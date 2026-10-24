@@ -3,3 +3,5 @@
 ratatui = "ratatui"
 # Short for "serialize" in trait and function names.
 ser = "ser"
+# An RFC 4648 base64 test vector ("", "f", "fo", "foo", ...), not "of".
+fo = "fo"

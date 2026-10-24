@@ -186,6 +186,16 @@ preset = "terminal"
 #     ["g", "g"]               -- chord
 #
 # Modifiers: "Alt", "Ctrl", "Shift", "Super"
+#
+# Modes: bookmarks, browser, confirm, form, prompt, help, queue, log
+
+[keys.bookmarks]
+# extra = [
+#     ["OpenItem",   "enter"],
+#     ["NewItem",    "n"],
+#     ["EditItem",   "e"],
+#     ["DeleteItem", ["d", "d"]],
+# ]
 
 [keys.browser]
 # extra = [
@@ -204,6 +214,16 @@ preset = "terminal"
 #     ["ToggleRow", "Space"],
 #     ["Checksum",  "c"],
 #     ["DiffRow",   "D"],
+# ]
+
+# In a form, printable keys are literal text, so only keys that cannot be
+# typed are bound. That is why choice fields cycle with the arrow keys rather
+# than with h/l or space: those have to stay available for typing a path.
+[keys.form]
+# extra = [
+#     ["NextChoice", "right"],
+#     ["PrevChoice", "left"],
+#     ["Submit",     "enter"],
 # ]
 
 # ─── Sync profiles ───────────────────────────────────────────────────────────

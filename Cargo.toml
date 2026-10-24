@@ -2,7 +2,7 @@
 name = "lazysync"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.89"
 description = "Dual-pane terminal file manager and sync tool with vim keys and a review-before-you-overwrite confirmation window"
 license = "MIT OR Apache-2.0"
 authors = ["guttermonk"]
@@ -43,8 +43,39 @@ tracing-appender = "0.2"
 # Timestamps on both sides of every sync row
 chrono = { version = "0.4", features = ["serde"] }
 
-# Protocol backends, keyring, notify, checksums and the rclone/rsync executors
-# arrive with the phases that use them -- see docs/PLAN.md.
+# Protocol backends. The remotefs family is what termscp uses, and it is
+# blocking -- see the note on `Vfs` in docs/PLAN.md about why that is the right
+# shape here rather than an async trait.
+remotefs = "1.0.1"
+remotefs-ssh = "1.1.0"
+
+# Read ~/.ssh/config, so `lazysync sftp://myhost/` honours the Host block you
+# already wrote rather than making you restate hostname, user, port and key.
+ssh2-config = "0.9.0"
+
+# Host key verification, which remotefs-ssh's libssh2 backend does not do:
+# nothing in it consults known_hosts. Used directly for a pre-flight handshake
+# that checks the key before any credential is sent. See vfs::hostkey.
+ssh2 = "0.9"
+
+# notify, the checksum crates and the rsync/rclone executors arrive with the
+# phases that use them -- see docs/PLAN.md.
+
+# Password storage. Opt-in per bookmark; key and agent auth are preferred and
+# need no keyring entry at all.
+#
+# The backend is per-platform rather than one feature set everywhere: the
+# Secret Service protocol only exists on Linux, and asking for it on macOS
+# would both fail to build and be the wrong store. `sync-secret-service` (not
+# the async one) because lazysync has no async runtime -- see docs/PLAN.md.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
 
 [dev-dependencies]
 tempfile = "3.14"

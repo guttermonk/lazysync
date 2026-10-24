@@ -5,14 +5,16 @@ set, vim keys by default with every binding remappable, and a confirmation
 window that shows you both sides of every overwrite — size and timestamp,
 source and destination — before anything moves.
 
-> **Status: phase 1 of 7.** What works today: the dual-pane browser over the
-> local filesystem, vim keybindings with chords and full config overrides,
+> **Status: phase 2 of 7.** What works today: the dual-pane browser over the
+> local filesystem **and over SFTP/SCP**, saved connections with the local
+> path kept, host key verification, optional keyring passwords, zide
+> auto-open, vim keybindings with chords and full config overrides,
 > synchronized browsing with ghosting, union view, search, marks, themes, and
-> a help overlay generated from the live keymap. So `lazysync ~/proj
-> /mnt/backup/proj` is already a usable two-tree browser.
+> a help overlay generated from the live keymap.
 >
-> What does not work yet: anything over a network, and anything that writes.
-> No SFTP, no bookmarks, no sync. Each subcommand tells you which phase it
+> What does not work yet: **nothing syncs**. There is no planner, no
+> confirmation window, and no transfers — browsing and connecting only. FTP,
+> S3, SMB and WebDAV are refused by name. Each subcommand says which phase it
 > arrives in. See [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Why not termscp
@@ -101,22 +103,42 @@ and falls back to its own engine with a note in the plan when they're not.
 ## Usage
 
 ```sh
-lazysync                              # both panes in the working directory
+lazysync                              # the saved connections
+lazysync open www-prod                # open one by name
+lazysync sftp://user@host/srv/www     # connect directly
 lazysync /mnt/backup/proj             # the working directory against that
 lazysync ~/proj /mnt/backup/proj      # one directory in each pane
 lazysync keys --mode browser          # dump the resolved keymap
 lazysync config                       # dump the resolved config as TOML
 
 # Not yet implemented -- each says which phase it arrives in:
-lazysync sftp://user@host/srv/www     # connect directly          (phase 2)
-lazysync open www-prod                # open a saved bookmark     (phase 2)
 lazysync sync deploy --dry-run        # print a plan              (phase 3)
 lazysync sync deploy --yes            # headless, for cron        (phase 7)
+lazysync import termscp               # import bookmarks          (phase 7)
 ```
+
+In the connection list: `enter` opens, `n` adds, `e` edits, `dd` deletes, `/`
+filters, `esc` drops to the local browser.
 
 In the browser: `h`/`j`/`k`/`l` navigate, `tab` switches panes, `S` toggles
 synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
 `?` shows every binding, `q` quits. All of it remappable — see below.
+
+### Connections
+
+Saved connections live in `bookmarks.toml` and store everything except the
+password — including the local working directory and a sync profile
+reference. Opening one shows its *name* and, only if it needs one, a password
+prompt; host, port, username and key path appear solely in the add/edit form.
+
+Host keys are verified against `~/.ssh/known_hosts` before any credential is
+sent, because `remotefs-ssh`'s libssh2 backend does not check them at all. A
+new host asks once, with a `SHA256:` fingerprint you can compare against
+`ssh-keygen -lf`. A *changed* host key is refused outright rather than offered
+as a prompt to click through.
+
+`~/.ssh/config` is read, so a bookmark for a host you have already configured
+picks up its `HostName`, `User`, `Port` and `IdentityFile`.
 
 ## Configuration
 

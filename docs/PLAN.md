@@ -308,8 +308,13 @@ Ranked by how much I think they matter.
    truncated file in place.
 7. **Bisync conflict resolution UI** — per-file keep-local / keep-remote /
    keep-both (suffixed) / skip, driven from the Conflicts section.
-8. **Host-key verification UX** — explicit TOFU dialog on first connect,
-   `known_hosts` read/write, loud warning on key change.
+8. ~~**Host-key verification UX**~~ — done in phase 2, and it turned out to be
+   mandatory rather than a nicety: `remotefs-ssh`'s libssh2 backend does not
+   consult `known_hosts` at all, so without this lazysync would hand both your
+   credentials and your files to whatever answered. Implemented as a pre-flight
+   handshake that reads the key and stops, *before* any password is collected —
+   so you are never asked to type a secret for an unverified server. A changed
+   key is refused outright rather than offered as a prompt.
 9. **Permission/ownership preservation** where the protocol supports it, and an
    honest "cannot preserve: <reason>" note where it doesn't.
 10. **Local↔local and remote↔remote** syncs, not just local↔remote.
@@ -334,7 +339,7 @@ Ranked by how much I think they matter.
 | --- | --- |
 | 0 | ✅ Repo scaffolding: flake, package.nix, CI, licenses, README skeleton, this doc |
 | 1 | ✅ TUI shell, config loader, keymap engine, theme, help overlay — local↔local dual pane, no network. Synchronized browsing with ghosting, and union view, landed here too: they are pure path logic and needed no network, and building them first meant the `Vfs` trait was shaped by a real caller. |
-| 2 | `Vfs` trait + Local + SFTP/SCP; connection form; bookmarks + keyring; host-key TOFU; zide auto-open |
+| 2 | ✅ `Vfs` + Local + SFTP/SCP; connection form; bookmarks + keyring; host-key TOFU; zide auto-open. Two things the underlying crates do not provide had to be written here: host key verification (`remotefs-ssh`'s libssh2 backend consults `known_hosts` nowhere at all), and an explicit `SshKeyStorage`, without which naming an identity file silently did nothing. `lazysync import termscp` slipped to phase 7 — its format carries an encrypted password blob, and an importer written against a format that cannot be tested here would be guesswork presented as a feature. |
 | 3 | Diff planner + confirmation window + native executor (push/pull, mirror) |
 | 4 | Transfer queue, progress, resume, filters, sync profiles, safety rails |
 | 5 | rsync + rclone executors; `RcloneFs`; remaining native backends (FTP/S3/SMB/WebDAV) |

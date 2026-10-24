@@ -4,6 +4,9 @@
 //! help overlay in particular is generated from the live keymap, so it cannot
 //! advertise a binding that does not exist.
 
+mod bookmarks;
+pub mod form;
+mod form_view;
 mod help;
 mod panes;
 mod status;
@@ -16,25 +19,45 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Overlay};
+use crate::app::{App, Overlay, Screen};
 
 /// Draw a frame.
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let [body, status_line] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
 
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
+    match app.screen {
+        Screen::Bookmarks => bookmarks::draw(frame, app, body),
+        Screen::Browser => {
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(body);
+            panes::draw(frame, app, [left, right]);
+        }
+        Screen::Form => {
+            // Cloned because `app` is borrowed mutably by `draw`, and the form
+            // renderer needs both it and the palette. A form is a dozen short
+            // strings, so the copy costs nothing.
+            if let Some(form) = app.form.clone() {
+                form_view::draw(frame, app, &form, body);
+            }
+        }
+    }
 
-    panes::draw(frame, app, [left, right]);
     status::draw(frame, app, status_line);
 
     match &app.overlay {
         Overlay::None => {}
         Overlay::Help { scroll } => help::draw(frame, app, *scroll),
         Overlay::Prompt(prompt) => {
-            let label = prompt.kind.label();
-            let text = format!("{label}{}", prompt.input);
+            // A password is never echoed. Dots rather than nothing, so you can
+            // see that your keystrokes are arriving.
+            let shown = if prompt.kind.is_secret() {
+                "\u{2022}".repeat(prompt.input.chars().count())
+            } else {
+                prompt.input.clone()
+            };
+            let text = format!("{}{shown}", prompt.kind.label());
             draw_prompt_line(frame, app, status_line, &text);
         }
         Overlay::Question(question) => draw_question(frame, app, &question.text),

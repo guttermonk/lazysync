@@ -24,6 +24,12 @@ typos
 CI runs the same set on stable and beta, Linux and macOS, plus `nix flake
 check`.
 
+**`nix build` only sees files git knows about.** A flake's `./.` is its *git*
+source, so a new file you have not `git add`ed is invisible to the build — it
+fails with `E0583 unresolved module` for a module whose file is plainly sitting
+there. `git add` the new files first. This bites once per person and is
+confusing every time.
+
 ## Things worth knowing
 
 - **The planner is the part that must be right.** `sync::diff` and `sync::plan`

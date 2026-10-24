@@ -13,11 +13,46 @@ use ratatui::{
     Frame,
 };
 
-use crate::{app::App, browser::sync_browse};
+use crate::{
+    app::{App, Screen},
+    browser::sync_browse,
+};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let palette = &app.palette;
     let mut spans = Vec::new();
+
+    // The browser indicators describe the panes, which the bookmark list and
+    // the form do not have. Showing a pane cursor position on a screen with no
+    // panes is just noise pretending to be information.
+    if !matches!(app.screen, Screen::Browser) {
+        if matches!(app.screen, Screen::Bookmarks) {
+            let shown = app.visible_bookmarks().len();
+            let total = app.store.bookmarks.len();
+            spans.push(Span::styled(
+                if shown == total {
+                    format!(" {total} saved ")
+                } else {
+                    format!(" {shown}/{total} saved ")
+                },
+                Style::default().fg(palette.dim),
+            ));
+        }
+
+        if !app.status.is_empty() {
+            spans.push(Span::styled(
+                format!(" {} ", app.status),
+                Style::default().fg(palette.fg),
+            ));
+        }
+
+        frame.render_widget(
+            Paragraph::new(Line::from(spans))
+                .style(Style::default().fg(palette.status_fg).bg(palette.status_bg)),
+            area,
+        );
+        return;
+    }
 
     if app.sync_browse {
         let in_step = sync_browse::in_step(&app.panes);

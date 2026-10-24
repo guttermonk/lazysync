@@ -8,6 +8,7 @@ use lazysync::{
     app::App,
     cli::{self, Cli, Command},
     config::{self, Config},
+    connection,
     keys::Mode,
     tui,
 };
@@ -23,19 +24,21 @@ fn main() -> Result<()> {
             init_stderr_logging();
             run_query(&cli)
         }
-        Some(Command::Open { name }) => {
-            init_stderr_logging();
-            not_yet("open", 2, &format!("bookmark {name:?}"))
-        }
         Some(Command::Sync { profile, .. }) => {
             init_stderr_logging();
             not_yet("sync", 3, &format!("profile {profile:?}"))
         }
         Some(Command::Import { from }) => {
             init_stderr_logging();
-            not_yet("import", 2, &format!("importing from {from:?}"))
+            // Deferred from phase 2 deliberately: termscp's bookmark format
+            // includes an encrypted password blob, and writing an importer
+            // against a format that cannot be tested here would be guesswork
+            // presented as a feature.
+            not_yet("import", 7, &format!("importing from {from:?}"))
         }
-        None => run_tui(&cli),
+        // `open` is the TUI with a bookmark pre-selected, so it shares the
+        // path rather than duplicating the startup sequence.
+        Some(Command::Open { .. }) | None => run_tui(&cli),
     }
 }
 
@@ -90,33 +93,150 @@ fn run_query(cli: &Cli) -> Result<()> {
 
 /// The interactive browser.
 fn run_tui(cli: &Cli) -> Result<()> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let (left, right) = cli.pane_targets(&cwd);
-
-    // Phase 2 turns a URL into a backend. Refusing now beats opening the
-    // local filesystem and pretending the URL was honoured.
-    for target in [&left, &right] {
-        if cli::looks_like_url(target) {
-            anyhow::bail!(
-                "connecting to {target:?} needs the protocol backends, which arrive in \
-                 phase 2 -- see docs/PLAN.md"
-            );
-        }
-    }
-
     if !tui::is_interactive() {
         anyhow::bail!("lazysync needs a terminal; use `lazysync sync <profile>` for cron");
     }
 
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let config = Config::load_default(cli.config.as_deref())?;
 
     // Keep the guard alive for the whole run: dropping it stops the
     // background log writer, which would silently lose every later line.
     let _log_guard = tui::init_file_logging("lazysync=warn");
 
-    let mut app = App::new(config, PathBuf::from(left), PathBuf::from(right))?;
+    let (left, right) = cli.pane_targets(&cwd);
+
+    // A URL in either position names a connection rather than a directory.
+    // Parsed here so a typo is reported before the terminal is taken over --
+    // an error written over the alternate screen is unreadable.
+    let remote = cli::looks_like_url(&right)
+        .then(|| connection::parse(&right))
+        .transpose()?;
+    if cli::looks_like_url(&left) {
+        anyhow::bail!(
+            "the left pane is the local side; pass {left:?} as the second argument instead"
+        );
+    }
+
+    let local_start = match &remote {
+        // With a remote on the right, the left pane is the working directory
+        // unless something else was asked for.
+        Some(_) if cli.targets.len() < 2 => cwd.clone(),
+        _ => PathBuf::from(&left),
+    };
+
+    let mut app = App::new(
+        config,
+        local_start,
+        // The right pane starts local and is replaced once connected, so the
+        // browser never has to handle a pane that does not exist.
+        if remote.is_some() {
+            cwd.clone()
+        } else {
+            PathBuf::from(&right)
+        },
+    )?;
+
+    match (&cli.command, remote) {
+        // `lazysync open <name>`
+        (Some(Command::Open { name }), _) => {
+            let Some(bookmark) = app.store.get(name).cloned() else {
+                let known: Vec<_> = app
+                    .store
+                    .bookmarks
+                    .iter()
+                    .map(|b| b.name.as_str())
+                    .collect();
+                anyhow::bail!(
+                    "no bookmark called {name:?}{}",
+                    if known.is_empty() {
+                        ". There are no saved connections yet".to_string()
+                    } else {
+                        format!(" (have: {})", known.join(", "))
+                    }
+                );
+            };
+            app.begin_open(&bookmark);
+        }
+
+        // `lazysync sftp://host/path`
+        (_, Some(target)) => {
+            let name = target.display();
+            let mut bookmark = lazysync::bookmarks::Bookmark::from_target(&name, &target);
+            bookmark.local_path = Some(local_start_of(&app));
+            app.begin_open(&bookmark);
+        }
+
+        // No connection asked for. Open the bookmark list unless paths were
+        // given, in which case the user clearly wants those two directories.
+        (_, None) => {
+            if cli.targets.is_empty() && should_auto_open(cli, &app) {
+                open_from_working_directory(&mut app, &cwd);
+            } else if cli.targets.is_empty() {
+                app.start_on_bookmarks();
+            }
+        }
+    }
 
     tui::run(&mut app)
+}
+
+fn local_start_of(app: &App) -> PathBuf {
+    app.panes[0].real_path().to_path_buf()
+}
+
+/// Whether the zide auto-open behaviour applies.
+fn should_auto_open(cli: &Cli, app: &App) -> bool {
+    if cli.no_auto_open {
+        return false;
+    }
+    cli.auto_open || app.config.zide.auto_open_bookmark
+}
+
+/// Open the bookmark whose local path contains the working directory.
+///
+/// This is the zide popup case: lazysync already knows where the pane started,
+/// so making the user pick from a list is a wasted keystroke. Several equally
+/// deep matches are ambiguous, so those fall back to the list -- filtered,
+/// rather than guessed between.
+fn open_from_working_directory(app: &mut App, cwd: &std::path::Path) {
+    use lazysync::integrations::zide;
+
+    let policy = app.config.zide.r#match;
+
+    if let Some((bookmark, found)) = zide::single(&app.store, cwd, policy) {
+        let bookmark = bookmark.clone();
+        let relative = found.relative.clone();
+
+        tracing::info!(
+            "working directory selected the bookmark {:?}{}",
+            bookmark.name,
+            if relative.as_os_str().is_empty() {
+                String::new()
+            } else {
+                format!(" at {}", relative.display())
+            }
+        );
+
+        // Pre-position both panes at the subdirectory the popup was opened
+        // from, which is the whole point of matching an ancestor rather than
+        // only an exact path.
+        let mut adjusted = bookmark.clone();
+        if !relative.as_os_str().is_empty() {
+            if let Some(local) = &bookmark.local_path {
+                adjusted.local_path = Some(local.join(&relative));
+            }
+            adjusted.remote_path = bookmark
+                .remote_path
+                .as_ref()
+                .map(|remote| remote.join(&relative));
+        }
+
+        app.begin_open(&adjusted);
+        return;
+    }
+
+    app.start_on_bookmarks();
 }
 
 fn init_stderr_logging() {

@@ -12,10 +12,13 @@
 //! the browser and a literal character in a password field.
 
 pub mod app;
+pub mod bookmarks;
 pub mod browser;
 pub mod cli;
 pub mod config;
+pub mod connection;
 pub mod event;
+pub mod integrations;
 pub mod keys;
 pub mod tui;
 pub mod ui;

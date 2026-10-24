@@ -3,6 +3,7 @@
   rustPlatform,
   makeWrapper,
   openssl,
+  dbus,
   pkg-config,
   stdenv,
   darwin,
@@ -39,6 +40,10 @@ rustPlatform.buildRustPackage {
 
   buildInputs =
     [ openssl ]
+    # keyring stores bookmark passwords in the platform's own credential
+    # store, which on Linux means Secret Service over libdbus and on Darwin
+    # means the Keychain via the Security framework.
+    ++ lib.optionals stdenv.hostPlatform.isLinux [ dbus ]
     ++ lib.optionals stdenv.hostPlatform.isDarwin [
       darwin.apple_sdk.frameworks.Security
     ];

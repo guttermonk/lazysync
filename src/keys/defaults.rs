@@ -18,6 +18,7 @@ use super::{
 /// The default keymap for one mode.
 pub fn for_mode(mode: Mode) -> Keymap {
     match mode {
+        Mode::Bookmarks => bookmarks(),
         Mode::Browser => browser(),
         Mode::Confirm => confirm(),
         Mode::Form => form(),
@@ -146,15 +147,46 @@ fn confirm() -> Keymap {
     Keymap(bindings)
 }
 
+fn bookmarks() -> Keymap {
+    let mut bindings = motions();
+    bindings.extend([
+        // Enter and `l` both open, so the key that enters a directory in the
+        // browser also opens a connection here.
+        (Action::OpenItem, n(Key::Enter)),
+        (Action::OpenItem, c('l')),
+        (Action::NewItem, c('n')),
+        (Action::EditItem, c('e')),
+        // A chord for the destructive one, deliberately: a single `d` next to
+        // `e` is how you delete the bookmark you meant to edit.
+        (Action::DeleteItem, chord("dd")),
+        (Action::Refresh, ctrl('r')),
+        // `n` is new-connection here, following lazygit, so search-repeat has
+        // no key in this mode -- the list is short enough that `/` landing on
+        // the first match is all it needs.
+        (Action::Search, c('/')),
+        (Action::Help, c('?')),
+        (Action::Cancel, n(Key::Esc)),
+        (Action::Quit, c('q')),
+        (Action::Quit, chord("ZZ")),
+    ]);
+    Keymap(bindings)
+}
+
 fn form() -> Keymap {
     // Printable keys are text here, so this map stays deliberately thin: only
     // the keys that cannot be literal input are bound. See
     // `Mode::takes_text_input`.
+    //
+    // That is also why choice fields cycle with the arrow keys rather than
+    // `h`/`l` or space: those have to stay available for typing a path or a
+    // password that happens to contain them.
     Keymap(vec![
         (Action::MoveDown, n(Key::Down)),
         (Action::MoveDown, n(Key::Tab)),
         (Action::MoveUp, n(Key::Up)),
         (Action::MoveUp, n(Key::BackTab)),
+        (Action::NextChoice, n(Key::Right)),
+        (Action::PrevChoice, n(Key::Left)),
         (Action::Submit, n(Key::Enter)),
         (Action::Cancel, n(Key::Esc)),
         (Action::Cancel, ctrl('c')),

@@ -13,13 +13,16 @@
 //! with `None`, and the confirmation window says which comparison it actually
 //! used.
 
+pub mod hostkey;
 pub mod local;
+pub mod ssh;
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
 pub use local::LocalFs;
+pub use ssh::SshFs;
 
 /// What an entry in a listing is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +152,19 @@ pub enum VfsError {
     PermissionDenied(String),
     #[error("not connected")]
     NotConnected,
+    /// Authentication was refused. Its own variant because it is the one
+    /// failure the user can act on immediately, by retyping a password.
+    #[error("authentication failed: {0}")]
+    AuthFailed(String),
+    /// The host key could not be verified. Never silently downgraded to a
+    /// connection error -- see [`crate::vfs::hostkey`].
+    #[error("host key problem: {0}")]
+    HostKey(String),
+    /// A protocol lazysync does not speak yet, refused by name.
+    #[error("{0}")]
+    Unsupported(String),
+    #[error("{context}: {message}")]
+    Protocol { context: String, message: String },
     #[error("{context}: {source}")]
     Io {
         context: String,

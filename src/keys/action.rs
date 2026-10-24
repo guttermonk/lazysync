@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
+    /// The bookmark list, which is the screen lazysync opens on.
+    Bookmarks,
     /// The dual-pane file browser.
     Browser,
     /// The sync confirmation window.
@@ -35,7 +37,8 @@ pub enum Mode {
 
 impl Mode {
     /// Every mode, in the order `lazysync keys` prints them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::Bookmarks,
         Self::Browser,
         Self::Confirm,
         Self::Form,
@@ -48,6 +51,7 @@ impl Mode {
     /// The name used in config (`[keys.browser]`) and on the CLI.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Bookmarks => "bookmarks",
             Self::Browser => "browser",
             Self::Confirm => "confirm",
             Self::Form => "form",
@@ -136,6 +140,19 @@ pub enum Action {
     FoldSection,
     UnfoldSection,
 
+    // ── Bookmarks and forms ──────────────────────────────────────────────
+    /// Open the selected bookmark.
+    OpenItem,
+    /// Add a new connection, on its own page.
+    NewItem,
+    /// Edit the selected connection -- the only place its details are shown.
+    EditItem,
+    DeleteItem,
+    /// Next value of a choice field. Bound to the arrow keys rather than
+    /// `h`/`l`, which in a form are literal characters.
+    NextChoice,
+    PrevChoice,
+
     // ── Generic ──────────────────────────────────────────────────────────
     Submit,
     Cancel,
@@ -194,6 +211,13 @@ impl Action {
             Self::FoldSection => "Fold this section",
             Self::UnfoldSection => "Unfold this section",
 
+            Self::OpenItem => "Open the selected connection",
+            Self::NewItem => "Add a new connection",
+            Self::EditItem => "Edit this connection",
+            Self::DeleteItem => "Delete this connection",
+            Self::NextChoice => "Next value",
+            Self::PrevChoice => "Previous value",
+
             Self::Submit => "Accept",
             Self::Cancel => "Cancel, or close the overlay",
             Self::Help => "Show this help",
@@ -239,6 +263,13 @@ impl Action {
             | Self::DiffRow
             | Self::FoldSection
             | Self::UnfoldSection => "Plan",
+
+            Self::OpenItem
+            | Self::NewItem
+            | Self::EditItem
+            | Self::DeleteItem
+            | Self::NextChoice
+            | Self::PrevChoice => "Connections",
 
             Self::Submit | Self::Cancel | Self::Help | Self::Quit => "General",
         }

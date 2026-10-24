@@ -40,18 +40,32 @@
       devShells = forAllSystems (
         pkgs:
         let
-          # The integration fixtures in later phases need a real server on the
-          # other end; a planner tested only against a mock will agree with the
-          # mock and nothing else.
+          # The integration fixtures need a real server on the other end; a
+          # planner tested only against a mock will agree with the mock and
+          # nothing else.
+          #
+          # garage rather than minio for the S3 side: minio was removed from
+          # nixpkgs after being abandoned upstream. rclone above doubles as the
+          # S3 client, so there is no separate one here.
           fixtures = with pkgs; [
             openssh
-            minio
-            minio-client
+            garage
           ];
         in
         {
           default = pkgs.mkShell {
-            packages =
+            # openssl goes in buildInputs, not packages: `packages` lands in
+            # nativeBuildInputs, and the pkg-config wrapper builds
+            # PKG_CONFIG_PATH from buildInputs only. With it in the wrong list,
+            # openssl-sys' build script cannot find openssl and the build fails
+            # before compiling anything of ours.
+            buildInputs = [
+              pkgs.openssl
+              # keyring's Secret Service backend links libdbus.
+              pkgs.dbus
+            ];
+
+            nativeBuildInputs =
               (with pkgs; [
                 rustc
                 cargo
@@ -59,7 +73,6 @@
                 rustfmt
                 rust-analyzer
                 pkg-config
-                openssl
 
                 bacon
                 cargo-watch
