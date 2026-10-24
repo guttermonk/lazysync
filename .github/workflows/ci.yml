@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-C debuginfo=0'
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: [stable, beta]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: |
+          rustup update --no-self-update ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+
+      - name: Check spelling
+        uses: crate-ci/typos@master
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linting
+        run: cargo clippy --workspace --all-targets -- --deny warnings
+
+  # The Nix build is what users actually install, and it is the thing that
+  # breaks when Cargo.lock and package.nix drift apart -- so it gets its own
+  # job rather than being assumed to follow from a green `cargo build`.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Flake check
+        run: nix flake check --print-build-logs
+      - name: Build
+        run: nix build --print-build-logs

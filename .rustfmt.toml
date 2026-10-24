@@ -1,0 +1,23 @@
+# Stable-only options. The nightly ones worth having are listed at the bottom
+# commented out: setting them here makes stable rustfmt print a warning per
+# option on every `cargo fmt`, which buries real output in CI.
+max_width = 100
+tab_spaces = 4
+newline_style = "Unix"
+edition = "2021"
+
+use_field_init_shorthand = true
+use_try_shorthand = true
+remove_nested_parens = true
+
+reorder_imports = true
+reorder_modules = true
+
+merge_derives = true
+
+# Nightly only -- enable with `cargo +nightly fmt` if you want them:
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"
+# wrap_comments = true
+# comment_width = 80
+# format_code_in_doc_comments = true

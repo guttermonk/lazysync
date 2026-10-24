@@ -1,0 +1,60 @@
+[package]
+name = "lazysync"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Dual-pane terminal file manager and sync tool with vim keys and a review-before-you-overwrite confirmation window"
+license = "MIT OR Apache-2.0"
+authors = ["guttermonk"]
+repository = "https://github.com/guttermonk/lazysync"
+homepage = "https://github.com/guttermonk/lazysync"
+readme = "README.md"
+keywords = ["tui", "ratatui", "sync", "sftp", "rsync"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = ["/docs", "/assets", "/.github", "/flake.nix", "/flake.lock", "/package.nix"]
+
+[dependencies]
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Config, bookmarks, sync profiles, themes
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# XDG paths
+dirs = "5.0"
+
+# Errors
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging to $XDG_STATE_HOME/lazysync/
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Timestamps on both sides of every sync row
+chrono = { version = "0.4", features = ["serde"] }
+
+# Protocol backends, keyring, notify, checksums and the rclone/rsync executors
+# arrive with the phases that use them -- see docs/PLAN.md.
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[[bin]]
+name = "lazysync"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+
+[profile.dev]
+debug = true
+opt-level = 0

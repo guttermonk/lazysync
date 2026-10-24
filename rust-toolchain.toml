@@ -1,0 +1,12 @@
+# Consulted by rustup-based (non-Nix) setups. The Nix build takes its
+# toolchain from nixpkgs instead, so this asks for "stable" with no version
+# pin -- nixpkgs' rustc then satisfies it and the two cannot disagree.
+[toolchain]
+channel = "stable"
+profile = "default"
+components = [
+    "rustfmt",
+    "clippy",
+    "rust-src",
+    "rust-analyzer",
+]

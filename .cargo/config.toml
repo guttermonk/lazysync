@@ -1,0 +1,20 @@
+# Profiles deliberately live in Cargo.toml and not here: `[profile.*]` in a
+# cargo config is still unstable and silently ignored on stable, so having them
+# in both places means the ones you can see are not the ones in effect.
+
+[alias]
+b = "build --release"
+r = "run --release"
+t = "test"
+c = "check"
+l = "clippy --all-targets -- --deny warnings"
+d = "doc --open"
+
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+retry = 2
+
+[term]
+color = "auto"

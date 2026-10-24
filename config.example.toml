@@ -1,0 +1,231 @@
+# lazysync configuration
+#
+# Copy to $XDG_CONFIG_HOME/lazysync/config.toml. Every value below is the
+# default, so an empty file behaves identically to this one.
+#
+# Bookmarks live in their own file (bookmarks.toml) because lazysync writes to
+# them from the UI, and round-tripping a hand-commented config through a
+# serializer would eat your comments.
+#
+# NOTE: this is the design target from docs/PLAN.md, not a description of what
+# is implemented today. Keys land in phase 1, bookmarks and zide in phase 2,
+# sync profiles in phases 3-4.
+
+# ─── General ─────────────────────────────────────────────────────────────────
+
+# Which pane has focus at startup: "local" or "remote".
+default_pane = "local"
+
+# Show dotfiles. Toggled live with `.`.
+show_hidden = false
+
+# "name" | "size" | "modified" | "extension", optionally "-name" to reverse.
+sort = "name"
+
+# Directories before files regardless of sort key.
+dirs_first = true
+
+# Computing a directory's recursive size costs one listing per subdirectory,
+# which over SFTP is slow enough to be felt. Off means directories show "-".
+dir_sizes = false
+
+# How long a chord like `gg` or `dd` waits for its second key.
+chord_timeout_ms = 500
+
+# ─── Synchronized browsing ───────────────────────────────────────────────────
+
+[sync_browse]
+# Start with synchronized browsing on.
+enabled = false
+
+# Which pane's navigation drives the other.
+#   "focused" -- whichever pane you are in leads
+#   "local" / "remote" -- that pane always leads
+leader = "focused"
+
+# What the follower pane does when the counterpart directory does not exist.
+# This is the case where a sparse local checkout meets a full remote.
+#   "ghost"  -- show "(does not exist on this side)" but remember the virtual
+#               path, so going back up re-couples the panes. No permanent
+#               desync. Recommended.
+#   "stay"   -- hold position and show a desynced badge in the status bar
+#   "create" -- create the directory
+#   "ask"    -- prompt each time
+on_missing = "ghost"
+
+# Merge both panes' listings into one logical set, marking each row L
+# (local only), R (remote only) or LR (both). Makes a remote with far more
+# entries than your local tree navigable. Toggled live with `u`.
+union_view = false
+
+# ─── zide integration ────────────────────────────────────────────────────────
+
+[zide]
+# When lazysync starts in a directory that matches a bookmark's local_path,
+# open that bookmark instead of showing the bookmark list.
+auto_open_bookmark = true
+
+# How the working directory is matched against bookmark local paths.
+#   "ancestor" -- exact match first, then the deepest local_path that is a
+#                 prefix of the working directory. Opening the popup in
+#                 ~/proj/src/api picks the ~/proj bookmark and pre-positions
+#                 the remote pane at src/api.
+#   "exact"    -- only an exact match counts
+#   "off"      -- same as auto_open_bookmark = false
+match = "ancestor"
+
+# ─── Comparison ──────────────────────────────────────────────────────────────
+
+[compare]
+# How two files are judged same-or-different when building a plan.
+#   "size_mtime" -- fast, and right nearly always
+#   "checksum"   -- correct, and reads both files in full
+#   "size_only"  -- for remotes with no usable timestamp at all
+method = "size_mtime"
+
+# Timestamps that differ by less than this are treated as equal. Needed
+# because filesystems and protocols disagree about granularity: FAT stores
+# 2-second resolution, some SFTP servers 1 second, S3 has no mtime at all.
+# Setting this to 0 is the most common cause of "why does it want to re-copy
+# everything".
+mtime_tolerance_secs = 2
+
+# Re-check rows the fast method calls ambiguous (equal size, equal mtime, but
+# a hash is available cheaply from the provider) using that hash.
+use_provider_hash = true
+
+# ─── Transfers ───────────────────────────────────────────────────────────────
+
+[transfer]
+# Concurrent file transfers per job.
+parallel = 4
+
+# KiB/s, 0 for unlimited.
+bandwidth_limit = 0
+
+# Write to `<name>.lazysync-part` and rename on completion, so an interrupted
+# transfer never leaves a truncated file where the real one was.
+partial_suffix = ".lazysync-part"
+
+# Resume an interrupted transfer from the partial file where the protocol
+# supports ranged writes.
+resume = true
+
+# Preserve mtime, and mode where the protocol allows it. The confirmation
+# window says so explicitly when it cannot.
+preserve_mtime = true
+preserve_mode = true
+
+# ─── Safety ──────────────────────────────────────────────────────────────────
+
+[safety]
+# Where deletions go in mirror mode. Set to "" for real deletion.
+#   "trash"            -- the XDG trash, local destinations only
+#   "<path>"           -- a backup directory, relative to the sync root
+backup_dir = ".lazysync-backup"
+
+# Abort the plan rather than show it if more than this fraction of the
+# destination would be deleted. The guard against a mistyped sync root.
+max_delete_fraction = 0.25
+
+# Abort if more than this many files would be deleted. 0 disables.
+max_delete_files = 0
+
+# Require a second confirmation when a plan would touch anything outside the
+# sync root (reachable through symlinks).
+confirm_outside_root = true
+
+# ─── Confirmation window ─────────────────────────────────────────────────────
+
+[confirm]
+# Start with the "identical, skipped" section folded.
+fold_skipped = true
+
+# Highlight in red when the destination is newer than the source -- i.e. you
+# are about to overwrite newer data with older.
+warn_dest_newer = true
+
+# Sections to show even when empty, so a missing section is never mistaken for
+# a missing check.
+always_show = ["create", "overwrite", "delete", "conflict"]
+
+# ─── Theme ───────────────────────────────────────────────────────────────────
+
+[theme]
+# "terminal" follows your terminal's palette. Also: "catppuccin-mocha",
+# "gruvbox-dark", "nord", or a path to a theme file.
+preset = "terminal"
+
+# ─── Keybindings ─────────────────────────────────────────────────────────────
+#
+# Each mode has its own keymap, because `d` is delete in the browser and a
+# literal `d` in a text field.
+#
+# `base` replaces that mode's defaults entirely; `extra` layers on top and
+# wins any collision with a base binding sharing its prefix. Run
+# `lazysync keys` to see what a config actually resolves to.
+#
+# A key combo is a single key, a key with modifiers, or an array of either
+# for a chord:
+#     "S"                      -- plain key
+#     { key = "d", mod = ["Ctrl"] }
+#     ["g", "g"]               -- chord
+#
+# Modifiers: "Alt", "Ctrl", "Shift", "Super"
+
+[keys.browser]
+# extra = [
+#     ["ToggleSyncBrowse", "S"],
+#     ["ToggleUnionView",  "u"],
+#     ["SyncPush",         ["s", "p"]],
+#     ["SyncPull",         ["s", "l"]],
+#     ["Delete",           ["d", "d"]],
+#     ["Quit",             ["Z", "Z"]],
+# ]
+
+[keys.confirm]
+# extra = [
+#     ["Apply",     "y"],
+#     ["Cancel",    "n"],
+#     ["ToggleRow", "Space"],
+#     ["Checksum",  "c"],
+#     ["DiffRow",   "D"],
+# ]
+
+# ─── Sync profiles ───────────────────────────────────────────────────────────
+#
+# Named, reusable bundles of sync options, referenced by bookmarks and by
+# `lazysync sync <profile>`. Without these, every run means re-entering the
+# same options.
+
+[profiles.deploy]
+# "push" | "pull" | "mirror-push" | "mirror-pull" | "bisync"
+mode = "push"
+
+# "auto" picks the best available: rsync for ssh remotes when rsync exists on
+# both ends, rclone when the remote is an rclone remote, native otherwise.
+# "native" never shells out.
+executor = "auto"
+
+# gitignore syntax. Later rules win.
+exclude = ["/target/", "*.log", ".git/"]
+
+# Honour .gitignore files found in the tree, in addition to `exclude`.
+respect_gitignore = false
+
+# Skip the confirmation window. Only honoured by `lazysync sync --yes` and by
+# watch mode; the interactive UI always shows the plan.
+auto_confirm = false
+
+[profiles.notes]
+mode = "bisync"
+executor = "auto"
+exclude = [".obsidian/workspace.json"]
+
+# Continuously push local changes as they happen. A watcher that opens a modal
+# on every save is useless, so changes are batched and confirmed together.
+#   "batch" -- collect for `debounce_ms`, then show one plan
+#   "auto"  -- apply without confirmation
+#   "off"   -- no watching
+watch = "off"
+debounce_ms = 2000

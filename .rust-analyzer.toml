@@ -1,0 +1,24 @@
+# Keeps rust-analyzer's artifacts out of the directory `cargo build` uses, so
+# an editor running check-on-save does not block the command line on the same
+# target lock.
+
+[cargo]
+buildScripts.enable = true
+targetDir = "target/rust-analyzer"
+
+[procMacro]
+enable = true
+attributes.enable = true
+
+[checkOnSave]
+enable = true
+command = "clippy"
+allTargets = true
+
+[rust]
+analyzerTargetDir = "target/rust-analyzer"
+
+[inlayHints]
+enable = true
+typeHints.enable = true
+parameterHints.enable = true

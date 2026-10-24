@@ -1,0 +1,49 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is tracked: this is a binary crate, and the Nix build reads it.
+
+# Nix
+result
+result-*
+.direnv/
+
+# Dev scratch config/state tree created by .envrc, so `cargo run` never
+# touches the bookmarks you actually use.
+/.dev/
+.envrc.local
+
+# A real config in the repo root would be read in preference to the example
+# and is almost certainly full of your own hosts.
+/config.toml
+/bookmarks.toml
+!config.example.toml
+
+# Partial transfers, if a test run is interrupted in the working tree
+*.lazysync-part
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.history/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and coverage
+*.log
+*.profraw
+*.profdata
+lcov.info
+/coverage/
+
+# Misc
+*.bak
+*.orig
+*.tmp
