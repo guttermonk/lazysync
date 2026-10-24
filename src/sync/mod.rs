@@ -20,16 +20,20 @@
 pub mod compare;
 pub mod diff;
 pub mod executor;
+pub mod filters;
 pub mod plan;
 pub mod safety;
+pub mod transfer;
 
 use crate::config::SyncMode;
 
 pub use compare::{Comparator, Method, Reason};
 pub use diff::{Direction, Endpoint};
 pub use executor::{apply, Report};
+pub use filters::Filters;
 pub use plan::{Action, Plan, Row, Section, Totals};
 pub use safety::DeletePolicy;
+pub use transfer::{State as TransferState, Transfer};
 
 impl SyncMode {
     /// Which pane files come from, and whether extraneous ones are removed.

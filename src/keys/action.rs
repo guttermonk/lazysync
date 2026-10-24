@@ -147,6 +147,10 @@ pub enum Action {
     SyncPull,
     /// Plan a mirror: make the remote identical, deletions included.
     SyncMirror,
+    /// Plan using the open connection's own sync profile.
+    SyncProfile,
+    /// Pause or resume the transfer in flight.
+    TogglePause,
 
     // ── Bookmarks and forms ──────────────────────────────────────────────
     /// Open the selected bookmark.
@@ -222,6 +226,8 @@ impl Action {
             Self::SyncPush => "Plan a push to the other pane",
             Self::SyncPull => "Plan a pull from the other pane",
             Self::SyncMirror => "Plan a mirror, deletions included",
+            Self::SyncProfile => "Plan using this connection's sync profile",
+            Self::TogglePause => "Pause or resume the transfer",
 
             Self::OpenItem => "Open the selected connection",
             Self::NewItem => "Add a new connection",
@@ -276,7 +282,11 @@ impl Action {
             | Self::FoldSection
             | Self::UnfoldSection => "Plan",
 
-            Self::SyncPush | Self::SyncPull | Self::SyncMirror => "Sync",
+            Self::SyncPush
+            | Self::SyncPull
+            | Self::SyncMirror
+            | Self::SyncProfile
+            | Self::TogglePause => "Sync",
 
             Self::OpenItem
             | Self::NewItem

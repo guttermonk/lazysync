@@ -6,7 +6,7 @@
 //! which [`Mode::takes_text_input`] routes to the overlay as characters --
 //! otherwise typing a password would run commands.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     bookmarks::{secrets, Bookmark, BookmarkStore},
@@ -19,9 +19,11 @@ use crate::{
     connection::Secret,
     keys::{Action, Keymaps, Mode},
     sync::{
-        diff, executor,
+        diff,
+        filters::Filters,
         plan::{Plan, Section},
         safety::{self, DeletePolicy},
+        transfer::{State as TransferState, Transfer},
     },
     ui::{confirm, form::ConnectionForm},
     vfs::{hostkey::HostKey, ssh, LocalFs, Vfs},
@@ -123,6 +125,8 @@ pub enum Screen {
     Form,
     /// Reviewing a sync plan before it is applied.
     Confirm,
+    /// Applying a plan, with progress.
+    Transfer,
 }
 
 /// Everything the UI draws and the event loop mutates.
@@ -168,6 +172,16 @@ pub struct App {
     pub folded: Vec<Section>,
     /// Which way the plan under review would move files.
     plan_mode: SyncMode,
+
+    /// The transfer in flight, stepped by the main loop between frames.
+    pub transfer: Option<Transfer>,
+
+    /// Name of the sync profile the open connection references, if any.
+    ///
+    /// Set when a bookmark opens. It decides the exclude rules and the
+    /// default direction, so a `[profiles.deploy]` entry is not just
+    /// documentation for the headless path.
+    pub active_profile: Option<String>,
 
     /// Which bookmark a password prompt or host key dialog belongs to.
     connecting: Option<Bookmark>,
@@ -223,6 +237,8 @@ impl App {
                 Vec::new()
             },
             plan_mode: SyncMode::Push,
+            transfer: None,
+            active_profile: None,
             connecting: None,
             host_key: None,
             palette,
@@ -263,6 +279,7 @@ impl App {
             Screen::Browser => Mode::Browser,
             Screen::Form => Mode::Form,
             Screen::Confirm => Mode::Confirm,
+            Screen::Transfer => Mode::Queue,
         }
     }
 
@@ -308,8 +325,9 @@ impl App {
             Mode::Help => self.handle_help(action),
             Mode::Prompt => self.handle_prompt(action),
             Mode::Confirm => self.handle_confirm(action),
-            // The queue and log screens arrive with the transfers they show.
-            Mode::Queue | Mode::Log => {}
+            Mode::Queue => self.handle_queue(action),
+            // The log viewer arrives with the audit log it shows.
+            Mode::Log => {}
         }
     }
 
@@ -613,6 +631,7 @@ impl App {
             }
         }
 
+        self.active_profile = bookmark.sync_profile.clone();
         self.sync_browse = bookmark.sync_browse || self.config.sync_browse.enabled;
         if self.sync_browse {
             sync_browse::anchor_both(&mut self.panes);
@@ -771,6 +790,7 @@ impl App {
             Action::SyncPush => self.begin_sync(SyncMode::Push),
             Action::SyncPull => self.begin_sync(SyncMode::Pull),
             Action::SyncMirror => self.begin_sync(SyncMode::MirrorPush),
+            Action::SyncProfile => self.begin_profile_sync(),
 
             Action::ToggleDirSizes => {
                 // Needs a recursive walk per directory, which over a network
@@ -930,6 +950,17 @@ impl App {
         let source_label = side_label(source_index).to_string();
         let dest_label = side_label(dest_index).to_string();
 
+        // Exclude rules from the active profile. A bad pattern stops the plan
+        // rather than being skipped: a filter that silently does nothing would
+        // let `target/` be pushed to a web server.
+        let filters = match self.resolve_filters(&source_root) {
+            Ok(filters) => filters,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+
         self.status = format!("planning {}...", mode.label());
 
         // Split the array so both panes can be borrowed mutably at once.
@@ -940,7 +971,7 @@ impl App {
             (&mut second[0], &mut first[0])
         };
 
-        let mut plan = diff::plan(
+        let mut plan = diff::plan_with_filters(
             diff::Endpoint {
                 fs: source.vfs.as_mut(),
                 root: &source_root,
@@ -953,6 +984,7 @@ impl App {
             },
             direction,
             &self.config,
+            &filters,
         );
 
         safety::check(&mut plan, &self.config.safety);
@@ -972,6 +1004,55 @@ impl App {
         self.plan = Some(plan);
         self.screen = Screen::Confirm;
         self.status.clear();
+    }
+
+    /// Compile the exclude rules for the active profile.
+    fn resolve_filters(&self, source_root: &Path) -> Result<Filters, String> {
+        let Some(profile) = self
+            .active_profile
+            .as_ref()
+            .and_then(|name| self.config.profiles.get(name))
+        else {
+            return Ok(Filters::default());
+        };
+
+        let mut patterns = profile.exclude.clone();
+
+        if profile.respect_gitignore {
+            // The sync root's own `.gitignore` only. Nested ones would need
+            // per-directory rule stacks, which is a bigger piece of work than
+            // it looks and is not worth half-doing: this covers the case
+            // people actually mean, and the status line says what was loaded.
+            let path = source_root.join(".gitignore");
+            match std::fs::read_to_string(&path) {
+                Ok(text) => patterns.extend(text.lines().map(str::to_owned)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::debug!("could not read {}: {e}", path.display());
+                }
+            }
+        }
+
+        Filters::parse(&patterns).map_err(|e| e.to_string())
+    }
+
+    /// Plan using the active profile's own mode.
+    ///
+    /// The point of a profile is not having to remember which direction a
+    /// given connection syncs in.
+    pub fn begin_profile_sync(&mut self) {
+        let Some(name) = self.active_profile.clone() else {
+            self.status = "this connection has no sync profile; use sp, sl or sm".into();
+            return;
+        };
+        let Some(profile) = self.config.profiles.get(&name) else {
+            self.status = format!("no [profiles.{name}] in config.toml");
+            return;
+        };
+
+        let mode = profile.mode;
+        self.status = format!("profile {name}: {}", mode.label());
+        self.begin_sync(mode);
     }
 
     fn handle_confirm(&mut self, action: Action) {
@@ -1107,8 +1188,33 @@ impl App {
         self.apply_plan();
     }
 
+    /// Hand the plan to the transfer queue and show the progress screen.
+    ///
+    /// Returns immediately. The main loop drives [`Transfer::step`] between
+    /// frames, which is what makes the progress bar move and `esc` work --
+    /// phase 3 applied the whole plan in one blocking call and the UI was
+    /// frozen for the duration.
     fn apply_plan(&mut self) {
         let Some(plan) = self.plan.take() else { return };
+
+        self.transfer = Some(Transfer::new(
+            plan,
+            DeletePolicy::from_config(&self.config.safety),
+            self.config.transfer.partial_suffix.clone(),
+            self.config.transfer.resume,
+        ));
+        self.screen = Screen::Transfer;
+        self.status.clear();
+    }
+
+    /// Do a slice of the transfer in flight. Called once per frame.
+    pub fn step_transfer(&mut self) {
+        let Some(transfer) = &mut self.transfer else {
+            return;
+        };
+        if transfer.is_finished() {
+            return;
+        }
 
         let direction = self.plan_mode.direction();
         let source_index = direction.source;
@@ -1116,8 +1222,6 @@ impl App {
 
         let source_root = self.panes[source_index].path().to_path_buf();
         let dest_root = self.panes[dest_index].path().to_path_buf();
-        let policy = DeletePolicy::from_config(&self.config.safety);
-        let suffix = self.config.transfer.partial_suffix.clone();
 
         let (first, second) = self.panes.split_at_mut(1);
         let (source, dest) = if source_index == 0 {
@@ -1126,29 +1230,65 @@ impl App {
             (&mut second[0], &mut first[0])
         };
 
-        let report = executor::apply(
+        let finished = transfer.step(
             source.vfs.as_mut(),
             &source_root,
             dest.vfs.as_mut(),
             &dest_root,
-            &plan,
-            &policy,
-            &suffix,
         );
 
-        // Both panes get re-read: the destination obviously changed, and the
-        // source may have had a partial file written next to it on a
-        // local-to-local sync.
+        if finished {
+            self.finish_transfer();
+        }
+    }
+
+    fn finish_transfer(&mut self) {
+        let Some(transfer) = &self.transfer else {
+            return;
+        };
+
+        for failure in transfer.report().failures() {
+            tracing::warn!("{}: {:?}", failure.path.display(), failure.outcome);
+        }
+        self.status = transfer.report().summary();
+
+        // Both panes get re-read: the destination obviously changed, and on a
+        // local-to-local sync the source directory may have had a partial
+        // file written next to it.
         for pane in &mut self.panes {
             pane.reload();
         }
+    }
 
-        for failure in report.failures() {
-            tracing::warn!("{}: {:?}", failure.path.display(), failure.outcome);
+    /// Whether the main loop should keep stepping rather than blocking on
+    /// input.
+    pub fn transfer_is_active(&self) -> bool {
+        self.transfer
+            .as_ref()
+            .is_some_and(|t| !t.is_finished() && t.state() != TransferState::Paused)
+    }
+
+    /// The progress screen's keys.
+    fn handle_queue(&mut self, action: Action) {
+        let Some(transfer) = &mut self.transfer else {
+            self.screen = Screen::Browser;
+            return;
+        };
+
+        // Once it is done, any key returns to the browser -- the screen is a
+        // report at that point, not a control panel.
+        if transfer.is_finished() {
+            self.transfer = None;
+            self.screen = Screen::Browser;
+            return;
         }
 
-        self.status = report.summary();
-        self.screen = Screen::Browser;
+        match action {
+            Action::TogglePause => transfer.toggle_pause(),
+            Action::Cancel => transfer.cancel(),
+            Action::Help => self.overlay = Overlay::Help { scroll: 0 },
+            _ => {}
+        }
     }
 
     fn handle_question(&mut self, action: Action) {

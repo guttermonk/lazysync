@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 use super::{
     plan::{Action, Plan, Row},
     safety::DeletePolicy,
+    transfer::Transfer,
 };
-use crate::vfs::{Vfs, VfsError, WriteMetadata};
+use crate::vfs::{Vfs, VfsError};
 
 /// What happened to one row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,13 @@ pub enum Outcome {
     /// Skipped because the destination changed after the plan was built.
     SkippedStale {
         why: String,
+    },
+    /// Abandoned because the user cancelled.
+    ///
+    /// Carries what had been written, since with resume on those bytes stay
+    /// on the destination and the next run picks up from them.
+    Cancelled {
+        partial_bytes: u64,
     },
     Failed {
         why: String,
@@ -122,157 +130,28 @@ pub fn apply(
     policy: &DeletePolicy,
     partial_suffix: &str,
 ) -> Report {
-    let mut report = Report::default();
-
     if !plan.can_apply() {
-        return report;
+        return Report::default();
     }
 
-    // Directories first, shallowest to deepest, so a create never fails for a
-    // missing parent.
-    for relative in plan.required_directories() {
-        let target = dest_root.join(&relative);
-        if let Err(e) = dest.create_dir(&target) {
-            report.applied.push(Applied {
-                path: relative,
-                action: Action::CreateDir,
-                outcome: Outcome::Failed { why: e.to_string() },
-            });
-        }
-    }
+    // Driven rather than reimplemented. There was briefly a second
+    // whole-file copy loop here, which meant the interactive and headless
+    // paths could disagree about resume, ordering and cleanup -- the same
+    // class of drift the plan-is-the-dry-run rule exists to prevent. The
+    // queue is the only thing that moves bytes.
+    let mut queue = Transfer::new(
+        plan.clone(),
+        policy.clone(),
+        partial_suffix.to_owned(),
+        // Resume is off here: this entry point is used by the headless path
+        // and by tests, where a partial file left behind by a failure would
+        // be a surprise rather than a feature. The interactive path builds
+        // its own `Transfer` with the configured setting.
+        false,
+    );
 
-    for row in plan.included() {
-        match row.action {
-            Action::CreateDir | Action::Skip => {}
-
-            Action::Create | Action::Overwrite => {
-                let outcome = transfer(source, source_root, dest, dest_root, row, partial_suffix);
-                if let Outcome::Transferred { bytes } = &outcome {
-                    report.bytes = report.bytes.saturating_add(*bytes);
-                }
-                report.applied.push(Applied {
-                    path: row.path.clone(),
-                    action: row.action,
-                    outcome,
-                });
-            }
-
-            Action::Delete => {
-                let outcome = delete(dest, dest_root, row, policy);
-                report.applied.push(Applied {
-                    path: row.path.clone(),
-                    action: row.action,
-                    outcome,
-                });
-            }
-        }
-    }
-
-    report
-}
-
-/// Copy one file, via a partial name.
-fn transfer(
-    source: &mut dyn Vfs,
-    source_root: &Path,
-    dest: &mut dyn Vfs,
-    dest_root: &Path,
-    row: &Row,
-    partial_suffix: &str,
-) -> Outcome {
-    let from = source_root.join(&row.path);
-    let to = dest_root.join(&row.path);
-
-    // Re-stat the source: the plan recorded a size, and protocols that send a
-    // length before the data need the *current* one. A stale size would
-    // corrupt the transfer rather than merely misreport it.
-    let current = match source.stat(&from) {
-        Ok(entry) => entry,
-        Err(e) => {
-            return Outcome::Failed {
-                why: format!("the source is gone: {e}"),
-            }
-        }
-    };
-
-    // Re-check the destination against what was planned. Overwriting on the
-    // strength of a snapshot that is no longer true is how a sync destroys
-    // something the user never saw in the window.
-    if let Some(planned) = row.dest {
-        match dest.stat(&to) {
-            Ok(now) => {
-                let now_side = super::plan::Side::from_entry(&now);
-                if now_side != planned {
-                    return Outcome::SkippedStale {
-                        why: "the destination changed after the plan was built".into(),
-                    };
-                }
-            }
-            Err(e) if e.is_not_found() => {
-                // Planned as an overwrite, but it is gone now. Writing it is
-                // still the intent, so this proceeds.
-            }
-            Err(e) => return Outcome::Failed { why: e.to_string() },
-        }
-    }
-
-    let metadata = WriteMetadata::from_entry(&current);
-    let partial = partial_path(&to, partial_suffix);
-
-    // Read into memory, then write. Phase 4's queue streams instead; this is
-    // the simple version, and it is why phase 3 has no progress bar.
-    let mut buffer = Vec::with_capacity(usize::try_from(current.size).unwrap_or(0));
-    let read = match source.read_into(&from, &mut buffer) {
-        Ok(count) => count,
-        Err(e) => {
-            return Outcome::Failed {
-                why: format!("reading: {e}"),
-            }
-        }
-    };
-
-    // A short read means the file changed while being copied. Writing what was
-    // read would put a truncated file on the destination, which is worse than
-    // not copying at all.
-    if read != current.size {
-        return Outcome::Failed {
-            why: format!(
-                "the source changed while being read ({read} bytes of {})",
-                current.size
-            ),
-        };
-    }
-
-    let mut cursor = std::io::Cursor::new(buffer);
-    if let Err(e) = dest.write_from(&partial, &metadata, &mut cursor) {
-        // Leave nothing behind: a stray partial file in the destination tree
-        // would show up in the next plan as a file to sync back.
-        let _ = dest.remove_file(&partial);
-        return Outcome::Failed {
-            why: format!("writing: {e}"),
-        };
-    }
-
-    // The rename is what makes the whole thing safe: until it happens, the
-    // destination still holds the previous good copy.
-    if let Err(e) = move_into_place(dest, &partial, &to, row.dest.is_some()) {
-        let _ = dest.remove_file(&partial);
-        return Outcome::Failed {
-            why: format!("renaming into place: {e}"),
-        };
-    }
-
-    // Timestamps again after the rename. Some backends apply them to the
-    // partial name and some lose them in the rename, and a destination stamped
-    // "now" looks newer than its source -- which would make the next sync in
-    // the other direction copy it back.
-    if metadata.mtime.is_some() {
-        if let Err(e) = dest.set_times(&to, &metadata) {
-            tracing::debug!("could not restamp {}: {e}", to.display());
-        }
-    }
-
-    Outcome::Transferred { bytes: read }
+    while !queue.step(source, source_root, dest, dest_root) {}
+    queue.report().clone()
 }
 
 /// Put the finished partial file at its final name.
@@ -290,7 +169,7 @@ fn transfer(
 /// name. A failure mid-swap is recoverable by hand, which is the property
 /// worth keeping; writing straight to the final name would instead leave a
 /// truncated file where a good one used to be.
-fn move_into_place(
+pub(crate) fn move_into_place(
     dest: &mut dyn Vfs,
     partial: &Path,
     to: &Path,
@@ -353,7 +232,12 @@ fn displaced_path(path: &Path) -> PathBuf {
 }
 
 /// Remove one entry, or move it aside.
-fn delete(dest: &mut dyn Vfs, dest_root: &Path, row: &Row, policy: &DeletePolicy) -> Outcome {
+pub(crate) fn delete(
+    dest: &mut dyn Vfs,
+    dest_root: &Path,
+    row: &Row,
+    policy: &DeletePolicy,
+) -> Outcome {
     let target = dest_root.join(&row.path);
 
     // Re-check: if it already matches what the source has, or is simply gone,
@@ -424,20 +308,6 @@ fn is_dir_row(row: &Row) -> bool {
         .is_some_and(|side| side.size == 0 && side.mtime.is_none())
 }
 
-/// `path` with the partial-transfer suffix appended.
-///
-/// Appended to the whole file name rather than replacing the extension, so
-/// `notes.md` becomes `notes.md.lazysync-part` and cannot collide with a real
-/// `notes.lazysync-part`.
-fn partial_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    name.push_str(suffix);
-    path.with_file_name(name)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -453,6 +323,7 @@ mod tests {
             safety,
         },
         vfs::LocalFs,
+        vfs::WriteMetadata,
     };
 
     fn write(path: &Path, content: &str, epoch: i64) {
@@ -814,6 +685,21 @@ mod tests {
         fn stat(&mut self, path: &Path) -> Result<crate::vfs::Entry, crate::vfs::VfsError> {
             self.0.stat(path)
         }
+        fn open_read(
+            &mut self,
+            path: &Path,
+            offset: u64,
+        ) -> Result<Box<dyn crate::vfs::ReadHandle>, crate::vfs::VfsError> {
+            self.0.open_read(path, offset)
+        }
+        fn open_write(
+            &mut self,
+            path: &Path,
+            metadata: &WriteMetadata,
+            append: bool,
+        ) -> Result<Box<dyn crate::vfs::WriteHandle>, crate::vfs::VfsError> {
+            self.0.open_write(path, metadata, append)
+        }
         fn read_into(
             &mut self,
             path: &Path,
@@ -946,18 +832,6 @@ mod tests {
             "new content"
         );
         assert!(!t.right.join("a.lazysync-replacing").exists());
-    }
-
-    #[test]
-    fn the_partial_suffix_is_appended_to_the_whole_name() {
-        assert_eq!(
-            partial_path(Path::new("/srv/notes.md"), ".lazysync-part"),
-            PathBuf::from("/srv/notes.md.lazysync-part"),
-        );
-        assert_eq!(
-            partial_path(Path::new("/srv/archive.tar.gz"), ".part"),
-            PathBuf::from("/srv/archive.tar.gz.part"),
-        );
     }
 
     #[test]

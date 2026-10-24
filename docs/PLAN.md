@@ -286,29 +286,36 @@ you left off.
 
 Ranked by how much I think they matter.
 
-1. **Sync profiles** — named, reusable bundles of (direction, mode, filters,
-   delete policy, compare policy, bandwidth cap, executor preference) attached
-   to bookmarks. Without these, "advanced syncing" means re-entering options
-   every run.
+1. ~~**Sync profiles**~~ — done in phase 4. A bookmark's `sync_profile` picks
+   the direction and the exclude rules, and `ss` runs it. Bandwidth caps and
+   executor preference are declared in the schema but not yet honoured.
 2. **mtime fidelity and clock skew** — the #1 cause of "why does it want to
    re-copy everything". Needs: per-backend mtime granularity (FAT 2s, some
    SFTP servers 1s), a configurable tolerance window, timezone-correct
    comparison, S3's lack of real mtime (fall back to ETag/metadata), and the
    confirmation window stating *which* comparison it actually used per row.
-3. **Filters** — gitignore-syntax include/exclude per profile, `--exclude` on
-   the CLI, and an optional "respect .gitignore" toggle.
+3. ~~**Filters**~~ — done in phase 4, bar the CLI flag. gitignore syntax per
+   profile, applied during the walk so an excluded directory is never
+   descended into, and on *both* sides so a mirror does not delete the
+   destination's copy of something the user filtered out. `respect_gitignore`
+   reads the sync root's own file; nested ones would need per-directory rule
+   stacks and are not worth half-doing.
 4. ~~**Safety rails**~~ — done in phase 3. `backup_dir` is the default, so a
    deletion is recoverable; a plan that would empty the destination is refused
    at any size; a fraction limit applies above a floor of ten destination
    files, because a percentage of a tiny tree is noise; and permanent deletion
    asks a second time. The backup directory is excluded from planning, or a
    mirror would delete its own backups on the next run.
-5. **Transfer queue + progress** — concurrent transfers, per-file and aggregate
-   progress with throughput and ETA, pause/resume/cancel per job. `Ctrl-C`
-   cancels the job, not the app.
-6. **Resumable transfers** — `.lazysync-part` partial files, resume after
-   reconnect, atomic rename on completion so a killed sync never leaves a
-   truncated file in place.
+5. ~~**Transfer queue + progress**~~ — done in phase 4, except for
+   concurrency. Per-file and aggregate progress, throughput, ETA, pause and
+   cancel. Transfers are sequential: parallelism within one SSH session needs
+   multiple channels, which is its own piece of work, and the serial case is
+   what a dual-pane tool spends its time on anyway.
+6. ~~**Resumable transfers**~~ — done in phases 3 and 4. Partial files, an
+   atomic rename (or a three-step swap where the protocol's rename will not
+   overwrite), and resume from a partial left by a cancelled run. A partial
+   longer than its source is discarded rather than appended to: it is debris
+   from a different version of the file.
 7. **Bisync conflict resolution UI** — per-file keep-local / keep-remote /
    keep-both (suffixed) / skip, driven from the Conflicts section.
 8. ~~**Host-key verification UX**~~ — done in phase 2, and it turned out to be
@@ -344,7 +351,7 @@ Ranked by how much I think they matter.
 | 1 | ✅ TUI shell, config loader, keymap engine, theme, help overlay — local↔local dual pane, no network. Synchronized browsing with ghosting, and union view, landed here too: they are pure path logic and needed no network, and building them first meant the `Vfs` trait was shaped by a real caller. |
 | 2 | ✅ `Vfs` + Local + SFTP/SCP; connection form; bookmarks + keyring; host-key TOFU; zide auto-open. Two things the underlying crates do not provide had to be written here: host key verification (`remotefs-ssh`'s libssh2 backend consults `known_hosts` nowhere at all), and an explicit `SshKeyStorage`, without which naming an identity file silently did nothing. `lazysync import termscp` slipped to phase 7 — its format carries an encrypted password blob, and an importer written against a format that cannot be tested here would be guesswork presented as a feature. |
 | 3 | ✅ Diff planner + confirmation window + native executor (push/pull, mirror). Three things the design did not anticipate: **SFTP's rename does not replace an existing file** (OpenSSH answers `SSH_FX_PERMISSION_DENIED`), so overwrites go through a three-step swap — see `Capabilities::atomic_overwrite_rename`; a **percentage-only delete guard misfires on small trees**, where removing one of two files reads as 50%, so a floor was added with a separate all-or-nothing check that fires at any size; and the **backup directory had to be excluded from planning**, or the second mirror run deletes the backups the first one made. |
-| 4 | Transfer queue, progress, resume, filters, sync profiles, safety rails |
+| 4 | ✅ Transfer queue, progress, resume, filters, sync profiles. (Safety rails landed early, in phase 3.) The queue is a state machine the main loop steps a chunk per frame rather than a worker thread: the panes own the `Vfs` values and an SFTP session cannot be cloned without asking for the password again, so a thread would mean the browser losing its backends for the duration. Stepping gives progress and cancellation with no shared state. Two things worth noting: `Vfs` gained streaming handles, so a 4 GB file no longer costs 4 GB of memory; and the glob matcher had to be memoised after `*a*a*a*a*a*a*b` against forty `a`s took **3.7 seconds** — the patterns come from the user's own config, so that was a filter line able to freeze the planner. |
 | 5 | rsync + rclone executors; `RcloneFs`; remaining native backends (FTP/S3/SMB/WebDAV) |
 | 6 | Bisync + state snapshots + conflict UI |
 | 7 | Watch mode, headless CLI + audit log, home-manager module, docs + demo cast |

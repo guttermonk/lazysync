@@ -118,6 +118,7 @@ fn browser() -> Keymap {
         (Action::SyncPush, chord("sp")),
         (Action::SyncPull, chord("sl")),
         (Action::SyncMirror, chord("sm")),
+        (Action::SyncProfile, chord("ss")),
         // General.
         (Action::Help, c('?')),
         (Action::Cancel, n(Key::Esc)),
@@ -226,8 +227,11 @@ fn help() -> Keymap {
 fn queue() -> Keymap {
     let mut bindings = motions();
     bindings.extend([
+        // `p` for pause, and Esc to cancel. Cancelling is Esc rather than `q`
+        // because `q` in every other mode quits lazysync, and quitting
+        // mid-transfer should not be one keystroke away from pausing it.
+        (Action::TogglePause, c('p')),
         (Action::Cancel, n(Key::Esc)),
-        (Action::Cancel, c('q')),
         (Action::Help, c('?')),
     ]);
     Keymap(bindings)

@@ -92,6 +92,34 @@ impl Harness {
         self.key(ModifiedKey::plain(Key::Space));
     }
 
+    /// Drive the transfer to completion, as the main loop does.
+    ///
+    /// `y` starts a queue and returns; the loop in `tui::main_loop` steps it a
+    /// chunk per frame. These tests stand in for that loop, which is also why
+    /// they exercise the stepping rather than a separate blocking path.
+    fn drain(&mut self) {
+        let mut guard = 0;
+        while self.app.transfer_is_active() {
+            self.app.step_transfer();
+            guard += 1;
+            assert!(guard < 200_000, "the transfer did not terminate");
+        }
+    }
+
+    /// `y`, then run the transfer out.
+    ///
+    /// Leaves the progress screen up, as the real thing does: it becomes a
+    /// report once finished and waits to be acknowledged.
+    fn apply(&mut self) {
+        self.press("y");
+        self.drain();
+    }
+
+    /// Dismiss the finished progress screen, back to the browser.
+    fn dismiss(&mut self) {
+        self.key(ModifiedKey::plain(Key::Esc));
+    }
+
     /// Move the confirmation cursor onto a named row.
     fn select_row(&mut self, name: &str) {
         let plan = self.app.plan.as_ref().expect("a plan should be open");
@@ -198,9 +226,9 @@ fn y_applies_the_plan() {
     h.refresh();
 
     h.press("sp");
-    h.press("y");
+    h.apply();
 
-    assert_eq!(h.app.screen, Screen::Browser);
+    assert!(h.app.transfer.is_some(), "the progress screen should be up");
     assert_eq!(
         fs::read_to_string(h.right().join("index.html")).unwrap(),
         "hello world"
@@ -225,7 +253,7 @@ fn applying_preserves_timestamps() {
     h.refresh();
 
     h.press("sp");
-    h.press("y");
+    h.apply();
 
     assert_eq!(
         mtime_of(&h.right().join("index.html")),
@@ -233,6 +261,12 @@ fn applying_preserves_timestamps() {
     );
 
     // And the proof of the pudding: planning again finds nothing to do.
+    // The progress screen has to be dismissed first -- it stays up as a
+    // report until acknowledged, so the first keypress after a sync closes it
+    // rather than starting another one.
+    h.dismiss();
+    assert_eq!(h.app.screen, Screen::Browser);
+
     h.refresh();
     h.press("sp");
     assert_eq!(
@@ -284,7 +318,7 @@ fn an_excluded_row_is_not_applied_and_the_totals_follow() {
     );
     assert_eq!(after.clobbers_newer, 0, "the dangerous row was excluded");
 
-    h.press("y");
+    h.apply();
 
     assert_eq!(
         fs::read_to_string(h.right().join("config.toml")).unwrap(),
@@ -310,7 +344,7 @@ fn o_includes_only_the_selected_row() {
 
     assert_eq!(h.app.plan.as_ref().unwrap().totals().operations(), 1);
 
-    h.press("y");
+    h.apply();
     assert_eq!(
         fs::read_to_string(h.right().join("index.html")).unwrap(),
         "hello world"
@@ -421,7 +455,7 @@ fn a_mirror_moves_deletions_to_the_backup_directory_by_default() {
     h.refresh();
 
     h.press("sm");
-    h.press("y");
+    h.apply();
 
     assert!(!h.right().join("obsolete.txt").exists());
     assert_eq!(
@@ -467,6 +501,7 @@ fn permanent_deletion_asks_a_second_time() {
     // Accepting goes through.
     h.press("y");
     h.press("y");
+    h.drain();
     assert!(!h.right().join("obsolete.txt").exists());
     assert!(!h.right().join(".lazysync-backup").exists());
 }
@@ -530,7 +565,7 @@ fn sl_plans_a_pull_in_the_other_direction() {
     assert!(plan.source_root.ends_with("right"));
     assert!(plan.dest_root.ends_with("left"));
 
-    h.press("y");
+    h.apply();
     assert_eq!(
         fs::read_to_string(h.left().join("a")).unwrap(),
         "new content",
@@ -568,7 +603,7 @@ fn a_destination_that_changes_after_planning_is_skipped_not_clobbered() {
     // Someone else writes to the destination while the window is open.
     write(&h.right().join("a"), "SOMEONE ELSE'S WORK", 3_000_000);
 
-    h.press("y");
+    h.apply();
 
     assert_eq!(
         fs::read_to_string(h.right().join("a")).unwrap(),
@@ -604,7 +639,7 @@ fn hidden_files_are_not_synced_unless_they_are_shown() {
     h.refresh();
 
     h.press("sp");
-    h.press("y");
+    h.apply();
 
     assert!(h.right().join("visible").exists());
     assert!(
@@ -620,13 +655,406 @@ fn a_sync_leaves_no_partial_files_behind() {
     h.refresh();
 
     h.press("sp");
-    h.press("y");
+    h.apply();
 
     let leftovers: Vec<_> = walk(&h.right())
         .into_iter()
         .filter(|p| p.to_string_lossy().contains("lazysync-part"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+// ── The transfer queue ──────────────────────────────────────────────────────
+
+/// `y` must return at once, not block until the sync finishes.
+#[test]
+fn applying_shows_the_progress_screen_rather_than_blocking() {
+    let mut h = Harness::new(Config::default());
+    // Several chunks' worth, so the transfer cannot complete in one step.
+    write(
+        &h.left().join("big.bin"),
+        &"x".repeat(lazysync::sync::transfer::CHUNK * 4),
+        1_000_000,
+    );
+    h.refresh();
+
+    h.press("sp");
+    h.press("y");
+
+    assert_eq!(h.app.screen, Screen::Transfer);
+    let transfer = h.app.transfer.as_ref().expect("a transfer");
+    assert!(
+        !transfer.is_finished(),
+        "it must not have run to completion"
+    );
+    assert!(
+        !h.right().join("big.bin").exists(),
+        "nothing should be in place yet"
+    );
+}
+
+#[test]
+fn progress_advances_as_the_transfer_is_stepped() {
+    let mut h = Harness::new(Config::default());
+    write(
+        &h.left().join("big.bin"),
+        &"x".repeat(lazysync::sync::transfer::CHUNK * 4),
+        1_000_000,
+    );
+    h.refresh();
+
+    h.press("sp");
+    h.press("y");
+
+    let mut seen = false;
+    for _ in 0..40 {
+        h.app.step_transfer();
+        let transfer = h.app.transfer.as_ref().unwrap();
+        let fraction = transfer.fraction();
+        if fraction > 0.0 && fraction < 1.0 {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "the aggregate bar should move part-way through");
+}
+
+#[test]
+fn p_pauses_and_resumes() {
+    let mut h = Harness::new(Config::default());
+    write(
+        &h.left().join("big.bin"),
+        &"x".repeat(lazysync::sync::transfer::CHUNK * 4),
+        1_000_000,
+    );
+    h.refresh();
+
+    h.press("sp");
+    h.press("y");
+    for _ in 0..2 {
+        h.app.step_transfer();
+    }
+
+    h.press("p");
+    assert_eq!(
+        h.app.transfer.as_ref().unwrap().state(),
+        lazysync::sync::TransferState::Paused
+    );
+    assert!(
+        !h.app.transfer_is_active(),
+        "a paused transfer must not keep the main loop spinning"
+    );
+
+    let before = h.app.transfer.as_ref().unwrap().bytes_done();
+    h.app.step_transfer();
+    assert_eq!(
+        h.app.transfer.as_ref().unwrap().bytes_done(),
+        before,
+        "stepping a paused transfer must do nothing"
+    );
+
+    h.press("p");
+    assert!(h.app.transfer_is_active());
+    h.drain();
+    assert!(h.right().join("big.bin").exists());
+}
+
+/// Cancelling mid-transfer has to stop promptly and keep what finished.
+#[test]
+fn esc_cancels_a_transfer_in_flight() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a-small"), "done", 1_000_000);
+    write(
+        &h.left().join("b-big.bin"),
+        &"x".repeat(lazysync::sync::transfer::CHUNK * 4),
+        1_000_000,
+    );
+    h.refresh();
+
+    h.press("sp");
+    h.press("y");
+    for _ in 0..4 {
+        h.app.step_transfer();
+    }
+
+    h.key(ModifiedKey::plain(Key::Esc));
+    h.drain();
+
+    assert!(h.app.transfer.as_ref().unwrap().is_finished());
+    assert_eq!(
+        fs::read_to_string(h.right().join("a-small")).unwrap(),
+        "done",
+        "a file finished before the cancel stays finished"
+    );
+    assert!(
+        !h.right().join("b-big.bin").exists(),
+        "the file in flight must not appear half-written at its real name"
+    );
+}
+
+/// The screen is a report once finished, so the next key dismisses it rather
+/// than doing something else.
+#[test]
+fn the_finished_screen_waits_to_be_acknowledged() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "x", 1_000_000);
+    h.refresh();
+
+    h.press("sp");
+    h.apply();
+
+    assert_eq!(h.app.screen, Screen::Transfer);
+    assert!(h.app.status.contains("applied"), "{}", h.app.status);
+
+    h.dismiss();
+    assert_eq!(h.app.screen, Screen::Browser);
+    assert!(h.app.transfer.is_none());
+}
+
+/// A sync has to leave the panes showing what is actually there now.
+#[test]
+fn the_panes_are_reloaded_when_a_transfer_finishes() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("new.txt"), "x", 1_000_000);
+    h.refresh();
+
+    assert!(!h.app.panes[1].entries().iter().any(|e| e.name == "new.txt"));
+
+    h.press("sp");
+    h.apply();
+
+    assert!(
+        h.app.panes[1].entries().iter().any(|e| e.name == "new.txt"),
+        "the destination pane should show the file that was just written"
+    );
+}
+
+/// A file larger than any sane buffer must transfer without being held in
+/// memory. This checks the result; the streaming is what makes it possible.
+#[test]
+fn a_multi_chunk_file_transfers_byte_for_byte() {
+    let mut h = Harness::new(Config::default());
+    // A pattern rather than a constant byte, so a chunk-boundary bug shows up
+    // as wrong content rather than passing by luck.
+    let payload: Vec<u8> = (0..lazysync::sync::transfer::CHUNK * 3 + 777)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    fs::write(h.left().join("blob.bin"), &payload).unwrap();
+    filetime::set_file_mtime(
+        h.left().join("blob.bin"),
+        FileTime::from_unix_time(1_000_000, 0),
+    )
+    .unwrap();
+    h.refresh();
+
+    h.press("sp");
+    h.apply();
+
+    assert_eq!(
+        fs::read(h.right().join("blob.bin")).unwrap(),
+        payload,
+        "a chunked copy has to be byte-identical across the boundaries"
+    );
+}
+
+// ── Profiles and filters ────────────────────────────────────────────────────
+
+/// A profile's exclude rules have to reach the planner. Without this,
+/// "advanced syncing" means pushing `target/` to a web server every time.
+#[test]
+fn a_profiles_exclude_rules_are_applied() {
+    let config: Config = toml::from_str(
+        r#"
+        [profiles.deploy]
+        mode = "push"
+        exclude = ["target/", "*.log"]
+        "#,
+    )
+    .unwrap();
+
+    let mut h = Harness::new(config);
+    write(&h.left().join("src/main.rs"), "code", 1_000_000);
+    write(
+        &h.left().join("target/debug/huge"),
+        "build output",
+        1_000_000,
+    );
+    write(&h.left().join("debug.log"), "noise", 1_000_000);
+    h.refresh();
+
+    h.app.active_profile = Some("deploy".into());
+    h.press("sp");
+
+    let planned: Vec<String> = h
+        .app
+        .plan
+        .as_ref()
+        .expect("a plan")
+        .rows
+        .iter()
+        .map(|r| r.path.display().to_string())
+        .collect();
+
+    assert!(planned.contains(&"src/main.rs".to_string()), "{planned:?}");
+    assert!(
+        !planned.iter().any(|p| p.starts_with("target")),
+        "{planned:?}"
+    );
+    assert!(!planned.contains(&"debug.log".to_string()), "{planned:?}");
+}
+
+/// With no profile, nothing is excluded -- a filter that applied by accident
+/// would be worse than none.
+#[test]
+fn without_a_profile_nothing_is_excluded() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("target/x"), "a", 1_000_000);
+    h.refresh();
+
+    h.press("sp");
+
+    assert!(h
+        .app
+        .plan
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .any(|r| r.path.starts_with("target")));
+}
+
+/// A pattern lazysync cannot honour stops the plan rather than being skipped:
+/// a filter that silently does nothing is how `target/` ends up on a server.
+#[test]
+fn an_unsupported_exclude_pattern_refuses_to_plan() {
+    let config: Config = toml::from_str(
+        r#"
+        [profiles.broken]
+        mode = "push"
+        exclude = ["*.[oa]"]
+        "#,
+    )
+    .unwrap();
+
+    let mut h = Harness::new(config);
+    write(&h.left().join("a"), "x", 1_000_000);
+    h.refresh();
+
+    h.app.active_profile = Some("broken".into());
+    h.press("sp");
+
+    assert!(
+        h.app.plan.is_none(),
+        "it must not plan with a broken filter"
+    );
+    assert!(
+        h.app.status.contains("character class"),
+        "and it must say why: {}",
+        h.app.status
+    );
+}
+
+#[test]
+fn respect_gitignore_reads_the_sync_roots_own_file() {
+    let config: Config = toml::from_str(
+        r#"
+        [profiles.deploy]
+        mode = "push"
+        respect_gitignore = true
+        "#,
+    )
+    .unwrap();
+
+    let mut h = Harness::new(config);
+    write(
+        &h.left().join(".gitignore"),
+        "ignored.txt\n# a comment\n",
+        1_000_000,
+    );
+    write(&h.left().join("ignored.txt"), "no", 1_000_000);
+    write(&h.left().join("kept.txt"), "yes", 1_000_000);
+    h.refresh();
+
+    h.app.active_profile = Some("deploy".into());
+    h.press("sp");
+
+    let planned: Vec<String> = h
+        .app
+        .plan
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r.path.display().to_string())
+        .collect();
+
+    assert!(planned.contains(&"kept.txt".to_string()), "{planned:?}");
+    assert!(!planned.contains(&"ignored.txt".to_string()), "{planned:?}");
+}
+
+/// `ss` uses the profile's own direction, which is the point of having one.
+#[test]
+fn ss_plans_using_the_profiles_own_mode() {
+    let config: Config = toml::from_str(
+        r#"
+        [profiles.fetch]
+        mode = "pull"
+        "#,
+    )
+    .unwrap();
+
+    let mut h = Harness::new(config);
+    write(&h.left().join("a"), "old", 1_000_000);
+    write(&h.right().join("a"), "newer from remote", 2_000_000);
+    h.refresh();
+
+    h.app.active_profile = Some("fetch".into());
+    h.press("ss");
+
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert!(
+        plan.source_root.ends_with("right"),
+        "a pull profile should read from the remote side"
+    );
+
+    h.apply();
+    assert_eq!(
+        fs::read_to_string(h.left().join("a")).unwrap(),
+        "newer from remote"
+    );
+}
+
+#[test]
+fn ss_without_a_profile_says_so() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "x", 1_000_000);
+    h.refresh();
+
+    h.press("ss");
+
+    assert!(h.app.plan.is_none());
+    assert!(h.app.status.contains("no sync profile"), "{}", h.app.status);
+}
+
+#[test]
+fn a_profile_naming_bisync_is_refused_rather_than_run_as_something_else() {
+    let config: Config = toml::from_str(
+        r#"
+        [profiles.both]
+        mode = "bisync"
+        "#,
+    )
+    .unwrap();
+
+    let mut h = Harness::new(config);
+    write(&h.left().join("a"), "x", 1_000_000);
+    h.refresh();
+
+    h.app.active_profile = Some("both".into());
+    h.press("ss");
+
+    assert!(h.app.plan.is_none());
+    assert!(h.app.status.contains("phase 6"), "{}", h.app.status);
 }
 
 fn walk(root: &Path) -> Vec<std::path::PathBuf> {

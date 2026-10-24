@@ -28,7 +28,9 @@ use remotefs::{
 };
 use remotefs_ssh::{ScpFs, SftpFs, SshAgentIdentity, SshKeyStorage, SshOpts};
 
-use super::{Capabilities, Entry, EntryKind, Vfs, VfsError, WriteMetadata};
+use super::{
+    Capabilities, Entry, EntryKind, ReadHandle, Vfs, VfsError, WriteHandle, WriteMetadata,
+};
 use crate::{
     connection::{AuthMethod, Protocol, Secret, Target, CONNECT_TIMEOUT},
     vfs::hostkey::{self, HostKey, Verdict},
@@ -355,6 +357,48 @@ impl Vfs for SshFs {
         Ok(convert(&file))
     }
 
+    fn open_read(&mut self, path: &Path, offset: u64) -> Result<Box<dyn ReadHandle>, VfsError> {
+        let mut opts = ReadOptions::default();
+        if offset > 0 {
+            opts = opts.offset(offset);
+        }
+        let stream = self
+            .client
+            .open(path, &opts)
+            .map_err(|e| translate(e, &format!("opening {}", path.display())))?;
+        Ok(Box::new(SshRead {
+            stream: Some(stream),
+            path: path.to_path_buf(),
+        }))
+    }
+
+    fn open_write(
+        &mut self,
+        path: &Path,
+        metadata: &WriteMetadata,
+        append: bool,
+    ) -> Result<Box<dyn WriteHandle>, VfsError> {
+        let mut opts = WriteOptions::default().size_hint(metadata.size);
+        if let Some(mtime) = metadata.mtime {
+            opts = opts.modified(mtime.into());
+        }
+        if let Some(mode) = metadata.mode {
+            opts = opts.mode(UnixPex::from(mode & 0o7777));
+        }
+
+        let stream = if append {
+            self.client.append(path, &opts)
+        } else {
+            self.client.create(path, &opts)
+        }
+        .map_err(|e| translate(e, &format!("opening {} for writing", path.display())))?;
+
+        Ok(Box::new(SshWrite {
+            stream: Some(stream),
+            path: path.to_path_buf(),
+        }))
+    }
+
     fn read_into(&mut self, path: &Path, dest: &mut (dyn Write + Send)) -> Result<u64, VfsError> {
         self.client
             .read_file(path, &ReadOptions::default(), dest)
@@ -441,6 +485,90 @@ impl Vfs for SshFs {
 impl Drop for SshFs {
     fn drop(&mut self) {
         self.disconnect();
+    }
+}
+
+/// A remote file open for reading.
+///
+/// The stream is in an `Option` because `finish` consumes it and the trait
+/// method takes a boxed `self`; there is nowhere to move it out of otherwise.
+struct SshRead {
+    stream: Option<remotefs::fs::ReadStream>,
+    path: PathBuf,
+}
+
+impl Read for SshRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match &mut self.stream {
+            Some(stream) => stream.read(buf),
+            None => Ok(0),
+        }
+    }
+}
+
+impl ReadHandle for SshRead {
+    fn finish(mut self: Box<Self>) -> Result<(), VfsError> {
+        match self.stream.take() {
+            Some(stream) => stream
+                .finish()
+                .map_err(|e| translate(e, &format!("closing the read of {}", self.path.display()))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A remote file open for writing.
+struct SshWrite {
+    stream: Option<remotefs::fs::WriteStream>,
+    path: PathBuf,
+}
+
+impl Write for SshWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut self.stream {
+            Some(stream) => stream.write(buf),
+            None => Err(std::io::Error::other("the stream was already finished")),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.stream {
+            Some(stream) => stream.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl WriteHandle for SshWrite {
+    fn finish(mut self: Box<Self>) -> Result<(), VfsError> {
+        let Some(mut stream) = self.stream.take() else {
+            return Ok(());
+        };
+
+        // Flush before finishing: `finish` closes the channel, and buffered
+        // bytes that never reached the server would leave a short file the
+        // caller would then rename into place.
+        stream.flush().map_err(|e| VfsError::Io {
+            context: format!("flushing {}", self.path.display()),
+            source: e,
+        })?;
+
+        stream
+            .finish()
+            .map_err(|e| translate(e, &format!("closing {}", self.path.display())))
+    }
+}
+
+impl Drop for SshWrite {
+    fn drop(&mut self) {
+        if self.stream.is_some() {
+            // A dropped write stream is a bug: the caller is about to rename a
+            // file whose last bytes may never have been sent.
+            tracing::warn!(
+                "{} was dropped without being finished; it may be incomplete",
+                self.path.display()
+            );
+        }
     }
 }
 

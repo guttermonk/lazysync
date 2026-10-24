@@ -1,6 +1,6 @@
 //! Terminal setup and the main loop.
 
-use std::io;
+use std::{io, time::Duration};
 
 use anyhow::Result;
 use ratatui::{
@@ -32,8 +32,24 @@ fn main_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        // With no chord in progress there is nothing to wake up for, so block
-        // on input rather than polling: an idle lazysync should use no CPU.
+        // A transfer in flight is driven here, a chunk per frame. That is what
+        // makes the progress bar move and `esc` work at all: applying a whole
+        // plan in one call would block this loop until it finished.
+        if app.transfer_is_active() {
+            app.step_transfer();
+
+            // Drain whatever input has arrived without waiting for more, so a
+            // keypress is noticed within a chunk rather than at the end of the
+            // transfer.
+            while event::poll(Duration::ZERO)? {
+                handle(app, &mut dispatcher, event::read()?);
+            }
+            continue;
+        }
+
+        // With no chord in progress and nothing transferring, there is nothing
+        // to wake up for: block on input rather than polling, so an idle
+        // lazysync uses no CPU.
         match dispatcher.poll_timeout() {
             None => handle(app, &mut dispatcher, event::read()?),
             Some(remaining) => {

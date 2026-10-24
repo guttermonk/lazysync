@@ -5,17 +5,17 @@ set, vim keys by default with every binding remappable, and a confirmation
 window that shows you both sides of every overwrite — size and timestamp,
 source and destination — before anything moves.
 
-> **Status: phase 3 of 7.** **It syncs.** Plan a push, pull or mirror from the
-> browser, review every row in the confirmation window, and apply it — over
-> the local filesystem or SFTP/SCP. Plus saved connections, host key
-> verification, keyring passwords, zide auto-open, synchronized browsing with
-> ghosting, union view, and vim keys throughout.
+> **Status: phase 4 of 7.** Plan a push, pull or mirror, review every row,
+> and watch it transfer — with progress, throughput, ETA, pause and cancel,
+> resumable partial files, and gitignore-style exclude rules driven by named
+> sync profiles. Over the local filesystem or SFTP/SCP, with saved
+> connections, host key verification, keyring passwords, zide auto-open,
+> synchronized browsing with ghosting, union view, and vim keys throughout.
 >
-> What does not work yet: no transfer queue, so no progress bar, no resume,
-> and no parallelism — a sync of a large tree blocks until it finishes. No
-> filters, no bisync, no watch mode. FTP, S3, SMB and WebDAV are refused by
-> name. Each subcommand says which phase it arrives in. See
-> [`docs/PLAN.md`](docs/PLAN.md).
+> What does not work yet: no bisync, no watch mode, no inline diffs, and no
+> checksum re-verification from the window. Transfers are sequential — one
+> file at a time. FTP, S3, SMB and WebDAV are refused by name. Each subcommand
+> says which phase it arrives in. See [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Why not termscp
 
@@ -124,7 +124,8 @@ filters, `esc` drops to the local browser.
 In the browser: `h`/`j`/`k`/`l` navigate, `tab` switches panes, `S` toggles
 synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
 `o` cycles the sort, `?` shows every binding, `q` quits. `sp` plans a push,
-`sl` a pull, `sm` a mirror. All of it remappable — see below.
+`sl` a pull, `sm` a mirror, `ss` uses the connection's own sync profile. All
+of it remappable — see below.
 
 ### The confirmation window
 
@@ -155,6 +156,45 @@ nothing else has a path to the executor.
 Deletions move to `.lazysync-backup/` by default rather than vanishing, and a
 mirror that would empty the destination is refused outright — that is what a
 mirror pointed at the wrong root looks like.
+
+### Transfers
+
+`y` hands the plan to a queue and shows progress; it does not block:
+
+```
+ transferring  ~/proj  →  box:/srv/www
+ 11 M of 69 M  ·  6 files left  ·  12 M/s · 4s left
+┌ file0.bin ──────────────────────────────────────────────────────┐
+│███████████████████████████ 11 M / 12 M █████████                │
+└─────────────────────────────────────────────────────────────────┘
+██████████████████ 17% of the plan
+ ✓  index.html                                            11 M
+ ✓  src/main.rs                                            2 M
+ p pause · esc cancel
+```
+
+`p` pauses between chunks, `esc` cancels. A cancelled file leaves its partial
+behind when `transfer.resume` is on, so the next run picks up where it
+stopped rather than re-sending. Files are streamed in 256 KiB chunks, so a
+4 GB file costs 256 KiB of memory rather than 4 GB.
+
+### Filters and profiles
+
+A `[profiles.<name>]` entry bundles a direction with exclude rules, and a
+bookmark's `sync_profile` points at one. `ss` then syncs using it, so you do
+not have to remember which way a given connection goes:
+
+```toml
+[profiles.deploy]
+mode = "push"
+exclude = ["/target/", "*.log", ".git/"]
+respect_gitignore = true
+```
+
+Rules are gitignore syntax — `name`, `name/`, `/name`, `*`, `**`, `?`, and
+`!` to re-include. Character classes aren't supported, and a pattern using
+one is an error rather than a literal: a filter that silently does nothing is
+how `target/` ends up on a web server.
 
 ### Connections
 

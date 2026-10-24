@@ -10,6 +10,7 @@ pub mod form;
 mod form_view;
 mod help;
 mod panes;
+mod progress;
 mod status;
 
 use ratatui::{
@@ -41,6 +42,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             // strings, so the copy costs nothing.
             if let Some(form) = app.form.clone() {
                 form_view::draw(frame, app, &form, body);
+            }
+        }
+        Screen::Transfer => {
+            if let Some(transfer) = &app.transfer {
+                progress::draw(frame, app, transfer, body);
             }
         }
         Screen::Confirm => {

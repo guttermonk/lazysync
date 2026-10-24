@@ -2,11 +2,13 @@
 
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Component, Path, PathBuf},
 };
 
-use super::{Capabilities, Entry, EntryKind, Vfs, VfsError, WriteMetadata};
+use super::{
+    Capabilities, Entry, EntryKind, ReadHandle, Vfs, VfsError, WriteHandle, WriteMetadata,
+};
 
 /// The machine lazysync is running on.
 #[derive(Debug, Default, Clone, Copy)]
@@ -175,6 +177,41 @@ impl Vfs for LocalFs {
         })
     }
 
+    fn open_read(&mut self, path: &Path, offset: u64) -> Result<Box<dyn ReadHandle>, VfsError> {
+        let mut file = fs::File::open(path).map_err(|e| classify(e, path))?;
+        if offset > 0 {
+            file.seek(io::SeekFrom::Start(offset))
+                .map_err(|e| VfsError::Io {
+                    context: format!("seeking to {offset} in {}", path.display()),
+                    source: e,
+                })?;
+        }
+        Ok(Box::new(LocalRead(file)))
+    }
+
+    fn open_write(
+        &mut self,
+        path: &Path,
+        metadata: &WriteMetadata,
+        append: bool,
+    ) -> Result<Box<dyn WriteHandle>, VfsError> {
+        let file = fs::File::options()
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)
+            .map_err(|e| classify(e, path))?;
+
+        Ok(Box::new(LocalWrite {
+            file,
+            // Applied on `finish`, not now: writing data updates the mtime, so
+            // stamping it first would be undone by the bytes.
+            metadata: *metadata,
+            path: path.to_path_buf(),
+        }))
+    }
+
     fn read_into(&mut self, path: &Path, dest: &mut (dyn Write + Send)) -> Result<u64, VfsError> {
         let mut file = fs::File::open(path).map_err(|e| classify(e, path))?;
         let copied = io::copy(&mut file, dest).map_err(|e| VfsError::Io {
@@ -266,6 +303,75 @@ impl Vfs for LocalFs {
 
     fn root(&self) -> PathBuf {
         PathBuf::from("/")
+    }
+}
+
+/// A local file open for reading.
+struct LocalRead(fs::File);
+
+impl Read for LocalRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl ReadHandle for LocalRead {
+    fn finish(self: Box<Self>) -> Result<(), VfsError> {
+        // Nothing to commit on a read.
+        Ok(())
+    }
+}
+
+/// A local file open for writing, with the metadata to stamp on close.
+struct LocalWrite {
+    file: fs::File,
+    metadata: WriteMetadata,
+    path: PathBuf,
+}
+
+impl Write for LocalWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl WriteHandle for LocalWrite {
+    fn finish(mut self: Box<Self>) -> Result<(), VfsError> {
+        self.file.flush().map_err(|e| VfsError::Io {
+            context: format!("flushing {}", self.path.display()),
+            source: e,
+        })?;
+
+        // Durable before the caller renames it into place. Without this, a
+        // crash between the rename and the writeback leaves the destination
+        // name pointing at content that never landed.
+        self.file.sync_all().map_err(|e| VfsError::Io {
+            context: format!("syncing {}", self.path.display()),
+            source: e,
+        })?;
+
+        // Timestamps last, on the closed file: writing updates the mtime, so
+        // stamping earlier would be undone by the data.
+        if let Some(mtime) = self.metadata.mtime {
+            let times = fs::FileTimes::new().set_modified(mtime.into());
+            self.file.set_times(times).map_err(|e| VfsError::Io {
+                context: format!("setting the timestamp on {}", self.path.display()),
+                source: e,
+            })?;
+        }
+
+        #[cfg(unix)]
+        if let Some(mode) = self.metadata.mode {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(|e| classify(e, &self.path))?;
+        }
+
+        Ok(())
     }
 }
 

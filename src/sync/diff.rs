@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     compare::Comparator,
+    filters::Filters,
     plan::{self, Plan, Row},
 };
 use crate::{
@@ -66,6 +67,17 @@ pub fn plan(
     direction: Direction,
     config: &Config,
 ) -> Plan {
+    plan_with_filters(source, dest, direction, config, &Filters::default())
+}
+
+/// As [`plan`], with exclude rules applied.
+pub fn plan_with_filters(
+    source: Endpoint<'_>,
+    dest: Endpoint<'_>,
+    direction: Direction,
+    config: &Config,
+    filters: &Filters,
+) -> Plan {
     let Endpoint {
         fs: source,
         root: source_root,
@@ -113,6 +125,7 @@ pub fn plan(
         mtime_caveat,
         mode_caveat,
         &policy,
+        filters,
         &mut built,
     );
 
@@ -136,6 +149,7 @@ fn walk(
     mtime_caveat: Option<&'static str>,
     mode_caveat: Option<&'static str>,
     policy: &super::safety::DeletePolicy,
+    filters: &Filters,
     built: &mut Plan,
 ) {
     if depth > MAX_DEPTH {
@@ -198,6 +212,14 @@ fn walk(
             continue;
         }
 
+        // Exclude rules. Applied here rather than after planning, so an
+        // excluded directory is never descended into at all -- on a remote
+        // that is a saved round trip per level.
+        let is_dir = matches!(entry.kind, EntryKind::Dir) || entry.symlink_to_dir;
+        if filters.excludes(&child, is_dir) {
+            continue;
+        }
+
         // The guard against a listing that somehow names a path outside the
         // root. A backend is not supposed to do this; if one does, writing
         // there would escape the sync root entirely.
@@ -241,6 +263,7 @@ fn walk(
                     mtime_caveat,
                     mode_caveat,
                     policy,
+                    filters,
                     built,
                 );
             }
@@ -264,6 +287,7 @@ fn walk(
                     mtime_caveat,
                     mode_caveat,
                     policy,
+                    filters,
                     built,
                 );
             }
@@ -357,6 +381,15 @@ fn walk(
             // destination root the next mirror would otherwise see it as
             // extraneous and remove it -- destroying every backup it holds.
             if super::safety::is_backup_path(policy, &child) {
+                continue;
+            }
+
+            // An excluded path is not lazysync's business on either side. A
+            // mirror that deleted the destination's `target/` because the
+            // source's was filtered out would be deleting files the user
+            // explicitly told it to ignore.
+            let is_dir = matches!(entry.kind, EntryKind::Dir) || entry.symlink_to_dir;
+            if filters.excludes(&child, is_dir) {
                 continue;
             }
             built
@@ -901,6 +934,107 @@ mod tests {
 
         assert_eq!(plan.count(Section::Delete), 0, "{:?}", plan.rows);
         assert!(!plan.rows.iter().any(|r| r.path.starts_with("backups")));
+    }
+
+    /// Filters are what make "advanced syncing" mean more than pushing
+    /// `target/` to a web server every time.
+    #[test]
+    fn excluded_paths_are_not_planned() {
+        let t = trees();
+        write(&t.left.join("src/main.rs"), "code", 1000);
+        write(&t.left.join("target/debug/binary"), "huge", 1000);
+        write(&t.left.join("notes.log"), "noise", 1000);
+
+        let filters = Filters::parse(&["target/".to_owned(), "*.log".to_owned()]).unwrap();
+        let mut source = LocalFs::new();
+        let mut dest = LocalFs::new();
+        let plan = plan_with_filters(
+            Endpoint {
+                fs: &mut source,
+                root: &t.left,
+                label: "local".into(),
+            },
+            Endpoint {
+                fs: &mut dest,
+                root: &t.right,
+                label: "remote".into(),
+            },
+            Direction {
+                source: 0,
+                delete_extraneous: false,
+            },
+            &Config::default(),
+            &filters,
+        );
+
+        let planned: Vec<String> = plan
+            .rows
+            .iter()
+            .map(|r| r.path.display().to_string())
+            .collect();
+
+        assert!(planned.contains(&"src/main.rs".to_string()), "{planned:?}");
+        assert!(
+            !planned.iter().any(|p| p.starts_with("target")),
+            "an excluded directory must not be descended into: {planned:?}"
+        );
+        assert!(!planned.contains(&"notes.log".to_string()), "{planned:?}");
+    }
+
+    /// A mirror must not delete the destination's copy of something the user
+    /// filtered out -- that would be deleting files they explicitly told it
+    /// to ignore.
+    #[test]
+    fn a_mirror_does_not_delete_excluded_paths_from_the_destination() {
+        let t = trees();
+        write(&t.left.join("keep"), "x", 1000);
+        write(&t.right.join("keep"), "x", 1000);
+        write(&t.right.join("target/debug/their-build"), "theirs", 1000);
+        write(&t.right.join("their.log"), "theirs", 1000);
+
+        let filters = Filters::parse(&["target/".to_owned(), "*.log".to_owned()]).unwrap();
+        let mut source = LocalFs::new();
+        let mut dest = LocalFs::new();
+        let plan = plan_with_filters(
+            Endpoint {
+                fs: &mut source,
+                root: &t.left,
+                label: "local".into(),
+            },
+            Endpoint {
+                fs: &mut dest,
+                root: &t.right,
+                label: "remote".into(),
+            },
+            Direction {
+                source: 0,
+                delete_extraneous: true,
+            },
+            &Config::default(),
+            &filters,
+        );
+
+        assert_eq!(
+            plan.count(Section::Delete),
+            0,
+            "excluded paths are not lazysync's business on either side: {:?}",
+            plan.rows
+                .iter()
+                .filter(|r| r.action == Action::Delete)
+                .map(|r| &r.path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn no_filters_plans_everything() {
+        let t = trees();
+        write(&t.left.join("target/x"), "a", 1000);
+        write(&t.left.join("b.log"), "b", 1000);
+
+        let plan = run(&t, false, &Config::default());
+        assert!(plan.rows.iter().any(|r| r.path.starts_with("target")));
+        assert!(plan.rows.iter().any(|r| r.path == Path::new("b.log")));
     }
 
     #[test]

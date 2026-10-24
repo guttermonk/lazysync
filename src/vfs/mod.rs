@@ -187,6 +187,26 @@ pub trait Vfs: Send {
     /// outcome available.
     fn read_into(&mut self, path: &Path, dest: &mut (dyn Write + Send)) -> Result<u64, VfsError>;
 
+    /// Open `path` for reading, starting at `offset`.
+    ///
+    /// Streaming rather than whole-file, because the alternative is reading a
+    /// 4 GB file into memory to copy it. `offset` is for resuming an
+    /// interrupted transfer; a backend without
+    /// [`Capabilities::ranged_writes`] is only ever asked for 0.
+    fn open_read(&mut self, path: &Path, offset: u64) -> Result<Box<dyn ReadHandle>, VfsError>;
+
+    /// Open `path` for writing, truncating unless `append` is set.
+    ///
+    /// `append` resumes a partial transfer. The handle must be finished, not
+    /// just dropped: some protocols only commit on close, and a dropped
+    /// stream can leave a file the server considers incomplete.
+    fn open_write(
+        &mut self,
+        path: &Path,
+        metadata: &WriteMetadata,
+        append: bool,
+    ) -> Result<Box<dyn WriteHandle>, VfsError>;
+
     /// Write `src` to `path`, replacing whatever was there.
     ///
     /// `metadata` carries the size hint, mode and mtime to apply. The size
@@ -228,6 +248,25 @@ pub trait Vfs: Send {
 
     /// The topmost directory, for [`crate::keys::Action::GoRoot`].
     fn root(&self) -> PathBuf;
+}
+
+/// An open read stream.
+///
+/// `finish` exists because a protocol stream is not just a file descriptor:
+/// SFTP has to drain and close its channel, and an error there means the read
+/// was incomplete even though every `read` call succeeded.
+pub trait ReadHandle: Read + Send {
+    fn finish(self: Box<Self>) -> Result<(), VfsError>;
+}
+
+/// An open write stream.
+///
+/// Must be finished rather than dropped. Some protocols commit only on close,
+/// so a dropped handle can leave a file the server treats as truncated -- and
+/// a truncated file at the destination is the outcome the whole
+/// partial-then-rename dance exists to prevent.
+pub trait WriteHandle: Write + Send {
+    fn finish(self: Box<Self>) -> Result<(), VfsError>;
 }
 
 /// Why a filesystem operation failed.

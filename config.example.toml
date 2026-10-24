@@ -7,9 +7,8 @@
 # them from the UI, and round-tripping a hand-commented config through a
 # serializer would eat your comments.
 #
-# NOTE: this is the design target from docs/PLAN.md, not a description of what
-# is implemented today. Keys land in phase 1, bookmarks and zide in phase 2,
-# sync profiles in phases 3-4.
+# Options marked "not yet" are parsed and validated but not acted on; the
+# phase that implements each is in docs/PLAN.md.
 
 # ─── General ─────────────────────────────────────────────────────────────────
 
@@ -97,10 +96,11 @@ use_provider_hash = true
 # ─── Transfers ───────────────────────────────────────────────────────────────
 
 [transfer]
-# Concurrent file transfers per job.
+# Concurrent file transfers per job. NOT YET: transfers are sequential.
+# Parallelism within one SSH session needs multiple channels.
 parallel = 4
 
-# KiB/s, 0 for unlimited.
+# KiB/s, 0 for unlimited. NOT YET.
 bandwidth_limit = 0
 
 # Write to `<name>.lazysync-part` and rename on completion, so an interrupted
@@ -112,7 +112,8 @@ partial_suffix = ".lazysync-part"
 resume = true
 
 # Preserve mtime, and mode where the protocol allows it. The confirmation
-# window says so explicitly when it cannot.
+# window says so explicitly when it cannot. Both are always on today; the
+# flags exist to turn them off and are NOT YET honoured.
 preserve_mtime = true
 preserve_mode = true
 
@@ -120,8 +121,9 @@ preserve_mode = true
 
 [safety]
 # Where deletions go in mirror mode. Set to "" for real deletion.
-#   "trash"            -- the XDG trash, local destinations only
 #   "<path>"           -- a backup directory, relative to the sync root
+#   ""                 -- permanent deletion, confirmed a second time
+# ("trash" for the XDG trash is NOT YET implemented.)
 backup_dir = ".lazysync-backup"
 
 # Abort the plan rather than show it if more than this fraction of the
@@ -132,7 +134,8 @@ max_delete_fraction = 0.25
 max_delete_files = 0
 
 # Require a second confirmation when a plan would touch anything outside the
-# sync root (reachable through symlinks).
+# sync root (reachable through symlinks). NOT YET: symlinks are not
+# transferred at all, so nothing can currently escape the root this way.
 confirm_outside_root = true
 
 # ─── Confirmation window ─────────────────────────────────────────────────────
@@ -146,7 +149,8 @@ fold_skipped = true
 warn_dest_newer = true
 
 # Sections to show even when empty, so a missing section is never mistaken for
-# a missing check.
+# a missing check. Create, Overwrite and Delete are always shown; this list is
+# NOT YET read.
 always_show = ["create", "overwrite", "delete", "conflict"]
 
 # ─── Theme ───────────────────────────────────────────────────────────────────
@@ -226,6 +230,13 @@ preset = "terminal"
 #     ["Submit",     "enter"],
 # ]
 
+# The transfer progress screen.
+[keys.queue]
+# extra = [
+#     ["TogglePause", "p"],
+#     ["Cancel",      "esc"],
+# ]
+
 # ─── Sync profiles ───────────────────────────────────────────────────────────
 #
 # Named, reusable bundles of sync options, referenced by bookmarks and by
@@ -241,14 +252,29 @@ mode = "push"
 # "native" never shells out.
 executor = "auto"
 
-# gitignore syntax. Later rules win.
+# Exclude rules, in gitignore syntax. Later rules win, so `!keep.log` after
+# `*.log` means something.
+#
+#   name      that name at any depth, file or directory
+#   name/     directories only, and everything under them
+#   /name     anchored to the sync root
+#   *         within one path component;  ?  one character
+#   **        across separators
+#   !name     re-include
+#   # ...     a comment
+#
+# Character classes ([a-z]) are not supported. A pattern using one is an
+# error rather than a literal -- a filter that silently does nothing is how
+# `target/` ends up on a web server.
 exclude = ["/target/", "*.log", ".git/"]
 
-# Honour .gitignore files found in the tree, in addition to `exclude`.
+# Also read the sync root's own .gitignore, on top of `exclude`.
+# Nested .gitignore files are not consulted yet.
 respect_gitignore = false
 
 # Skip the confirmation window. Only honoured by `lazysync sync --yes` and by
-# watch mode; the interactive UI always shows the plan.
+# watch mode; the interactive UI always shows the plan. NOT YET read: use
+# --yes.
 auto_confirm = false
 
 [profiles.notes]
