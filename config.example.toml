@@ -152,9 +152,23 @@ always_show = ["create", "overwrite", "delete", "conflict"]
 # ─── Theme ───────────────────────────────────────────────────────────────────
 
 [theme]
-# "terminal" follows your terminal's palette. Also: "catppuccin-mocha",
-# "gruvbox-dark", "nord", or a path to a theme file.
+# "terminal" follows your terminal's own palette, so a transparent or themed
+# terminal shows through. Also: "catppuccin-mocha", "gruvbox-dark", "nord".
 preset = "terminal"
+
+# Individual colours can be overridden on top of the preset. Values are either
+# hex ("#89b4fa" or "0x89b4fa") or an ANSI name: reset, black, red, green,
+# yellow, blue, magenta, cyan, gray, dark-gray, and bright-red through
+# bright-white.
+#
+# Slots: fg, bg, dim, border, border_focused, dir, file, symlink, executable,
+# ghost, marked, cursor_fg, cursor_bg, status_fg, status_bg, accent, ok, warn,
+# danger.
+#
+# [theme.colors]
+# border_focused = "#fabd2f"
+# ghost = "dark-gray"      # one-sided rows in union view, and absent panes
+# danger = "bright-red"    # overwriting newer data with older
 
 # ─── Keybindings ─────────────────────────────────────────────────────────────
 #

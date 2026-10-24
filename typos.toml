@@ -1,4 +1,5 @@
 [default.extend-words]
-# "ba" shows up as a shell variable and in base-two prose; "crate" vs "create"
-# is a real risk in a file-sync codebase, so leave that one alone.
+# The TUI crate, not a misspelling of "ratatouille".
+ratatui = "ratatui"
+# Short for "serialize" in trait and function names.
 ser = "ser"

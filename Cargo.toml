@@ -14,9 +14,11 @@ categories = ["command-line-utilities", "filesystem"]
 exclude = ["/docs", "/assets", "/.github", "/flake.nix", "/flake.lock", "/package.nix"]
 
 [dependencies]
-# TUI
+# TUI. crossterm is reached through `ratatui::crossterm` rather than declared
+# here: ratatui-crossterm can build against either 0.28 or 0.29, and a second
+# direct dependency could resolve to the other one, at which point KeyEvent
+# from the re-export and KeyEvent from our own dep are different types.
 ratatui = "0.30"
-crossterm = "0.29"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
@@ -32,9 +34,11 @@ dirs = "5.0"
 anyhow = "1.0"
 thiserror = "2.0"
 
-# Logging to $XDG_STATE_HOME/lazysync/
+# Logging. The file sink is not optional: anything written to stderr while
+# ratatui holds the alternate screen corrupts the display.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # Timestamps on both sides of every sync row
 chrono = { version = "0.4", features = ["serde"] }

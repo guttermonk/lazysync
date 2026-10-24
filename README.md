@@ -5,10 +5,15 @@ set, vim keys by default with every binding remappable, and a confirmation
 window that shows you both sides of every overwrite — size and timestamp,
 source and destination — before anything moves.
 
-> **Status: phase 0.** This is the scaffolding commit. The design is written
-> up in [`docs/PLAN.md`](docs/PLAN.md); the code is not there yet. `lazysync`
-> currently parses its CLI and tells you which phase each subcommand arrives
-> in. Watch the repo if you want to know when it does something useful.
+> **Status: phase 1 of 7.** What works today: the dual-pane browser over the
+> local filesystem, vim keybindings with chords and full config overrides,
+> synchronized browsing with ghosting, union view, search, marks, themes, and
+> a help overlay generated from the live keymap. So `lazysync ~/proj
+> /mnt/backup/proj` is already a usable two-tree browser.
+>
+> What does not work yet: anything over a network, and anything that writes.
+> No SFTP, no bookmarks, no sync. Each subcommand tells you which phase it
+> arrives in. See [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Why not termscp
 
@@ -96,13 +101,22 @@ and falls back to its own engine with a note in the plan when they're not.
 ## Usage
 
 ```sh
-lazysync                              # bookmark list
-lazysync sftp://user@host/srv/www     # connect directly
-lazysync open www-prod                # open a saved bookmark
-lazysync sync deploy --dry-run        # print a plan, transfer nothing
-lazysync sync deploy --yes            # headless, for cron
+lazysync                              # both panes in the working directory
+lazysync /mnt/backup/proj             # the working directory against that
+lazysync ~/proj /mnt/backup/proj      # one directory in each pane
 lazysync keys --mode browser          # dump the resolved keymap
+lazysync config                       # dump the resolved config as TOML
+
+# Not yet implemented -- each says which phase it arrives in:
+lazysync sftp://user@host/srv/www     # connect directly          (phase 2)
+lazysync open www-prod                # open a saved bookmark     (phase 2)
+lazysync sync deploy --dry-run        # print a plan              (phase 3)
+lazysync sync deploy --yes            # headless, for cron        (phase 7)
 ```
+
+In the browser: `h`/`j`/`k`/`l` navigate, `tab` switches panes, `S` toggles
+synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
+`?` shows every binding, `q` quits. All of it remappable — see below.
 
 ## Configuration
 

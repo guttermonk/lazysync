@@ -25,8 +25,7 @@ Modelled on `jambi` for packaging/layout and `bluetui` for the ratatui + serde
 config idiom; the keybinding engine is modelled on `inlyne`.
 
 ```
-ratatui 0.30 + crossterm 0.29   TUI
-tokio                           async I/O, job queue, cancellation
+ratatui 0.30                    TUI (crossterm via ratatui::crossterm)
 remotefs-ssh / -ftp / -aws-s3   protocol backends (the crates termscp publishes)
   / -smb / -webdav
 serde + toml                    config, bookmarks, sync profiles, themes
@@ -34,9 +33,23 @@ keyring                         password storage (Secret Service / kwallet)
 notify                          watch mode
 blake3 + md5 + sha2             checksum verification (match provider hash)
 clap                            CLI
-tracing + tracing-subscriber    logs to $XDG_STATE_HOME/lazysync/
+tracing + tracing-appender      logs to $XDG_STATE_HOME/lazysync/
 thiserror / anyhow              errors
 ```
+
+**No async runtime.** The plan originally called for tokio. It is not there,
+because the `remotefs-*` crates are themselves blocking: an async `Vfs` would
+mean wrapping sync calls in `spawn_blocking` and paying async's complexity for
+none of its benefit. The trait is blocking, and phase 2 keeps the UI responsive
+by running each backend on its own worker thread and passing results to the UI
+thread — which is also how termscp does it. If a later phase needs real
+concurrency across many transfers, a thread pool is the smaller change.
+
+**crossterm is not a direct dependency.** `ratatui-crossterm` can build against
+either 0.28 or 0.29, so a second direct dependency risks resolving to the other
+one — at which point `KeyEvent` from the re-export and `KeyEvent` from our own
+dependency are different types. Everything goes through
+`ratatui::crossterm`.
 
 Tree-wide conventions copied from `jambi`: `rust-toolchain.toml`,
 `.rustfmt.toml`, `.cargo/config.toml`, `.envrc`, `flake.nix` + `package.nix`,
@@ -319,8 +332,8 @@ Ranked by how much I think they matter.
 
 | Phase | Deliverable |
 | --- | --- |
-| 0 | Repo scaffolding: flake, package.nix, CI, licenses, README skeleton, this doc |
-| 1 | TUI shell, config loader, keymap engine, theme, help overlay — local↔local dual pane, no network |
+| 0 | ✅ Repo scaffolding: flake, package.nix, CI, licenses, README skeleton, this doc |
+| 1 | ✅ TUI shell, config loader, keymap engine, theme, help overlay — local↔local dual pane, no network. Synchronized browsing with ghosting, and union view, landed here too: they are pure path logic and needed no network, and building them first meant the `Vfs` trait was shaped by a real caller. |
 | 2 | `Vfs` trait + Local + SFTP/SCP; connection form; bookmarks + keyring; host-key TOFU; zide auto-open |
 | 3 | Diff planner + confirmation window + native executor (push/pull, mirror) |
 | 4 | Transfer queue, progress, resume, filters, sync profiles, safety rails |
