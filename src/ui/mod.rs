@@ -5,6 +5,7 @@
 //! advertise a binding that does not exist.
 
 mod bookmarks;
+pub mod confirm;
 pub mod form;
 mod form_view;
 mod help;
@@ -40,6 +41,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             // strings, so the copy costs nothing.
             if let Some(form) = app.form.clone() {
                 form_view::draw(frame, app, &form, body);
+            }
+        }
+        Screen::Confirm => {
+            // Cloned for the same borrow reason as the form. A plan can be
+            // large, so this is the one place worth revisiting if a sync of
+            // tens of thousands of files ever feels slow to draw.
+            if let Some(plan) = app.plan.clone() {
+                let cursor = app.plan_cursor;
+                let folded = app.folded.clone();
+                confirm::draw(frame, app, &plan, cursor, &folded, body);
             }
         }
     }

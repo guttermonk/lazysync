@@ -20,6 +20,7 @@ pub mod connection;
 pub mod event;
 pub mod integrations;
 pub mod keys;
+pub mod sync;
 pub mod tui;
 pub mod ui;
 pub mod vfs;

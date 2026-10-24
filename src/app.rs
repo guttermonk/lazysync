@@ -15,10 +15,15 @@ use crate::{
         union::{self, UnionRow},
         Pane, Side,
     },
-    config::{Config, Palette, PaneSide},
+    config::{Config, Palette, PaneSide, SyncMode},
     connection::Secret,
     keys::{Action, Keymaps, Mode},
-    ui::form::ConnectionForm,
+    sync::{
+        diff, executor,
+        plan::{Plan, Section},
+        safety::{self, DeletePolicy},
+    },
+    ui::{confirm, form::ConnectionForm},
     vfs::{hostkey::HostKey, ssh, LocalFs, Vfs},
 };
 
@@ -96,6 +101,8 @@ pub enum Pending {
     DeleteBookmark { name: String },
     /// Record the pending host key, then carry on opening the connection.
     TrustHostKey,
+    /// Apply the plan under review, after a second confirmation.
+    ApplyPlan,
     /// Nothing. The answer was "no" and no has no side effect.
     Nothing,
 }
@@ -114,6 +121,8 @@ pub enum Screen {
     Browser,
     /// Adding or editing a connection.
     Form,
+    /// Reviewing a sync plan before it is applied.
+    Confirm,
 }
 
 /// Everything the UI draws and the event loop mutates.
@@ -150,6 +159,15 @@ pub struct App {
 
     /// The connection form, while [`Screen::Form`] is in front.
     pub form: Option<ConnectionForm>,
+
+    /// The sync plan under review, while [`Screen::Confirm`] is in front.
+    pub plan: Option<Plan>,
+    /// Cursor in the confirmation window's flattened heading-and-row list.
+    pub plan_cursor: usize,
+    /// Sections currently folded shut.
+    pub folded: Vec<Section>,
+    /// Which way the plan under review would move files.
+    plan_mode: SyncMode,
 
     /// Which bookmark a password prompt or host key dialog belongs to.
     connecting: Option<Bookmark>,
@@ -195,6 +213,16 @@ impl App {
             bookmark_cursor: 0,
             bookmark_filter: String::new(),
             form: None,
+            plan: None,
+            plan_cursor: 0,
+            // The identical files start folded: a plan whose review list is
+            // nine-tenths `=` rows is a plan nobody reads.
+            folded: if config.confirm.fold_skipped {
+                vec![Section::Skipped]
+            } else {
+                Vec::new()
+            },
+            plan_mode: SyncMode::Push,
             connecting: None,
             host_key: None,
             palette,
@@ -234,6 +262,7 @@ impl App {
             Screen::Bookmarks => Mode::Bookmarks,
             Screen::Browser => Mode::Browser,
             Screen::Form => Mode::Form,
+            Screen::Confirm => Mode::Confirm,
         }
     }
 
@@ -278,7 +307,7 @@ impl App {
             Mode::Form => self.handle_form(action),
             Mode::Help => self.handle_help(action),
             Mode::Prompt => self.handle_prompt(action),
-            Mode::Confirm => self.handle_question(action),
+            Mode::Confirm => self.handle_confirm(action),
             // The queue and log screens arrive with the transfers they show.
             Mode::Queue | Mode::Log => {}
         }
@@ -739,6 +768,10 @@ impl App {
             }
             Action::ToggleSyncBrowse => self.toggle_sync_browse(),
             Action::ToggleUnionView => self.toggle_union_view(),
+            Action::SyncPush => self.begin_sync(SyncMode::Push),
+            Action::SyncPull => self.begin_sync(SyncMode::Pull),
+            Action::SyncMirror => self.begin_sync(SyncMode::MirrorPush),
+
             Action::ToggleDirSizes => {
                 // Needs a recursive walk per directory, which over a network
                 // backend is slow enough that it belongs with the transfer
@@ -865,6 +898,259 @@ impl App {
         }
     }
 
+    // ── Sync: plan, review, apply ────────────────────────────────────────
+
+    /// Build a plan and put it on screen.
+    ///
+    /// Nothing is transferred here. The plan *is* the dry run, and the
+    /// confirmation window is the only route to applying it -- which is why
+    /// there is no "sync now" that skips this.
+    pub fn begin_sync(&mut self, mode: SyncMode) {
+        if !mode.is_implemented() {
+            self.status = format!("{} arrives in phase 6 -- see docs/PLAN.md", mode.label());
+            return;
+        }
+
+        let direction = mode.direction();
+        let source_index = direction.source;
+        let dest_index = direction.dest();
+
+        // Roots are the panes' current directories, so what gets synced is
+        // what you are looking at. Using the bookmark's configured paths
+        // instead would sync something other than what is on screen.
+        let source_root = self.panes[source_index].path().to_path_buf();
+        let dest_root = self.panes[dest_index].path().to_path_buf();
+
+        if self.panes[source_index].is_ghost() || self.panes[dest_index].is_ghost() {
+            self.status =
+                "one pane is standing on a directory that does not exist; nothing to sync".into();
+            return;
+        }
+
+        let source_label = side_label(source_index).to_string();
+        let dest_label = side_label(dest_index).to_string();
+
+        self.status = format!("planning {}...", mode.label());
+
+        // Split the array so both panes can be borrowed mutably at once.
+        let (first, second) = self.panes.split_at_mut(1);
+        let (source, dest) = if source_index == 0 {
+            (&mut first[0], &mut second[0])
+        } else {
+            (&mut second[0], &mut first[0])
+        };
+
+        let mut plan = diff::plan(
+            diff::Endpoint {
+                fs: source.vfs.as_mut(),
+                root: &source_root,
+                label: source_label,
+            },
+            diff::Endpoint {
+                fs: dest.vfs.as_mut(),
+                root: &dest_root,
+                label: dest_label,
+            },
+            direction,
+            &self.config,
+        );
+
+        safety::check(&mut plan, &self.config.safety);
+
+        if plan.is_empty() && plan.unreadable.is_empty() {
+            self.status = format!("nothing to {} -- the trees already match", mode.label());
+            return;
+        }
+
+        self.plan_mode = mode;
+        self.plan_cursor = 0;
+        self.folded = if self.config.confirm.fold_skipped {
+            vec![Section::Skipped]
+        } else {
+            Vec::new()
+        };
+        self.plan = Some(plan);
+        self.screen = Screen::Confirm;
+        self.status.clear();
+    }
+
+    fn handle_confirm(&mut self, action: Action) {
+        // A yes/no question overlay also uses this keymap; it is handled
+        // separately and takes priority.
+        if matches!(self.overlay, Overlay::Question(_)) {
+            self.handle_question(action);
+            return;
+        }
+
+        let Some(plan) = &mut self.plan else {
+            self.screen = Screen::Browser;
+            return;
+        };
+
+        let entries = confirm::entries(plan, &self.folded);
+        let last = entries.len().saturating_sub(1);
+
+        match action {
+            Action::MoveDown => self.plan_cursor = (self.plan_cursor + 1).min(last),
+            Action::MoveUp => self.plan_cursor = self.plan_cursor.saturating_sub(1),
+            Action::HalfPageDown | Action::PageDown => {
+                self.plan_cursor = (self.plan_cursor + 10).min(last);
+            }
+            Action::HalfPageUp | Action::PageUp => {
+                self.plan_cursor = self.plan_cursor.saturating_sub(10);
+            }
+            Action::MoveTop => self.plan_cursor = 0,
+            Action::MoveBottom => self.plan_cursor = last,
+
+            Action::ToggleRow => {
+                if let Some(index) = confirm::row_at(&entries, self.plan_cursor) {
+                    plan.toggle(index);
+                    // Re-check: excluding deletions can bring a refused plan
+                    // back under the limit, and a refusal that will not clear
+                    // is a dead end.
+                    safety::check(plan, &self.config.safety);
+                } else if let Some(section) = confirm::section_at(&entries, self.plan_cursor) {
+                    // On a heading, space folds -- the obvious thing to want.
+                    self.toggle_fold(section);
+                }
+            }
+            Action::AllRows => {
+                plan.set_all(true);
+                safety::check(plan, &self.config.safety);
+            }
+            Action::InvertRows => {
+                plan.invert();
+                safety::check(plan, &self.config.safety);
+            }
+            Action::OnlyRow => {
+                if let Some(index) = confirm::row_at(&entries, self.plan_cursor) {
+                    plan.only(index);
+                    safety::check(plan, &self.config.safety);
+                }
+            }
+
+            Action::FoldSection => {
+                if let Some(section) = confirm::section_at(&entries, self.plan_cursor) {
+                    if !self.folded.contains(&section) {
+                        self.folded.push(section);
+                    }
+                }
+            }
+            Action::UnfoldSection => {
+                if let Some(section) = confirm::section_at(&entries, self.plan_cursor) {
+                    self.folded.retain(|s| *s != section);
+                }
+            }
+
+            Action::Checksum => {
+                self.status =
+                    "re-checking by checksum arrives in phase 4, with the transfer queue".into();
+            }
+            Action::DiffRow => {
+                self.status = "inline diffs arrive in phase 4".into();
+            }
+
+            Action::Apply => self.confirm_apply(),
+
+            Action::Cancel => {
+                self.plan = None;
+                self.screen = Screen::Browser;
+                self.status = "cancelled -- nothing was transferred".into();
+            }
+            Action::Help => self.overlay = Overlay::Help { scroll: 0 },
+            Action::Quit => self.should_quit = true,
+            _ => {}
+        }
+    }
+
+    fn toggle_fold(&mut self, section: Section) {
+        if self.folded.contains(&section) {
+            self.folded.retain(|s| *s != section);
+        } else {
+            self.folded.push(section);
+        }
+    }
+
+    /// `y` in the confirmation window.
+    ///
+    /// A plan that deletes anything gets a second question. Not ceremony: the
+    /// first keystroke agrees to a screenful of rows, and the one irreversible
+    /// part of that deserves to be named on its own.
+    fn confirm_apply(&mut self) {
+        let Some(plan) = &self.plan else { return };
+
+        if let Some(refusal) = &plan.refusal {
+            self.status = refusal.clone();
+            return;
+        }
+        if !plan.can_apply() {
+            self.status = "nothing included -- press a to include everything".into();
+            return;
+        }
+
+        let totals = plan.totals();
+        let policy = DeletePolicy::from_config(&self.config.safety);
+
+        if totals.deletes > 0 && matches!(policy, DeletePolicy::Remove) {
+            self.overlay = Overlay::Question(Question {
+                text: format!(
+                    "Permanently delete {} file(s) on the {} side? This cannot be undone.",
+                    totals.deletes,
+                    side_label(self.plan_mode.direction().dest())
+                ),
+                on_yes: Pending::ApplyPlan,
+                on_no: Pending::Nothing,
+            });
+            return;
+        }
+
+        self.apply_plan();
+    }
+
+    fn apply_plan(&mut self) {
+        let Some(plan) = self.plan.take() else { return };
+
+        let direction = self.plan_mode.direction();
+        let source_index = direction.source;
+        let dest_index = direction.dest();
+
+        let source_root = self.panes[source_index].path().to_path_buf();
+        let dest_root = self.panes[dest_index].path().to_path_buf();
+        let policy = DeletePolicy::from_config(&self.config.safety);
+        let suffix = self.config.transfer.partial_suffix.clone();
+
+        let (first, second) = self.panes.split_at_mut(1);
+        let (source, dest) = if source_index == 0 {
+            (&mut first[0], &mut second[0])
+        } else {
+            (&mut second[0], &mut first[0])
+        };
+
+        let report = executor::apply(
+            source.vfs.as_mut(),
+            &source_root,
+            dest.vfs.as_mut(),
+            &dest_root,
+            &plan,
+            &policy,
+            &suffix,
+        );
+
+        // Both panes get re-read: the destination obviously changed, and the
+        // source may have had a partial file written next to it on a
+        // local-to-local sync.
+        for pane in &mut self.panes {
+            pane.reload();
+        }
+
+        for failure in report.failures() {
+            tracing::warn!("{}: {:?}", failure.path.display(), failure.outcome);
+        }
+
+        self.status = report.summary();
+        self.screen = Screen::Browser;
+    }
+
     fn handle_question(&mut self, action: Action) {
         let Overlay::Question(question) = &self.overlay else {
             return;
@@ -935,10 +1221,17 @@ impl App {
                 }
             }
 
+            Pending::ApplyPlan => self.apply_plan(),
+
             Pending::Nothing => {
                 self.connecting = None;
                 self.host_key = None;
-                self.status.clear();
+                // Declining the delete confirmation returns to the window
+                // rather than discarding the plan: the user may want to
+                // exclude the deletions and apply the rest.
+                if !matches!(self.screen, Screen::Confirm) {
+                    self.status.clear();
+                }
             }
         }
     }

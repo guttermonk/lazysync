@@ -5,17 +5,17 @@ set, vim keys by default with every binding remappable, and a confirmation
 window that shows you both sides of every overwrite — size and timestamp,
 source and destination — before anything moves.
 
-> **Status: phase 2 of 7.** What works today: the dual-pane browser over the
-> local filesystem **and over SFTP/SCP**, saved connections with the local
-> path kept, host key verification, optional keyring passwords, zide
-> auto-open, vim keybindings with chords and full config overrides,
-> synchronized browsing with ghosting, union view, search, marks, themes, and
-> a help overlay generated from the live keymap.
+> **Status: phase 3 of 7.** **It syncs.** Plan a push, pull or mirror from the
+> browser, review every row in the confirmation window, and apply it — over
+> the local filesystem or SFTP/SCP. Plus saved connections, host key
+> verification, keyring passwords, zide auto-open, synchronized browsing with
+> ghosting, union view, and vim keys throughout.
 >
-> What does not work yet: **nothing syncs**. There is no planner, no
-> confirmation window, and no transfers — browsing and connecting only. FTP,
-> S3, SMB and WebDAV are refused by name. Each subcommand says which phase it
-> arrives in. See [`docs/PLAN.md`](docs/PLAN.md).
+> What does not work yet: no transfer queue, so no progress bar, no resume,
+> and no parallelism — a sync of a large tree blocks until it finishes. No
+> filters, no bisync, no watch mode. FTP, S3, SMB and WebDAV are refused by
+> name. Each subcommand says which phase it arrives in. See
+> [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Why not termscp
 
@@ -49,9 +49,9 @@ Planned for 1.0, phased in the order below. See
 
 - Dual-pane browser over SFTP, SCP, FTP/FTPS, S3, SMB, WebDAV, and any
   `rclone` remote
-- Sync modes: push/pull without deletes, mirror with deletes, two-way bisync
-  with conflict resolution, and a file watcher
-- Confirmation window with per-row exclusion, inline diffs, and checksum
+- Sync modes: push/pull without deletes ✅, mirror with deletes ✅, two-way
+  bisync with conflict resolution, and a file watcher
+- Confirmation window with per-row exclusion ✅, inline diffs, and checksum
   re-verification
 - Synchronized browsing with ghost positions and a union view
 - Vim keybindings by default; every binding remappable per UI mode, with chord
@@ -111,9 +111,10 @@ lazysync ~/proj /mnt/backup/proj      # one directory in each pane
 lazysync keys --mode browser          # dump the resolved keymap
 lazysync config                       # dump the resolved config as TOML
 
+lazysync sync deploy ~/proj /mnt/backup --dry-run   # print a plan, move nothing
+lazysync sync deploy ~/proj /mnt/backup --yes      # headless, for cron
+
 # Not yet implemented -- each says which phase it arrives in:
-lazysync sync deploy --dry-run        # print a plan              (phase 3)
-lazysync sync deploy --yes            # headless, for cron        (phase 7)
 lazysync import termscp               # import bookmarks          (phase 7)
 ```
 
@@ -122,7 +123,38 @@ filters, `esc` drops to the local browser.
 
 In the browser: `h`/`j`/`k`/`l` navigate, `tab` switches panes, `S` toggles
 synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
-`?` shows every binding, `q` quits. All of it remappable — see below.
+`o` cycles the sort, `?` shows every binding, `q` quits. `sp` plans a push,
+`sl` a pull, `sm` a mirror. All of it remappable — see below.
+
+### The confirmation window
+
+`sp` does not transfer anything. It builds a plan and shows it:
+
+```
+ Sync  ~/proj  →  box:/srv/www        compare: size+mtime  tolerance: 2s  deletions move to .lazysync-backup/
+┌───────────────────────────────────────────────────────────────────────────────────────────────┐
+│    ▾ Create (1)                                                                               │
+│ +  src/main.rs                     11 B  2026-10-24 14:14        —                   +11 B    │
+│    ▾ Overwrite (2)                                                                            │
+│ ↓  config.toml                      5 B  2026-09-02 16:30      5 B  2026-10-23 19:02  DESTINATION IS NEWER │
+│ ↑  index.html                      11 B  2026-10-24 13:02      5 B  2026-10-21 14:14  +6 B     │
+│    ▾ Delete (1)                                                                               │
+│ ✗  obsolete.txt                       —                        8 B  2026-10-24 18:22  not on the source   │
+│    ▸ Skipped, identical (1)                                                      zo to open    │
+└───────────────────────────────────────────────────────────────────────────────────────────────┘
+ 3 ops · 27 B out · 1 unchanged · 1 would overwrite NEWER data
+ y apply · n cancel · space include/exclude · a all · i invert · o only · zc/zo fold
+```
+
+Both sides' size and timestamp on every row, so "overwrite" is never an
+abstract word. A **newer destination is red** — that is the one outcome of a
+sync that destroys work. `space` excludes a row and the totals recompute
+immediately. The plan *is* the dry run: `y` applies exactly these rows, and
+nothing else has a path to the executor.
+
+Deletions move to `.lazysync-backup/` by default rather than vanishing, and a
+mirror that would empty the destination is refused outright — that is what a
+mirror pointed at the wrong root looks like.
 
 ### Connections
 

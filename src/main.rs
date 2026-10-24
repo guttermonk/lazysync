@@ -24,9 +24,15 @@ fn main() -> Result<()> {
             init_stderr_logging();
             run_query(&cli)
         }
-        Some(Command::Sync { profile, .. }) => {
+        Some(Command::Sync {
+            profile,
+            source,
+            destination,
+            dry_run,
+            yes,
+        }) => {
             init_stderr_logging();
-            not_yet("sync", 3, &format!("profile {profile:?}"))
+            run_headless_sync(&cli, profile, source, destination, *dry_run, *yes)
         }
         Some(Command::Import { from }) => {
             init_stderr_logging();
@@ -89,6 +95,219 @@ fn run_query(cli: &Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `lazysync sync <profile>`, with no terminal.
+///
+/// Shares the planner and the executor with the interactive path, which is the
+/// point: a `--dry-run` report and the plan the confirmation window shows
+/// cannot drift apart, because they are produced by the same code from the
+/// same inputs.
+///
+/// Remote profiles are refused for now. Connecting non-interactively needs a
+/// credential with nowhere to prompt for it, and the keyring is the answer --
+/// but a cron job on a locked session cannot reach the keyring either, so that
+/// deserves its own design rather than a half-working version here.
+fn run_headless_sync(
+    cli: &Cli,
+    profile_name: &str,
+    source_arg: &std::path::Path,
+    dest_arg: &std::path::Path,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use lazysync::{
+        sync::{diff, executor, safety, safety::DeletePolicy},
+        vfs::LocalFs,
+    };
+
+    let config = Config::load_default(cli.config.as_deref())?;
+
+    let profile = config.profiles.get(profile_name).with_context(|| {
+        let known: Vec<_> = config.profiles.keys().map(String::as_str).collect();
+        if known.is_empty() {
+            format!("no sync profile called {profile_name:?}; config.toml has none defined")
+        } else {
+            format!(
+                "no sync profile called {profile_name:?} (have: {})",
+                known.join(", ")
+            )
+        }
+    })?;
+
+    if !profile.mode.is_implemented() {
+        anyhow::bail!(
+            "the {} mode arrives in phase 6 -- see docs/PLAN.md",
+            profile.mode.label()
+        );
+    }
+
+    // Local paths only, for now.
+    for target in [source_arg, dest_arg] {
+        let shown = target.display().to_string();
+        if cli::looks_like_url(&shown) {
+            anyhow::bail!(
+                "headless syncing to {shown:?} needs credentials with nowhere to prompt for \
+                 them; local paths only for now -- see docs/PLAN.md"
+            );
+        }
+    }
+
+    if !source_arg.is_dir() {
+        anyhow::bail!("{} is not a directory", source_arg.display());
+    }
+    if !dest_arg.is_dir() {
+        anyhow::bail!("{} is not a directory", dest_arg.display());
+    }
+
+    // `source` and `destination` are named from the user's point of view, so a
+    // pull profile means the first argument is where files *go*. Swapping here
+    // rather than in the planner keeps the argument names honest.
+    let direction = profile.mode.direction();
+    let (source_root, dest_root) = if direction.source == 0 {
+        (source_arg.to_path_buf(), dest_arg.to_path_buf())
+    } else {
+        (dest_arg.to_path_buf(), source_arg.to_path_buf())
+    };
+
+    let mut source = LocalFs::new();
+    let mut dest = LocalFs::new();
+
+    let mut plan = diff::plan(
+        diff::Endpoint {
+            fs: &mut source,
+            root: &source_root,
+            label: "source".into(),
+        },
+        diff::Endpoint {
+            fs: &mut dest,
+            root: &dest_root,
+            label: "destination".into(),
+        },
+        direction,
+        &config,
+    );
+    safety::check(&mut plan, &config.safety);
+
+    print_plan(&plan, profile.mode.label());
+
+    if let Some(refusal) = &plan.refusal {
+        anyhow::bail!("{refusal}");
+    }
+    if dry_run {
+        return Ok(());
+    }
+    if !yes {
+        anyhow::bail!(
+            "refusing to apply without --yes. Run with --dry-run to see the plan, or --yes to \
+             apply it"
+        );
+    }
+    if !plan.can_apply() {
+        println!("nothing to do");
+        return Ok(());
+    }
+
+    let report = executor::apply(
+        &mut source,
+        &source_root,
+        &mut dest,
+        &dest_root,
+        &plan,
+        &DeletePolicy::from_config(&config.safety),
+        &config.transfer.partial_suffix,
+    );
+
+    for failure in report.failures() {
+        eprintln!(
+            "failed: {} -- {:?}",
+            failure.path.display(),
+            failure.outcome
+        );
+    }
+    for skipped in report.skipped() {
+        eprintln!(
+            "skipped: {} -- it changed underneath",
+            skipped.path.display()
+        );
+    }
+    println!("{}", report.summary());
+
+    // A non-zero exit when anything failed, so a cron job or a systemd timer
+    // notices rather than reporting success over a partial sync.
+    if report.failures().count() > 0 {
+        anyhow::bail!("{} operation(s) failed", report.failures().count());
+    }
+
+    Ok(())
+}
+
+/// Print a plan as text, for the headless path.
+///
+/// The same information the confirmation window shows, in the same order --
+/// both sides' size and time per row, and the destructive sections above the
+/// skipped list.
+fn print_plan(plan: &lazysync::sync::Plan, mode: &str) {
+    use lazysync::{sync::plan::Section, ui::format_size};
+
+    println!(
+        "{mode}: {} -> {}  (compare: {}, tolerance {}s)",
+        plan.source_root.display(),
+        plan.dest_root.display(),
+        plan.method.describe(),
+        plan.tolerance_secs
+    );
+
+    for section in Section::ALL {
+        let rows: Vec<_> = plan.section(section).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        println!("\n{} ({})", section.title(), rows.len());
+
+        for row in rows {
+            let describe = |side: Option<lazysync::sync::plan::Side>| match side {
+                Some(s) => format!(
+                    "{:>9}  {}",
+                    format_size(s.size),
+                    s.mtime
+                        .map_or_else(|| "-".into(), |t| t.format("%Y-%m-%d %H:%M").to_string())
+                ),
+                None => format!("{:>9}  {:16}", "-", "-"),
+            };
+
+            println!(
+                "  {} {:<40} {}   {}   {}{}",
+                row.action.glyph(),
+                row.path.display(),
+                describe(row.source),
+                describe(row.dest),
+                row.reason.describe(),
+                row.caveat.map(|c| format!("  [{c}]")).unwrap_or_default(),
+            );
+        }
+    }
+
+    for (path, why) in &plan.unreadable {
+        eprintln!("unreadable: {} -- {why}", path.display());
+    }
+
+    let totals = plan.totals();
+    println!(
+        "\n{} ops, {} out, {} deleted ({}), {} dirs, {} unchanged",
+        totals.operations(),
+        format_size(totals.bytes_out),
+        totals.deletes,
+        format_size(totals.bytes_deleted),
+        totals.directories,
+        totals.skipped,
+    );
+    if totals.clobbers_newer > 0 {
+        println!(
+            "WARNING: {} row(s) would overwrite NEWER data with older",
+            totals.clobbers_newer
+        );
+    }
 }
 
 /// The interactive browser.

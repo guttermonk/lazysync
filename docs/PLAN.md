@@ -5,7 +5,8 @@ local ↔ local, remote ↔ remote) trees. termscp's feature set, vim keys by
 default, every binding remappable, and a confirmation window that shows you
 exactly what is about to be overwritten before anything moves.
 
-Status: **planning**. Nothing implemented yet.
+Status: **phase 3 of 7 complete**. Browsing, connections and syncing work; see
+the phase table in §10 for what each one actually delivered.
 
 ---
 
@@ -296,10 +297,12 @@ Ranked by how much I think they matter.
    confirmation window stating *which* comparison it actually used per row.
 3. **Filters** — gitignore-syntax include/exclude per profile, `--exclude` on
    the CLI, and an optional "respect .gitignore" toggle.
-4. **Safety rails** — `backup_dir` or trash instead of hard delete;
-   `max_delete` threshold that aborts if more than N% / N files of the
-   destination would be removed; double-confirm for deletes outside the sync
-   root.
+4. ~~**Safety rails**~~ — done in phase 3. `backup_dir` is the default, so a
+   deletion is recoverable; a plan that would empty the destination is refused
+   at any size; a fraction limit applies above a floor of ten destination
+   files, because a percentage of a tiny tree is noise; and permanent deletion
+   asks a second time. The backup directory is excluded from planning, or a
+   mirror would delete its own backups on the next run.
 5. **Transfer queue + progress** — concurrent transfers, per-file and aggregate
    progress with throughput and ETA, pause/resume/cancel per job. `Ctrl-C`
    cancels the job, not the app.
@@ -340,7 +343,7 @@ Ranked by how much I think they matter.
 | 0 | ✅ Repo scaffolding: flake, package.nix, CI, licenses, README skeleton, this doc |
 | 1 | ✅ TUI shell, config loader, keymap engine, theme, help overlay — local↔local dual pane, no network. Synchronized browsing with ghosting, and union view, landed here too: they are pure path logic and needed no network, and building them first meant the `Vfs` trait was shaped by a real caller. |
 | 2 | ✅ `Vfs` + Local + SFTP/SCP; connection form; bookmarks + keyring; host-key TOFU; zide auto-open. Two things the underlying crates do not provide had to be written here: host key verification (`remotefs-ssh`'s libssh2 backend consults `known_hosts` nowhere at all), and an explicit `SshKeyStorage`, without which naming an identity file silently did nothing. `lazysync import termscp` slipped to phase 7 — its format carries an encrypted password blob, and an importer written against a format that cannot be tested here would be guesswork presented as a feature. |
-| 3 | Diff planner + confirmation window + native executor (push/pull, mirror) |
+| 3 | ✅ Diff planner + confirmation window + native executor (push/pull, mirror). Three things the design did not anticipate: **SFTP's rename does not replace an existing file** (OpenSSH answers `SSH_FX_PERMISSION_DENIED`), so overwrites go through a three-step swap — see `Capabilities::atomic_overwrite_rename`; a **percentage-only delete guard misfires on small trees**, where removing one of two files reads as 50%, so a floor was added with a separate all-or-nothing check that fires at any size; and the **backup directory had to be excluded from planning**, or the second mirror run deletes the backups the first one made. |
 | 4 | Transfer queue, progress, resume, filters, sync profiles, safety rails |
 | 5 | rsync + rclone executors; `RcloneFs`; remaining native backends (FTP/S3/SMB/WebDAV) |
 | 6 | Bisync + state snapshots + conflict UI |

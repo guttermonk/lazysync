@@ -14,17 +14,21 @@
 //! sync want to re-copy a tree that has not changed.
 
 use std::{
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use remotefs::{
-    fs::{Capabilities as RemoteCapabilities, File, FileType, UnixPex},
+    fs::{
+        Capabilities as RemoteCapabilities, File, FileType, ReadOptions, SetMetadata, UnixPex,
+        WriteOptions,
+    },
     RemoteError, RemoteErrorType, RemoteFs,
 };
 use remotefs_ssh::{ScpFs, SftpFs, SshAgentIdentity, SshKeyStorage, SshOpts};
 
-use super::{Capabilities, Entry, EntryKind, Vfs, VfsError};
+use super::{Capabilities, Entry, EntryKind, Vfs, VfsError, WriteMetadata};
 use crate::{
     connection::{AuthMethod, Protocol, Secret, Target, CONNECT_TIMEOUT},
     vfs::hostkey::{self, HostKey, Verdict},
@@ -277,6 +281,10 @@ impl Vfs for SshFs {
             // Resuming a partial transfer needs to write at an offset, which
             // is seek-on-write rather than append.
             ranged_writes: remote.contains(RemoteCapabilities::SEEK_WRITE),
+            // SFTP's rename refuses an existing target: OpenSSH answers
+            // SSH_FX_PERMISSION_DENIED rather than replacing it. Overwrites
+            // therefore go through the executor's swap path.
+            atomic_overwrite_rename: false,
             // One second, not zero. The SFTP protocol carries whole-second
             // mtimes in its base attribute set, and while version 4 added
             // nanoseconds, plenty of servers do not send them. Claiming
@@ -337,6 +345,88 @@ impl Vfs for SshFs {
         }
 
         Ok(())
+    }
+
+    fn stat(&mut self, path: &Path) -> Result<Entry, VfsError> {
+        let file = self
+            .client
+            .stat(path)
+            .map_err(|e| translate(e, &format!("stat {}", path.display())))?;
+        Ok(convert(&file))
+    }
+
+    fn read_into(&mut self, path: &Path, dest: &mut (dyn Write + Send)) -> Result<u64, VfsError> {
+        self.client
+            .read_file(path, &ReadOptions::default(), dest)
+            .map_err(|e| translate(e, &format!("reading {}", path.display())))
+    }
+
+    fn write_from(
+        &mut self,
+        path: &Path,
+        metadata: &WriteMetadata,
+        src: &mut (dyn Read + Send),
+    ) -> Result<u64, VfsError> {
+        // The size hint is not a nicety here: SCP sends a length before the
+        // data, so a wrong one corrupts the transfer rather than merely
+        // slowing it.
+        let mut opts = WriteOptions::default().size_hint(metadata.size);
+
+        // Applied during the write where the protocol allows it, which is one
+        // round trip instead of two and leaves no window where the file exists
+        // with the wrong timestamp.
+        if let Some(mtime) = metadata.mtime {
+            opts = opts.modified(mtime.into());
+        }
+        if let Some(mode) = metadata.mode {
+            opts = opts.mode(UnixPex::from(mode & 0o7777));
+        }
+
+        self.client
+            .write_file(path, &opts, src)
+            .map_err(|e| translate(e, &format!("writing {}", path.display())))
+    }
+
+    fn set_times(&mut self, path: &Path, metadata: &WriteMetadata) -> Result<(), VfsError> {
+        if !self.capabilities().set_mtime {
+            return Err(VfsError::Unsupported(format!(
+                "{} cannot set timestamps",
+                self.protocol
+            )));
+        }
+
+        let mut set = SetMetadata::default();
+        if let Some(mtime) = metadata.mtime {
+            set = set.modified(mtime.into());
+        }
+        if let Some(mode) = metadata.mode {
+            set = set.mode(UnixPex::from(mode & 0o7777));
+        }
+
+        self.client
+            .set_metadata(path, &set)
+            .map_err(|e| translate(e, &format!("setting metadata on {}", path.display())))
+    }
+
+    fn remove_file(&mut self, path: &Path) -> Result<(), VfsError> {
+        self.client
+            .remove_file(path)
+            .map_err(|e| translate(e, &format!("removing {}", path.display())))
+    }
+
+    fn remove_dir_all(&mut self, path: &Path) -> Result<(), VfsError> {
+        self.client
+            .remove_dir_all(path)
+            .map_err(|e| translate(e, &format!("removing {}", path.display())))
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), VfsError> {
+        self.client.rename(from, to).map_err(|e| {
+            translate(
+                e,
+                &format!("renaming {} to {}", from.display(), to.display()),
+            )
+        })
     }
 
     fn home(&mut self) -> Option<PathBuf> {

@@ -97,7 +97,10 @@ fn browser() -> Keymap {
         (Action::ToggleSyncBrowse, c('S')),
         (Action::ToggleUnionView, c('u')),
         (Action::ToggleDirSizes, c('z')),
-        (Action::CycleSort, c('s')),
+        // `o`/`O` for ordering rather than `s`, which is now purely the sync
+        // prefix: leaving sort on `s` would make every sort keystroke wait for
+        // the chord timeout before doing anything.
+        (Action::CycleSort, c('o')),
         (Action::ReverseSort, c('O')),
         // Marks. `m` is a prefix rather than a toggle so the mark commands
         // read as a group; Space is the one-key toggle you actually use.
@@ -109,6 +112,12 @@ fn browser() -> Keymap {
         (Action::Search, c('/')),
         (Action::SearchNext, c('n')),
         (Action::SearchPrev, c('N')),
+        // Sync. All chords under `s`, so the destructive one cannot be
+        // reached by a single keystroke -- and `s` alone is the sort key, so
+        // the prefix is already in use for something harmless.
+        (Action::SyncPush, chord("sp")),
+        (Action::SyncPull, chord("sl")),
+        (Action::SyncMirror, chord("sm")),
         // General.
         (Action::Help, c('?')),
         (Action::Cancel, n(Key::Esc)),

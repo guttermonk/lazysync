@@ -85,8 +85,18 @@ pub enum Command {
 
     /// Plan a sync, and apply it without a TUI. Intended for cron.
     Sync {
-        /// Sync profile to run.
+        /// Sync profile to run, from `[profiles.<name>]` in config.toml.
         profile: String,
+
+        /// Where files come from.
+        ///
+        /// Both sides are given explicitly rather than taken from the
+        /// top-level arguments: a cron entry should say what it syncs, not
+        /// depend on the working directory it happens to inherit.
+        source: PathBuf,
+
+        /// Where files go.
+        destination: PathBuf,
 
         /// Print the plan and exit without transferring anything.
         #[arg(long)]
@@ -171,13 +181,15 @@ mod tests {
     #[test]
     fn the_subcommands_parse() {
         assert!(matches!(
-            parse(&["sync", "deploy", "--dry-run"]).command,
+            parse(&["sync", "deploy", "/a", "/b", "--dry-run"]).command,
             Some(Command::Sync {
                 dry_run: true,
                 yes: false,
                 ..
             })
         ));
+        // Both sides are required: a cron entry has to say what it syncs.
+        assert!(Cli::try_parse_from(["lazysync", "sync", "deploy"]).is_err());
         assert!(matches!(
             parse(&["keys", "--mode", "browser"]).command,
             Some(Command::Keys { mode: Some(_) })

@@ -80,6 +80,11 @@ keyring = { version = "3.6", features = ["windows-native"] }
 [dev-dependencies]
 tempfile = "3.14"
 
+# Set a file's mtime in tests. Comparison rules turn on timestamps, so a test
+# that writes a file and compares it "now" asserts on how fast it ran rather
+# than on the rule.
+filetime = "0.2"
+
 [[bin]]
 name = "lazysync"
 path = "src/main.rs"

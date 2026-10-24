@@ -1,11 +1,12 @@
 //! The local filesystem.
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
 };
 
-use super::{Capabilities, Entry, EntryKind, Vfs, VfsError};
+use super::{Capabilities, Entry, EntryKind, Vfs, VfsError, WriteMetadata};
 
 /// The machine lazysync is running on.
 #[derive(Debug, Default, Clone, Copy)]
@@ -57,6 +58,8 @@ impl Vfs for LocalFs {
             mode: cfg!(unix),
             symlinks: true,
             ranged_writes: true,
+            // POSIX rename(2) replaces the target atomically.
+            atomic_overwrite_rename: true,
             // Local filesystems are finer than this, but claiming 1s rather
             // than 0 avoids pretending a comparison against a coarse remote
             // is exact.
@@ -133,6 +136,128 @@ impl Vfs for LocalFs {
 
     fn create_dir(&mut self, path: &Path) -> Result<(), VfsError> {
         fs::create_dir_all(path).map_err(|e| classify(e, path))
+    }
+
+    fn stat(&mut self, path: &Path) -> Result<Entry, VfsError> {
+        let meta = fs::symlink_metadata(path).map_err(|e| classify(e, path))?;
+
+        let kind = if meta.is_symlink() {
+            EntryKind::Symlink
+        } else if meta.is_dir() {
+            EntryKind::Dir
+        } else {
+            EntryKind::File
+        };
+
+        let (symlink_target, symlink_to_dir) = if meta.is_symlink() {
+            (
+                fs::read_link(path).ok(),
+                fs::metadata(path).is_ok_and(|m| m.is_dir()),
+            )
+        } else {
+            (None, false)
+        };
+
+        Ok(Entry {
+            name: path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            kind,
+            size: if matches!(kind, EntryKind::Dir) {
+                0
+            } else {
+                meta.len()
+            },
+            mtime: meta.modified().ok().map(Into::into),
+            mode: mode_of(&meta),
+            symlink_target,
+            symlink_to_dir,
+        })
+    }
+
+    fn read_into(&mut self, path: &Path, dest: &mut (dyn Write + Send)) -> Result<u64, VfsError> {
+        let mut file = fs::File::open(path).map_err(|e| classify(e, path))?;
+        let copied = io::copy(&mut file, dest).map_err(|e| VfsError::Io {
+            context: format!("reading {}", path.display()),
+            source: e,
+        })?;
+        dest.flush().map_err(|e| VfsError::Io {
+            context: format!("flushing a copy of {}", path.display()),
+            source: e,
+        })?;
+        Ok(copied)
+    }
+
+    fn write_from(
+        &mut self,
+        path: &Path,
+        metadata: &WriteMetadata,
+        src: &mut (dyn Read + Send),
+    ) -> Result<u64, VfsError> {
+        // The parent has to exist; the executor creates directories first, but
+        // a plan applied against a tree that changed underneath should fail
+        // with a path rather than a bare ENOENT.
+        let mut file = fs::File::create(path).map_err(|e| classify(e, path))?;
+        let copied = io::copy(src, &mut file).map_err(|e| VfsError::Io {
+            context: format!("writing {}", path.display()),
+            source: e,
+        })?;
+
+        // Flush *and* sync before the caller renames this into place.
+        // Otherwise a crash between the rename and the writeback can leave the
+        // destination name pointing at a file whose contents never landed.
+        file.flush().map_err(|e| VfsError::Io {
+            context: format!("flushing {}", path.display()),
+            source: e,
+        })?;
+        file.sync_all().map_err(|e| VfsError::Io {
+            context: format!("syncing {}", path.display()),
+            source: e,
+        })?;
+        drop(file);
+
+        self.set_times(path, metadata)?;
+        Ok(copied)
+    }
+
+    fn set_times(&mut self, path: &Path, metadata: &WriteMetadata) -> Result<(), VfsError> {
+        if let Some(mtime) = metadata.mtime {
+            let file = fs::File::options()
+                .write(true)
+                .open(path)
+                .map_err(|e| classify(e, path))?;
+            let times = fs::FileTimes::new().set_modified(mtime.into());
+            file.set_times(times).map_err(|e| VfsError::Io {
+                context: format!("setting the timestamp on {}", path.display()),
+                source: e,
+            })?;
+        }
+
+        #[cfg(unix)]
+        if let Some(mode) = metadata.mode {
+            use std::os::unix::fs::PermissionsExt;
+            // Only the permission bits: the file type bits in a stat mode are
+            // not ours to set, and passing them through would be rejected.
+            fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(|e| classify(e, path))?;
+        }
+
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &Path) -> Result<(), VfsError> {
+        fs::remove_file(path).map_err(|e| classify(e, path))
+    }
+
+    fn remove_dir_all(&mut self, path: &Path) -> Result<(), VfsError> {
+        fs::remove_dir_all(path).map_err(|e| classify(e, path))
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), VfsError> {
+        fs::rename(from, to).map_err(|e| VfsError::Io {
+            context: format!("renaming {} to {}", from.display(), to.display()),
+            source: e,
+        })
     }
 
     fn home(&mut self) -> Option<PathBuf> {

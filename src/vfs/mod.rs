@@ -17,7 +17,10 @@ pub mod hostkey;
 pub mod local;
 pub mod ssh;
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
 
 use chrono::{DateTime, Utc};
 
@@ -71,6 +74,35 @@ impl Entry {
     }
 }
 
+/// What to stamp on a file as it is written.
+///
+/// Gathered from the source file, so a copy carries the original's timestamp
+/// and permissions rather than the moment it happened to be transferred. That
+/// matters for more than tidiness: a destination stamped with "now" looks
+/// newer than its source, and the next sync in the other direction would copy
+/// it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteMetadata {
+    /// Expected size. Required up front by protocols that send a length
+    /// before the data.
+    pub size: u64,
+    /// Modification time to preserve, where the backend can set one.
+    pub mtime: Option<DateTime<Utc>>,
+    /// Unix mode bits to preserve, where the backend has them.
+    pub mode: Option<u32>,
+}
+
+impl WriteMetadata {
+    /// The metadata a copy of `entry` should carry.
+    pub fn from_entry(entry: &Entry) -> Self {
+        Self {
+            size: entry.size,
+            mtime: entry.mtime,
+            mode: entry.mode,
+        }
+    }
+}
+
 /// What a backend can and cannot do.
 ///
 /// Carried alongside listings so the planner can decide how to compare files
@@ -86,6 +118,17 @@ pub struct Capabilities {
     pub symlinks: bool,
     /// Ranged writes, which is what resuming a partial transfer needs.
     pub ranged_writes: bool,
+    /// Whether [`Vfs::rename`] replaces an existing target.
+    ///
+    /// POSIX `rename(2)` does. The SFTP protocol's rename does **not**: the
+    /// OpenSSH server fails with a permission error if the target exists,
+    /// unless the client negotiates the `posix-rename@openssh.com` extension.
+    ///
+    /// This matters because the executor writes to a partial name and renames
+    /// it into place, so that an interrupted transfer never leaves a truncated
+    /// file. Where the rename cannot overwrite, that has to become a
+    /// three-step swap instead -- see `executor::transfer`.
+    pub atomic_overwrite_rename: bool,
     /// Coarsest timestamp this backend can represent, in seconds.
     ///
     /// Not cosmetic: comparing a 1-second-granularity SFTP server against a
@@ -128,6 +171,56 @@ pub trait Vfs: Send {
     /// documented option, and a backend that cannot honour it would make the
     /// setting a lie.
     fn create_dir(&mut self, path: &Path) -> Result<(), VfsError>;
+
+    /// Metadata for a single entry.
+    ///
+    /// Separate from [`Vfs::list`] because the planner needs to re-check one
+    /// file -- after a checksum disagreement, or to confirm a destination has
+    /// not changed since the plan was built.
+    fn stat(&mut self, path: &Path) -> Result<Entry, VfsError>;
+
+    /// Read a whole file into `dest`.
+    ///
+    /// Returns the number of bytes copied, which the executor compares
+    /// against the size it planned for: a short read means the file changed
+    /// under it, and copying a truncated file over a good one is the worst
+    /// outcome available.
+    fn read_into(&mut self, path: &Path, dest: &mut (dyn Write + Send)) -> Result<u64, VfsError>;
+
+    /// Write `src` to `path`, replacing whatever was there.
+    ///
+    /// `metadata` carries the size hint, mode and mtime to apply. The size
+    /// hint is not optional for some protocols -- SCP has to send a length up
+    /// front -- which is why it is a parameter rather than something the
+    /// backend could discover.
+    fn write_from(
+        &mut self,
+        path: &Path,
+        metadata: &WriteMetadata,
+        src: &mut (dyn Read + Send),
+    ) -> Result<u64, VfsError>;
+
+    /// Set a file's modification time, and mode where supported.
+    ///
+    /// Called after a write only when the backend could not apply them during
+    /// it. A backend without [`Capabilities::set_mtime`] reports
+    /// [`VfsError::Unsupported`] rather than silently doing nothing, so the
+    /// plan can say the timestamp will not be preserved.
+    fn set_times(&mut self, path: &Path, metadata: &WriteMetadata) -> Result<(), VfsError>;
+
+    /// Delete a file.
+    fn remove_file(&mut self, path: &Path) -> Result<(), VfsError>;
+
+    /// Delete a directory and everything in it.
+    fn remove_dir_all(&mut self, path: &Path) -> Result<(), VfsError>;
+
+    /// Rename within the same filesystem.
+    ///
+    /// The executor writes to a partial file and renames it into place, so
+    /// that an interrupted transfer never leaves a truncated file where a good
+    /// one used to be. That only works if the rename is atomic, which it is
+    /// for both a local filesystem and SFTP within one server.
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), VfsError>;
 
     /// The directory to start in, and where [`crate::keys::Action::GoHome`]
     /// goes.

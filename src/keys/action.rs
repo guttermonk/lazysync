@@ -140,6 +140,14 @@ pub enum Action {
     FoldSection,
     UnfoldSection,
 
+    // ── Sync ─────────────────────────────────────────────────────────────
+    /// Plan a push: local to remote, without deleting anything.
+    SyncPush,
+    /// Plan a pull: remote to local, without deleting anything.
+    SyncPull,
+    /// Plan a mirror: make the remote identical, deletions included.
+    SyncMirror,
+
     // ── Bookmarks and forms ──────────────────────────────────────────────
     /// Open the selected bookmark.
     OpenItem,
@@ -211,6 +219,10 @@ impl Action {
             Self::FoldSection => "Fold this section",
             Self::UnfoldSection => "Unfold this section",
 
+            Self::SyncPush => "Plan a push to the other pane",
+            Self::SyncPull => "Plan a pull from the other pane",
+            Self::SyncMirror => "Plan a mirror, deletions included",
+
             Self::OpenItem => "Open the selected connection",
             Self::NewItem => "Add a new connection",
             Self::EditItem => "Edit this connection",
@@ -263,6 +275,8 @@ impl Action {
             | Self::DiffRow
             | Self::FoldSection
             | Self::UnfoldSection => "Plan",
+
+            Self::SyncPush | Self::SyncPull | Self::SyncMirror => "Sync",
 
             Self::OpenItem
             | Self::NewItem

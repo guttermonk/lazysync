@@ -522,6 +522,228 @@ fn a_bad_key_reports_an_authentication_failure() {
     });
 }
 
+/// Planning and applying a sync over a real SSH connection.
+///
+/// The local-to-local tests cover the planner's logic; this covers the part
+/// only a network backend exercises -- writing through SFTP, the partial-file
+/// rename on the remote side, and whether a timestamp survives the trip. That
+/// last one decides whether the *next* sync re-copies everything, and no mock
+/// would tell the truth about it.
+#[test]
+fn a_push_over_sftp_transfers_and_preserves_timestamps() {
+    use lazysync::{
+        config::Config,
+        sync::{
+            diff::{self, Direction},
+            executor,
+            safety::DeletePolicy,
+        },
+        vfs::LocalFs,
+    };
+
+    let server = server!();
+
+    with_home(&server.home, || {
+        let (_, key) = hostkey::verify(
+            "127.0.0.1",
+            server.port,
+            std::time::Duration::from_secs(10),
+            Some(&server.known_hosts()),
+        )
+        .expect("verification");
+        hostkey::remember(&key, Some(&server.known_hosts())).expect("recording");
+
+        let mut remote = ssh::open(&server.target(), None).expect("open");
+
+        // A local tree to push: one new file and one that differs.
+        let local_dir = server.work.join("local");
+        std::fs::create_dir_all(local_dir.join("nested")).unwrap();
+        std::fs::write(local_dir.join("fresh.txt"), b"brand new").unwrap();
+        std::fs::write(local_dir.join("nested/deep.txt"), b"deeper").unwrap();
+        // Same name as a file the server already has, different content.
+        std::fs::write(local_dir.join("README.md"), b"replaced from local").unwrap();
+
+        let mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        for name in ["fresh.txt", "nested/deep.txt", "README.md"] {
+            filetime::set_file_mtime(local_dir.join(name), mtime).unwrap();
+        }
+
+        let mut local = LocalFs::new();
+        let config = Config::default();
+
+        let plan = diff::plan(
+            diff::Endpoint {
+                fs: &mut local,
+                root: &local_dir,
+                label: "local".into(),
+            },
+            diff::Endpoint {
+                fs: &mut remote,
+                root: &server.served,
+                label: "remote".into(),
+            },
+            Direction {
+                source: 0,
+                delete_extraneous: false,
+            },
+            &config,
+        );
+
+        // The plan must name both sides for the file that exists on each.
+        let readme = plan
+            .rows
+            .iter()
+            .find(|r| r.path == Path::new("README.md"))
+            .expect("README.md should be in the plan");
+        assert!(
+            readme.source.is_some() && readme.dest.is_some(),
+            "the window needs both sides of a remote overwrite"
+        );
+        assert!(
+            readme.dest.unwrap().mtime.is_some(),
+            "the remote side has to contribute a timestamp"
+        );
+
+        let report = executor::apply(
+            &mut local,
+            &local_dir,
+            &mut remote,
+            &server.served,
+            &plan,
+            &DeletePolicy::Remove,
+            ".lazysync-part",
+        );
+
+        assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
+
+        // The server writes to a real directory, so the result is checkable
+        // directly rather than through the client that wrote it.
+        assert_eq!(
+            std::fs::read_to_string(server.served.join("fresh.txt")).unwrap(),
+            "brand new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(server.served.join("nested/deep.txt")).unwrap(),
+            "deeper",
+            "a nested create has to bring its directory with it, over SFTP too"
+        );
+        assert_eq!(
+            std::fs::read_to_string(server.served.join("README.md")).unwrap(),
+            "replaced from local"
+        );
+
+        // No partial files left in the remote tree: one would show up in the
+        // next plan as a file to sync back.
+        let leftovers: Vec<_> = std::fs::read_dir(&server.served)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("lazysync-part"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // The timestamp survived. If it did not, the next sync would see every
+        // file as changed and copy the whole tree again.
+        let landed = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(server.served.join("fresh.txt")).unwrap(),
+        );
+        assert_eq!(
+            landed.unix_seconds(),
+            1_700_000_000,
+            "an mtime lost in transit makes every subsequent sync re-copy the file"
+        );
+    });
+}
+
+/// And the proof of that: planning again finds nothing to do.
+#[test]
+fn a_second_push_over_sftp_finds_nothing_to_do() {
+    use lazysync::{
+        config::Config,
+        sync::{
+            diff::{self, Direction},
+            executor,
+            safety::DeletePolicy,
+        },
+        vfs::LocalFs,
+    };
+
+    let server = server!();
+
+    with_home(&server.home, || {
+        let (_, key) = hostkey::verify(
+            "127.0.0.1",
+            server.port,
+            std::time::Duration::from_secs(10),
+            Some(&server.known_hosts()),
+        )
+        .expect("verification");
+        hostkey::remember(&key, Some(&server.known_hosts())).expect("recording");
+
+        let mut remote = ssh::open(&server.target(), None).expect("open");
+
+        let local_dir = server.work.join("local2");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::write(local_dir.join("a.txt"), b"content").unwrap();
+        filetime::set_file_mtime(
+            local_dir.join("a.txt"),
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+
+        let mut local = LocalFs::new();
+        let config = Config::default();
+
+        let build = |local: &mut LocalFs, remote: &mut lazysync::vfs::SshFs| {
+            diff::plan(
+                diff::Endpoint {
+                    fs: local,
+                    root: &local_dir,
+                    label: "local".into(),
+                },
+                diff::Endpoint {
+                    fs: remote,
+                    root: &server.served,
+                    label: "remote".into(),
+                },
+                Direction {
+                    source: 0,
+                    delete_extraneous: false,
+                },
+                &config,
+            )
+        };
+
+        let first = build(&mut local, &mut remote);
+        assert_eq!(first.totals().operations(), 1);
+
+        let report = executor::apply(
+            &mut local,
+            &local_dir,
+            &mut remote,
+            &server.served,
+            &first,
+            &DeletePolicy::Remove,
+            ".lazysync-part",
+        );
+        assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
+
+        let second = build(&mut local, &mut remote);
+        assert_eq!(
+            second.totals().operations(),
+            0,
+            "a sync that re-copies an unchanged tree is the failure this whole comparison \
+             design exists to avoid: {:?}",
+            second
+                .rows
+                .iter()
+                .filter(|r| r.needs_review())
+                .map(|r| (&r.path, r.reason))
+                .collect::<Vec<_>>()
+        );
+    });
+}
+
 /// Connecting to a port nothing is listening on must fail promptly rather than
 /// hanging, because the blocking `Vfs` means a hang blocks the draw loop.
 #[test]
