@@ -37,14 +37,22 @@ pub enum Protocol {
     S3,
     Smb,
     Webdav,
+    /// Any remote in the user's `rclone.conf`, reached by running `rclone`.
+    ///
+    /// The host field holds the remote's name, so `rclone://gdrive/Documents`
+    /// is the remote `gdrive` at path `/Documents`. This is how S3, WebDAV,
+    /// B2, Google Drive and some seventy others are reachable without a
+    /// `remotefs` backend for each -- see [`crate::vfs::rclone`].
+    Rclone,
 }
 
 impl Protocol {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Sftp,
         Self::Scp,
         Self::Ftp,
         Self::Ftps,
+        Self::Rclone,
         Self::S3,
         Self::Smb,
         Self::Webdav,
@@ -60,6 +68,7 @@ impl Protocol {
             Self::S3 => "s3",
             Self::Smb => "smb",
             Self::Webdav => "webdav",
+            Self::Rclone => "rclone",
         }
     }
 
@@ -82,6 +91,9 @@ impl Protocol {
             Self::Ftp | Self::Ftps => 21,
             Self::S3 | Self::Webdav => 443,
             Self::Smb => 445,
+            // No port: rclone runs as a subprocess and the remote's own
+            // config says how to reach wherever it points.
+            Self::Rclone => 0,
         }
     }
 
@@ -91,7 +103,10 @@ impl Protocol {
     /// written for a later version still loads; the connect path refuses the
     /// unimplemented ones by name instead of failing obscurely.
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps)
+        matches!(
+            self,
+            Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps | Self::Rclone
+        )
     }
 
     /// What is standing in the way, for the message shown when you pick an
@@ -103,7 +118,7 @@ impl Protocol {
     /// whoever picked the protocol and incapable of going stale.
     pub const fn unavailable_because(self) -> Option<&'static str> {
         match self {
-            Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps => None,
+            Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps | Self::Rclone => None,
 
             // `remotefs-webdav` also still wants `remotefs 0.3`, whose
             // `RemoteFs` is a different and incompatible trait -- so it cannot
@@ -119,9 +134,19 @@ impl Protocol {
             ),
             Self::Smb => Some(
                 "it needs a share name, and libsmbclient as a system dependency in the Nix \
-                 build",
+                 build -- or reach it as an rclone remote instead",
             ),
         }
+    }
+
+    /// Whether lazysync has to collect a credential for this protocol.
+    ///
+    /// rclone does not: its own `rclone.conf` holds whatever the remote needs,
+    /// including OAuth tokens it refreshes itself. Prompting for a password
+    /// would be asking for something lazysync has nowhere to put -- and the
+    /// keyring entry it created would never be read.
+    pub const fn needs_credentials(self) -> bool {
+        !matches!(self, Self::Rclone)
     }
 
     /// What a backend of this protocol can do.
@@ -199,6 +224,21 @@ impl Protocol {
             // reporting every object as changed.
             Self::S3 => Capabilities {
                 mtime: false,
+                set_mtime: false,
+                mode: false,
+                symlinks: false,
+                ranged_writes: false,
+                atomic_overwrite_rename: true,
+                mtime_granularity_secs: 1,
+            },
+
+            // rclone: whatever is behind the remote. Declared pessimistically
+            // because one remote name could be S3 or a local disk, and the
+            // comparison rules must hold for the worst of them. `RcloneFs`
+            // reports the same thing; this exists for the form and the
+            // bookmark list, which have no live backend to ask.
+            Self::Rclone => Capabilities {
+                mtime: true,
                 set_mtime: false,
                 mode: false,
                 symlinks: false,

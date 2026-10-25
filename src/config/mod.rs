@@ -453,6 +453,17 @@ pub enum Executor {
     Rclone,
 }
 
+impl Executor {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Native => "the native engine",
+            Self::Rsync => "rsync",
+            Self::Rclone => "rclone",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Watch {

@@ -15,20 +15,21 @@ use crate::{
         union::{self, UnionRow},
         Pane, Side,
     },
-    config::{Config, Palette, PaneSide, SyncMode},
-    connection::Secret,
+    config::{Config, Executor, Palette, PaneSide, SyncMode, Watch},
+    connection::{Protocol, Secret},
     keys::{Action, Keymaps, Mode},
     sync::{
-        bisync, diff,
+        audit, bisync, delegate, diff,
         executor::{Outcome, Report},
         filters::Filters,
         plan::{Action as PlanAction, Plan, Resolution, Section, Side as PlanSide},
         safety::{self, DeletePolicy},
         state::{Record, Snapshot},
         transfer::{Settings as TransferSettings, State as TransferState, Transfer},
+        watch,
     },
     ui::{confirm, form::ConnectionForm},
-    vfs::{ftp, hostkey::HostKey, ssh, LocalFs, Vfs},
+    vfs::{ftp, hostkey::HostKey, rclone, ssh, LocalFs, Vfs},
 };
 
 /// What is on top of the browser, if anything.
@@ -129,6 +130,8 @@ pub enum Screen {
     Confirm,
     /// Applying a plan, with progress.
     Transfer,
+    /// The audit log: what previous runs actually did.
+    Log,
 }
 
 /// Everything the UI draws and the event loop mutates.
@@ -178,6 +181,19 @@ pub struct App {
     /// display form. Kept so the snapshot can be written against the same key
     /// it was read with, even if a pane has since moved.
     bisync_snapshot: Option<(PathBuf, String)>,
+    /// The tree being watched, if watch mode is on.
+    pub watcher: Option<watch::Watcher>,
+    /// Which engine the run in flight is using, for the audit log.
+    transfer_engine: &'static str,
+    /// The audit log, read when the viewer opens rather than kept live: a
+    /// log is appended to by other processes too, and a cached copy would go
+    /// stale in the one place staleness is confusing.
+    pub audit_entries: Vec<crate::sync::audit::Entry>,
+    pub log_cursor: usize,
+    /// Whether a human reviewed the plan in flight. False for watch mode's
+    /// unattended syncs, which is the distinction the log exists to record.
+    transfer_confirmed: bool,
+
     /// What the last applied run actually did.
     ///
     /// Needed by the bisync snapshot, which must record only the paths that
@@ -250,6 +266,11 @@ impl App {
             },
             plan_mode: SyncMode::Push,
             bisync_snapshot: None,
+            watcher: None,
+            transfer_engine: "native",
+            audit_entries: Vec::new(),
+            log_cursor: 0,
+            transfer_confirmed: true,
             last_report: None,
             transfer: None,
             active_profile: None,
@@ -294,6 +315,7 @@ impl App {
             Screen::Form => Mode::Form,
             Screen::Confirm => Mode::Confirm,
             Screen::Transfer => Mode::Queue,
+            Screen::Log => Mode::Log,
         }
     }
 
@@ -340,8 +362,7 @@ impl App {
             Mode::Prompt => self.handle_prompt(action),
             Mode::Confirm => self.handle_confirm(action),
             Mode::Queue => self.handle_queue(action),
-            // The log viewer arrives with the audit log it shows.
-            Mode::Log => {}
+            Mode::Log => self.handle_log(action),
         }
     }
 
@@ -600,6 +621,14 @@ impl App {
 
     /// Step two: get the secret, if one is needed at all.
     fn collect_secret_and_open(&mut self, bookmark: &Bookmark) {
+        // A protocol with no credential of its own is opened straight away.
+        // rclone keeps its own secrets, so prompting would ask for something
+        // lazysync has nowhere to put.
+        if !bookmark.protocol.needs_credentials() {
+            self.finish_open(bookmark, None);
+            return;
+        }
+
         // The keyring first, then the prompt. Agent and key auth reach
         // neither, which is why opening a bookmark usually shows nothing but
         // its name.
@@ -627,10 +656,20 @@ impl App {
         self.status = format!("connecting to {}...", bookmark.name);
 
         let target = bookmark.target();
-        let opened = if target.protocol.is_ssh() {
-            ssh::open(&target, secret)
+
+        // Boxed as `dyn Vfs` because rclone's backend is a different type
+        // from the `remotefs` adapter, and `open_connection` only ever needed
+        // the trait.
+        let opened: Result<Box<dyn Vfs>, _> = if target.protocol.is_ssh() {
+            ssh::open(&target, secret).map(|fs| Box::new(fs) as Box<dyn Vfs>)
+        } else if matches!(target.protocol, Protocol::Rclone) {
+            // The host field carries the remote's name: `rclone://gdrive/x`
+            // is the remote `gdrive`. There is no session to establish, so
+            // this cannot fail for network reasons -- only for a remote that
+            // is not in rclone.conf.
+            rclone::RcloneFs::open(&target.host).map(|fs| Box::new(fs) as Box<dyn Vfs>)
         } else {
-            ftp::open(&target, secret)
+            ftp::open(&target, secret).map(|fs| Box::new(fs) as Box<dyn Vfs>)
         };
 
         match opened {
@@ -647,7 +686,7 @@ impl App {
     fn open_connection(
         &mut self,
         bookmark: &Bookmark,
-        mut fs: crate::vfs::RemoteAdapter,
+        mut fs: Box<dyn Vfs>,
         secret: Option<&Secret>,
     ) {
         // Where to start: the bookmark's remote path, then the remote home,
@@ -662,7 +701,7 @@ impl App {
         if let Some(local) = &bookmark.local_path {
             self.panes[0] = Pane::new(Box::new(LocalFs::new()), local.clone(), &self.config);
         }
-        self.panes[1] = Pane::new(Box::new(fs), start, &self.config);
+        self.panes[1] = Pane::new(fs, start, &self.config);
 
         // Save the password only once the connection has actually worked --
         // storing a credential that turns out to be wrong is worse than not
@@ -836,6 +875,8 @@ impl App {
             Action::SyncMirror => self.begin_sync(SyncMode::MirrorPush),
             Action::SyncProfile => self.begin_profile_sync(),
             Action::SyncBisync => self.begin_sync(SyncMode::Bisync),
+            Action::ToggleWatch => self.toggle_watch(),
+            Action::ShowLog => self.open_log(),
 
             Action::ToggleDirSizes => {
                 // Needs a recursive walk per directory, which over a network
@@ -1517,12 +1558,227 @@ impl App {
     fn apply_plan(&mut self) {
         let Some(plan) = self.plan.take() else { return };
 
-        self.transfer = Some(Transfer::new(
-            plan,
-            TransferSettings::from_config(&self.config),
-        ));
+        let settings = TransferSettings::from_config(&self.config);
+        let endpoints = self.external_endpoints();
+        let preference = self.active_executor();
+
+        let (tool, unusable) = delegate::choose(preference, &plan, &endpoints);
+
+        // A *named* executor that cannot run says so. `auto` says nothing,
+        // because falling back to the native engine is what auto means --
+        // whereas `executor = "rsync"` silently doing something else is how a
+        // bandwidth-limited link ends up saturated.
+        if let Some(why) = unusable {
+            self.status = format!("{} not used: {why}", preference.label());
+        }
+
+        self.transfer_engine = tool.map_or("native", delegate::Tool::label);
+
+        self.transfer = Some(match tool {
+            Some(tool) => {
+                match Transfer::delegated(plan.clone(), settings.clone(), tool, &endpoints, &[]) {
+                    Ok(transfer) => {
+                        if self.status.is_empty() {
+                            self.status = format!("transferring with {}", tool.label());
+                        }
+                        transfer
+                    }
+                    Err(e) => {
+                        // Spawning is the only part that can fail before any
+                        // bytes move, so falling back loses nothing.
+                        self.status = format!(
+                            "{} could not start ({e}); using the native engine",
+                            tool.label()
+                        );
+                        self.transfer_engine = "native";
+                        Transfer::new(plan, settings)
+                    }
+                }
+            }
+            None => Transfer::new(plan, settings),
+        });
+
         self.screen = Screen::Transfer;
-        self.status.clear();
+    }
+
+    /// Open the audit log.
+    fn open_log(&mut self) {
+        // Read fresh. `lazysync sync` from cron appends to the same file, so
+        // a copy cached at startup would be missing exactly the runs nobody
+        // watched -- which are the ones worth looking at.
+        self.audit_entries = crate::sync::audit::recent(500);
+        self.log_cursor = 0;
+        self.screen = Screen::Log;
+        self.status = if self.audit_entries.is_empty() {
+            "nothing recorded yet".into()
+        } else {
+            format!("{} run(s) recorded", self.audit_entries.len())
+        };
+    }
+
+    /// The audit log's keys.
+    fn handle_log(&mut self, action: Action) {
+        let last = self.audit_entries.len().saturating_sub(1);
+        match action {
+            Action::MoveDown => self.log_cursor = (self.log_cursor + 1).min(last),
+            Action::MoveUp => self.log_cursor = self.log_cursor.saturating_sub(1),
+            Action::MoveTop => self.log_cursor = 0,
+            Action::MoveBottom => self.log_cursor = last,
+            Action::HalfPageDown | Action::PageDown => {
+                self.log_cursor = (self.log_cursor + 10).min(last);
+            }
+            Action::HalfPageUp | Action::PageUp => {
+                self.log_cursor = self.log_cursor.saturating_sub(10);
+            }
+            Action::Cancel => {
+                self.screen = Screen::Browser;
+                self.status.clear();
+            }
+            Action::Help => self.overlay = Overlay::Help { scroll: 0 },
+            _ => {}
+        }
+    }
+
+    /// Turn watch mode on or off for the local pane's tree.
+    fn toggle_watch(&mut self) {
+        if self.watcher.is_some() {
+            self.watcher = None;
+            self.status = "watching stopped".into();
+            return;
+        }
+
+        let mode = self.watch_mode();
+        if matches!(mode, Watch::Off) {
+            // A profile that does not ask to be watched is not watched by a
+            // keystroke either: `watch` is where the behaviour is declared,
+            // and `auto` in particular applies without confirming.
+            self.status = "this profile has watch = \"off\"; set \"batch\" or \"auto\" to \
+                           use it"
+                .into();
+            return;
+        }
+
+        let root = self.panes[0].path().to_path_buf();
+        match watch::Watcher::start(&root, self.watch_debounce()) {
+            Ok(watcher) => {
+                self.watcher = Some(watcher);
+                self.status = format!(
+                    "watching {} -- changes {} after {}ms of quiet",
+                    root.display(),
+                    match mode {
+                        Watch::Auto => "sync automatically",
+                        _ => "open a plan",
+                    },
+                    self.watch_debounce().as_millis()
+                );
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// What the active profile says about watching.
+    fn watch_mode(&self) -> Watch {
+        self.active_profile
+            .as_ref()
+            .and_then(|name| self.config.profiles.get(name))
+            .map_or(Watch::Off, |profile| profile.watch)
+    }
+
+    fn watch_debounce(&self) -> std::time::Duration {
+        let ms = self
+            .active_profile
+            .as_ref()
+            .and_then(|name| self.config.profiles.get(name))
+            .map_or(2000, |profile| profile.debounce_ms);
+        std::time::Duration::from_millis(ms)
+    }
+
+    /// How long the main loop may block before the watcher needs attention.
+    pub fn watch_deadline(&self) -> Option<std::time::Duration> {
+        self.watcher.as_ref()?.next_deadline()
+    }
+
+    /// Give the watcher a chance to notice changes, and act on a ready batch.
+    ///
+    /// Called once per frame. Does nothing unless a batch has gone quiet for
+    /// the debounce window.
+    pub fn step_watch(&mut self) {
+        // Not while something else is already in front: opening a plan over a
+        // plan, or over a transfer, would take the screen out from under a
+        // decision the user is in the middle of making.
+        if !matches!(self.screen, Screen::Browser) || self.transfer.is_some() {
+            return;
+        }
+
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        if !watcher.poll() {
+            return;
+        }
+
+        let batch = watcher.take();
+        let count = batch.len();
+
+        // The batch decides *when* to sync, not what. The planner walks the
+        // trees as it always does -- syncing only the paths that fired events
+        // would miss whatever the watcher dropped (inotify queues overflow)
+        // and would make watch mode disagree with what `sp` does on the same
+        // trees.
+        let mode = self.watch_mode();
+        let profile_mode = self
+            .active_profile
+            .as_ref()
+            .and_then(|name| self.config.profiles.get(name))
+            .map_or(SyncMode::Push, |profile| profile.mode);
+
+        self.begin_sync(profile_mode);
+
+        let Some(plan) = &self.plan else {
+            // Nothing to do after all: the change was to something excluded,
+            // or it was already in agreement.
+            self.status = format!("{count} change(s) seen, nothing to sync");
+            return;
+        };
+
+        if plan.refusal.is_some() {
+            // The safety rails apply in watch mode exactly as they do by
+            // hand, and a refusal is the one thing that must never be
+            // auto-applied.
+            return;
+        }
+
+        match mode {
+            Watch::Auto => {
+                self.status = format!("{count} change(s): syncing");
+                // Nobody saw this plan, which is exactly what the log needs
+                // to record: an unattended sync is a different event from a
+                // reviewed one.
+                self.transfer_confirmed = false;
+                self.apply_plan();
+            }
+            // Batch and Off both leave the plan on screen. `Off` cannot reach
+            // here, since the watcher would not have started.
+            _ => {
+                self.status = format!("{count} change(s) since the last sync -- review and y");
+            }
+        }
+    }
+
+    /// Which executor the active profile asks for.
+    fn active_executor(&self) -> Executor {
+        self.active_profile
+            .as_ref()
+            .and_then(|name| self.config.profiles.get(name))
+            .map_or(Executor::Auto, |profile| profile.executor)
+    }
+
+    /// How each pane's current directory looks to an external tool.
+    fn external_endpoints(&self) -> delegate::Endpoints {
+        delegate::Endpoints {
+            local: self.panes[0].vfs.external_spec(self.panes[0].path()),
+            remote: self.panes[1].vfs.external_spec(self.panes[1].path()),
+        }
     }
 
     /// Do a slice of the transfer in flight. Called once per frame.
@@ -1584,10 +1840,44 @@ impl App {
         // and the snapshot was silently never written -- which made every
         // bisync a first run for ever, and deletions never propagate.
         let plan = self.transfer.as_ref().map(|t| t.plan().clone());
-        if let (Some((local_root, remote_key)), Some(plan)) = (self.bisync_snapshot.clone(), plan) {
+        if let (Some((local_root, remote_key)), Some(plan)) =
+            (self.bisync_snapshot.clone(), plan.clone())
+        {
             self.store_snapshot(&local_root, &remote_key, &plan);
             self.bisync_snapshot = None;
         }
+
+        self.record_run(plan.as_ref());
+    }
+
+    /// Put the finished run in the audit log.
+    ///
+    /// Best effort by design: the sync has already happened, so refusing to
+    /// acknowledge it because the record could not be written would be the
+    /// wrong way round. A failure goes in the status line and nowhere else.
+    fn record_run(&mut self, plan: Option<&Plan>) {
+        let Some(report) = self.last_report.clone() else {
+            return;
+        };
+        let Some(plan) = plan else { return };
+
+        let entry = audit::Entry::from_report(
+            chrono::Utc::now(),
+            self.plan_mode.label(),
+            self.transfer_engine,
+            &plan.source_root.display().to_string(),
+            &plan.dest_root.display().to_string(),
+            self.transfer_confirmed,
+            &report,
+        );
+
+        if let Err(e) = audit::append(&entry) {
+            tracing::warn!("the audit log could not be written: {e}");
+        }
+
+        // Back to the default for the next run, which is reviewed unless
+        // something says otherwise.
+        self.transfer_confirmed = true;
     }
 
     /// Whether the main loop should keep stepping rather than blocking on

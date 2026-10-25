@@ -162,6 +162,10 @@ pub enum Action {
     SyncBisync,
     /// Pause or resume the transfer in flight.
     TogglePause,
+    /// Start or stop watching the local tree and syncing what changes.
+    ToggleWatch,
+    /// Open the audit log: what previous runs actually did.
+    ShowLog,
 
     // ── Bookmarks and forms ──────────────────────────────────────────────
     /// Open the selected bookmark.
@@ -244,6 +248,8 @@ impl Action {
             Self::SyncProfile => "Plan using this connection's sync profile",
             Self::SyncBisync => "Plan a two-way sync",
             Self::TogglePause => "Pause or resume the transfer",
+            Self::ToggleWatch => "Watch this tree and sync changes",
+            Self::ShowLog => "Show the audit log",
 
             Self::OpenItem => "Open the selected connection",
             Self::NewItem => "Add a new connection",
@@ -307,7 +313,9 @@ impl Action {
             | Self::SyncMirror
             | Self::SyncProfile
             | Self::SyncBisync
-            | Self::TogglePause => "Sync",
+            | Self::TogglePause
+            | Self::ToggleWatch
+            | Self::ShowLog => "Sync",
 
             Self::OpenItem
             | Self::NewItem

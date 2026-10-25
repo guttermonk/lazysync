@@ -20,6 +20,7 @@
 pub mod ftp;
 pub mod hostkey;
 pub mod local;
+pub mod rclone;
 pub mod remote;
 pub mod ssh;
 
@@ -247,6 +248,20 @@ pub trait Vfs: Send {
     /// one used to be. That only works if the rename is atomic, which it is
     /// for both a local filesystem and SFTP within one server.
     fn rename(&mut self, from: &Path, to: &Path) -> Result<(), VfsError>;
+
+    /// How `rsync` or `rclone` would name this location on its command line.
+    ///
+    /// `None` where no external tool can reach it, which is the honest answer
+    /// for FTP: neither speaks it in a form lazysync can hand over. Returning
+    /// `None` makes delegation unavailable for the whole plan, which is how
+    /// `executor = "auto"` falls back to the native engine.
+    ///
+    /// Defaulted to `None` so a new backend has to opt in deliberately. The
+    /// failure mode of guessing wrong here is a tool pointed at the wrong
+    /// place, which is worse than not using the tool at all.
+    fn external_spec(&self, _path: &Path) -> Option<crate::sync::external::Spec> {
+        None
+    }
 
     /// The directory to start in, and where [`crate::keys::Action::GoHome`]
     /// goes.

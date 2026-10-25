@@ -47,10 +47,25 @@ fn main_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             continue;
         }
 
-        // With no chord in progress and nothing transferring, there is nothing
-        // to wake up for: block on input rather than polling, so an idle
-        // lazysync uses no CPU.
-        match dispatcher.poll_timeout() {
+        // Watch mode gives the loop a second reason to wake up. Two deadlines
+        // can be pending -- a chord timing out and a batch of file changes
+        // going quiet -- so the shorter one wins. With neither, the loop still
+        // blocks on input, so an idle lazysync uses no CPU even with a
+        // watcher running: `notify` does its waiting in its own thread, and
+        // a change arriving is what creates a deadline in the first place.
+        //
+        // The subtlety is that a watcher with nothing pending has *no*
+        // deadline. Polling on a fixed interval instead would mean waking
+        // several times a second for ever, which is exactly what the blocking
+        // read was chosen to avoid.
+        let deadline = match (dispatcher.poll_timeout(), app.watch_deadline()) {
+            (Some(chord), Some(watch)) => Some(chord.min(watch)),
+            (Some(chord), None) => Some(chord),
+            (None, Some(watch)) => Some(watch),
+            (None, None) => None,
+        };
+
+        match deadline {
             None => handle(app, &mut dispatcher, event::read()?),
             Some(remaining) => {
                 if event::poll(remaining)? {
@@ -59,6 +74,13 @@ fn main_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     app.handle(action);
                 }
             }
+        }
+
+        // After input, so a keystroke is never delayed by a sync starting --
+        // and before the next draw, so the plan a batch opens is on screen in
+        // the same frame.
+        if app.watcher.is_some() {
+            app.step_watch();
         }
     }
 

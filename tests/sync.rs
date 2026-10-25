@@ -1423,3 +1423,272 @@ fn walk(root: &Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+// ── Watch mode ──────────────────────────────────────────────────────────────
+
+/// Drive the watcher the way the main loop does, until it acts or gives up.
+fn pump_watch(h: &mut Harness) -> bool {
+    for _ in 0..300 {
+        h.app.step_watch();
+        if h.app.plan.is_some() || h.app.transfer.is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn watch_config(mode: &str) -> Config {
+    toml::from_str(&format!(
+        "[profiles.live]\nmode = \"push\"\nwatch = \"{mode}\"\ndebounce_ms = 50\n"
+    ))
+    .unwrap()
+}
+
+/// `sw` starts watching, and a change opens a plan for review.
+#[test]
+fn watch_batch_opens_a_plan_when_the_tree_goes_quiet() {
+    let mut h = Harness::new(watch_config("batch"));
+    h.app.active_profile = Some("live".into());
+    h.refresh();
+
+    h.press("sw");
+    assert!(h.app.watcher.is_some(), "{}", h.app.status);
+    assert!(h.app.status.contains("watching"), "{}", h.app.status);
+
+    write(&h.left().join("new.txt"), "fresh", 2_000_000);
+
+    assert!(pump_watch(&mut h), "the watcher should have opened a plan");
+    assert_eq!(
+        h.app.screen,
+        Screen::Confirm,
+        "batch mode reviews rather than applying: {}",
+        h.app.status
+    );
+    assert!(
+        h.app.transfer.is_none(),
+        "nothing may move before the plan is confirmed"
+    );
+}
+
+/// `watch = "auto"` applies without asking. A watcher that stops for a modal
+/// on every save is useless, which is why this mode exists at all -- but it is
+/// a different promise from the rest of lazysync, so it is opt-in per profile.
+#[test]
+fn watch_auto_applies_without_confirmation() {
+    let mut h = Harness::new(watch_config("auto"));
+    h.app.active_profile = Some("live".into());
+    h.refresh();
+
+    h.press("sw");
+    write(&h.left().join("new.txt"), "fresh", 2_000_000);
+
+    assert!(pump_watch(&mut h), "the watcher should have acted");
+    h.drain();
+
+    assert_eq!(
+        fs::read_to_string(h.right().join("new.txt")).unwrap(),
+        "fresh",
+        "auto mode syncs without a confirmation step"
+    );
+}
+
+/// `watch = "off"` is honoured even when the key is pressed: the behaviour is
+/// declared in the profile, and `auto` in particular applies without asking.
+#[test]
+fn watch_is_refused_when_the_profile_says_off() {
+    let mut h = Harness::new(watch_config("off"));
+    h.app.active_profile = Some("live".into());
+    h.refresh();
+
+    h.press("sw");
+
+    assert!(h.app.watcher.is_none());
+    assert!(h.app.status.contains("off"), "{}", h.app.status);
+}
+
+/// Pressing it again stops.
+#[test]
+fn watching_can_be_turned_off_again() {
+    let mut h = Harness::new(watch_config("batch"));
+    h.app.active_profile = Some("live".into());
+    h.refresh();
+
+    h.press("sw");
+    assert!(h.app.watcher.is_some());
+
+    h.press("sw");
+    assert!(h.app.watcher.is_none());
+    assert!(h.app.status.contains("stopped"), "{}", h.app.status);
+}
+
+/// **The feedback loop that would never end.** A sync writes partial files
+/// into the tree being watched; reacting to them would plan another sync,
+/// which writes more. The watcher ignores lazysync's own bookkeeping.
+#[test]
+fn a_transfers_own_partial_file_does_not_trigger_another_sync() {
+    let mut h = Harness::new(watch_config("batch"));
+    h.app.active_profile = Some("live".into());
+    h.refresh();
+
+    h.press("sw");
+
+    // Exactly what a transfer leaves behind mid-flight.
+    write(
+        &h.left().join("a.txt.lazysync-part"),
+        "in flight",
+        2_000_000,
+    );
+
+    for _ in 0..40 {
+        h.app.step_watch();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        h.app.plan.is_none(),
+        "a partial file is lazysync's own output, and syncing it would never stop"
+    );
+}
+
+/// With nothing pending there is no deadline, so the main loop can keep
+/// blocking on input rather than waking several times a second for ever.
+#[test]
+fn an_idle_watcher_lets_the_loop_block() {
+    let mut h = Harness::new(watch_config("batch"));
+    h.app.active_profile = Some("live".into());
+    h.refresh();
+
+    h.press("sw");
+    assert!(h.app.watcher.is_some());
+    assert!(
+        h.app.watch_deadline().is_none(),
+        "an idle watcher must not make the loop poll"
+    );
+}
+
+// ── Audit log ───────────────────────────────────────────────────────────────
+
+/// A finished run is recorded, and `sL` opens it.
+#[test]
+fn a_run_is_written_to_the_audit_log_and_can_be_read_back() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a.txt"), "hello", 2_000_000);
+    h.refresh();
+
+    h.press("sp");
+    h.apply();
+    h.dismiss();
+
+    h.press("sL");
+    assert_eq!(h.app.screen, Screen::Log);
+
+    let entries = &h.app.audit_entries;
+    assert_eq!(entries.len(), 1, "one run, one record: {entries:?}");
+
+    let entry = &entries[0];
+    assert_eq!(entry.mode, "push");
+    assert_eq!(entry.engine, "native");
+    assert_eq!(entry.applied, 1);
+    assert_eq!(entry.failed, 0);
+    assert_eq!(entry.bytes, 5);
+    assert!(
+        entry.confirmed,
+        "this plan was reviewed, which is the distinction the log exists for"
+    );
+    assert!(entry.items.iter().any(|i| i.path == "a.txt"));
+}
+
+/// An unattended watch-mode sync is marked as such. Someone reading the log
+/// needs to know which runs nobody saw.
+#[test]
+fn a_watch_mode_sync_is_recorded_as_unattended() {
+    let mut h = Harness::new(watch_config("auto"));
+    h.app.active_profile = Some("live".into());
+    h.refresh();
+
+    h.press("sw");
+    write(&h.left().join("new.txt"), "fresh", 2_000_000);
+
+    assert!(pump_watch(&mut h), "the watcher should have acted");
+    h.drain();
+
+    // The finished progress screen has to be acknowledged before the browser
+    // keymap -- and so `sL` -- is in effect again.
+    h.dismiss();
+    h.app.watcher = None;
+    h.press("sL");
+
+    let entry = h
+        .app
+        .audit_entries
+        .first()
+        .expect("the unattended run should be recorded");
+    assert!(
+        !entry.confirmed,
+        "nobody reviewed this plan, and the log has to say so"
+    );
+}
+
+/// Moving around the log works, and `esc` returns to the browser.
+#[test]
+fn the_log_viewer_navigates_and_closes() {
+    let mut h = Harness::new(Config::default());
+
+    // Two runs, so there is something to move between.
+    for (name, content) in [("a.txt", "one"), ("b.txt", "two")] {
+        write(&h.left().join(name), content, 2_000_000);
+        h.refresh();
+        h.press("sp");
+        h.apply();
+        h.dismiss();
+    }
+
+    h.press("sL");
+    assert_eq!(h.app.audit_entries.len(), 2);
+    assert_eq!(h.app.log_cursor, 0, "newest first");
+
+    h.press("j");
+    assert_eq!(h.app.log_cursor, 1);
+    h.press("j");
+    assert_eq!(h.app.log_cursor, 1, "and it stops at the end");
+
+    h.press("k");
+    assert_eq!(h.app.log_cursor, 0);
+
+    h.dismiss();
+    assert_eq!(h.app.screen, Screen::Browser);
+}
+
+/// A refused plan is recorded too: the user needs to learn it was *stopped*
+/// rather than wondering why nothing synced.
+#[test]
+fn a_refused_mirror_is_recorded_as_a_refusal() {
+    let config: Config = toml::from_str(
+        r#"
+        [safety]
+        max_delete_fraction = 0.1
+        "#,
+    )
+    .unwrap();
+
+    let mut h = Harness::new(config);
+    // Everything on the right is extraneous, so a mirror would empty it.
+    for i in 0..12 {
+        write(&h.right().join(format!("f{i}")), "x", 1_000_000);
+    }
+    write(&h.left().join("keep.txt"), "y", 1_000_000);
+    h.refresh();
+
+    h.press("sm");
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert!(plan.refusal.is_some(), "the guard should have fired");
+
+    // Applying is refused, so nothing is recorded as having run -- the
+    // interactive path records a refusal only when it actually tries.
+    h.press("y");
+    assert!(
+        h.app.transfer.is_none(),
+        "a refused plan must not start a transfer"
+    );
+}

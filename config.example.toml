@@ -7,8 +7,11 @@
 # them from the UI, and round-tripping a hand-commented config through a
 # serializer would eat your comments.
 #
-# Options marked "not yet" are parsed and validated but not acted on; the
-# phase that implements each is in docs/PLAN.md.
+# Options marked NOT YET are parsed and validated but not acted on. They are
+# accepted rather than rejected so a config written for a later version still
+# loads -- but nothing pretends they work, and where one would change what a
+# comparison means, the confirmation window reports the rule it actually
+# applied rather than the one requested.
 
 # ─── General ─────────────────────────────────────────────────────────────────
 
@@ -78,8 +81,12 @@ match = "ancestor"
 [compare]
 # How two files are judged same-or-different when building a plan.
 #   "size_mtime" -- fast, and right nearly always
-#   "checksum"   -- correct, and reads both files in full
 #   "size_only"  -- for remotes with no usable timestamp at all
+#   "checksum"   -- NOT YET: nothing hashes anything, so this degrades to
+#                   "size_mtime". It is accepted rather than rejected so a
+#                   config written for a later version still loads -- but the
+#                   window reports the rule it *actually* used, because that
+#                   header is a claim about what was checked.
 #
 # "size_mtime" falls back to "size_only" by itself where a timestamp
 # comparison could not mean anything: when either side does not report an
@@ -88,8 +95,7 @@ match = "ancestor"
 # uploaded file carries the time it was uploaded, so comparing timestamps
 # would mark the whole tree changed on every run. The confirmation window
 # always shows the rule it actually used, and such rows read "same size, times
-# not kept" rather than claiming a check that was not made. Set "checksum"
-# when size alone is not enough for you.
+# not kept" rather than claiming a check that was not made.
 method = "size_mtime"
 
 # Timestamps that differ by less than this are treated as equal. Needed
@@ -274,9 +280,24 @@ preset = "terminal"
 # side is one that works until the day it matters.
 mode = "push"
 
-# "auto" picks the best available: rsync for ssh remotes when rsync exists on
-# both ends, rclone when the remote is an rclone remote, native otherwise.
-# "native" never shells out.
+# What moves the bytes: "auto" | "native" | "rsync" | "rclone".
+#
+# "auto" means the native engine. That is not what the name suggests, so here
+# is why: a delegated transfer gives up three things only lazysync's own write
+# path provides. The destination is re-checked immediately before it is
+# written, so a file that changed after the plan was built is skipped rather
+# than clobbered. Progress and cancellation are per file rather than one
+# aggregate line. And a conflict resolved "keep both" has its displaced copy
+# preserved.
+#
+# Those can be a fair trade for rsync's delta transfer on a large changed
+# file. Making them silently, under a setting that promises only "the best
+# available", is not -- so name the tool to get it. (Keep-both is refused even
+# then: that one is data loss, not a trade.)
+#
+# When a tool does run it is a transport, not a planner: it is handed the
+# exact list of paths the plan contains, and deletions always stay with the
+# native engine so the backup directory and the delete limits keep working.
 executor = "auto"
 
 # Exclude rules, in gitignore syntax. Later rules win, so `!keep.log` after
@@ -299,9 +320,12 @@ exclude = ["/target/", "*.log", ".git/"]
 # Nested .gitignore files are not consulted yet.
 respect_gitignore = false
 
-# Skip the confirmation window. Only honoured by `lazysync sync --yes` and by
-# watch mode; the interactive UI always shows the plan. NOT YET read: use
-# --yes.
+# Skip the confirmation window. NOT YET read, and probably never will be:
+# `watch = "auto"` is the setting that applies without asking, and `--yes` is
+# the one for cron. A third way to say the same thing -- one that silently
+# applies to the *interactive* path too -- would be a config line that turns
+# the confirmation window off, which is the feature this program exists to
+# provide.
 auto_confirm = false
 
 # A two-way profile. Run it with `sb`, or with `ss` when a bookmark names it.
@@ -315,10 +339,18 @@ mode = "bisync"
 executor = "auto"
 exclude = [".obsidian/workspace.json"]
 
-# Continuously push local changes as they happen. A watcher that opens a modal
-# on every save is useless, so changes are batched and confirmed together.
+# Continuously sync local changes as they happen. `sw` starts and stops it.
 #   "batch" -- collect for `debounce_ms`, then show one plan
 #   "auto"  -- apply without confirmation
-#   "off"   -- no watching
+#   "off"   -- no watching, and `sw` says so
+#
+# A watcher that opens a modal on every save is useless; one that never
+# confirms contradicts the rest of lazysync. Both exist, and the unattended
+# one is opt-in -- the audit log marks its runs `unattended`.
+#
+# The batch decides *when* to sync, never what: the planner walks the trees as
+# usual, because syncing only the paths that fired events would miss whatever
+# inotify dropped. lazysync's own partial and backup files are ignored, or a
+# transfer would trigger the next sync for ever.
 watch = "off"
 debounce_ms = 2000

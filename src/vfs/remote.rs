@@ -311,6 +311,28 @@ impl Vfs for RemoteAdapter {
         })
     }
 
+    fn external_spec(&self, path: &Path) -> Option<crate::sync::external::Spec> {
+        use crate::connection::AuthMethod;
+
+        // SSH only. Neither rsync nor rclone can be handed an FTP location in
+        // a form that reuses what lazysync already knows about it, and
+        // guessing would point a tool somewhere other than the pane on screen.
+        if !self.protocol.is_ssh() {
+            return None;
+        }
+
+        Some(crate::sync::external::Spec::Ssh {
+            user: self.target.username.clone(),
+            host: self.target.host.clone(),
+            port: self.target.port_or_default(),
+            identity: self.target.identity_file.clone(),
+            // A typed password cannot be handed on: rsync would open its own
+            // session and prompt for it again, over a screen the TUI owns.
+            password_auth: matches!(self.target.auth, AuthMethod::Password),
+            path: path.to_path_buf(),
+        })
+    }
+
     fn home(&mut self) -> Option<PathBuf> {
         self.home.clone()
     }

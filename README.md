@@ -5,21 +5,21 @@ set, vim keys by default with every binding remappable, and a confirmation
 window that shows you both sides of every overwrite — size and timestamp,
 source and destination — before anything moves.
 
-> **Status: phase 6 of 7.** Plan a push, pull, mirror or **two-way bisync**,
-> review every row, and watch it transfer — with progress, throughput, ETA,
-> pause and cancel, resumable partial files, and gitignore-style exclude rules
-> driven by named sync profiles. Over the local filesystem, SFTP/SCP or
-> FTP/FTPS, with saved connections, host key verification, keyring passwords,
-> zide auto-open, synchronized browsing with ghosting, union view, and vim
-> keys throughout.
+> **Status: feature-complete against the plan.** Plan a push, pull, mirror or
+> two-way bisync, review every row, and watch it transfer — with progress,
+> throughput, ETA, pause and cancel, resumable partial files, and
+> gitignore-style exclude rules driven by named sync profiles. Over the local
+> filesystem, SFTP/SCP, FTP/FTPS, or **any `rclone` remote** — which is how S3,
+> WebDAV, B2 and Google Drive are reachable. Optionally delegate the transfer
+> to `rsync` or `rclone`. Watch a tree and sync what changes. Every run is
+> recorded in an audit log.
 >
-> What does not work yet: no watch mode, no `rsync`/`rclone` delegation, no
-> inline diffs, and no checksum re-verification from the window. Transfers are
-> sequential — one file at a time. S3, SMB and WebDAV are refused by name, and
-> are blocked on more than time: the `remotefs` backends for WebDAV and S3
-> still require an older, incompatible version of the trait every other
-> backend implements. Each subcommand says what it is waiting on. See
-> [`docs/PLAN.md`](docs/PLAN.md).
+> What is not there: no inline diffs and no checksum re-verification from the
+> confirmation window, and transfers are sequential — one file at a time.
+> `s3://`, `smb://` and `webdav://` are still refused as *native* protocols
+> (the `remotefs` backends for the first two need an older, incompatible
+> version of the trait every other backend implements) — use an rclone remote
+> instead. See [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Why not termscp
 
@@ -43,20 +43,21 @@ things that sent me to write another one:
   bookmark list. Connection details live in the add/edit screen; opening a
   bookmark shows its *name* and a password prompt, and skips even that when
   agent or key auth works.
-- **No advanced sync.** lazysync has a native sync engine and will delegate to
-  `rsync` or `rclone` when they are installed and the remote suits them.
+- **No advanced sync.** lazysync has a native sync engine, and can hand the
+  transfer to `rsync` or `rclone` when you ask it to — see
+  [below](#delegating-to-rsync-or-rclone) for what that trades away.
 
 ## Features
 
 Planned for 1.0, phased in the order below. See
 [`docs/PLAN.md`](docs/PLAN.md) for the full breakdown.
 
-- Dual-pane browser over SFTP, SCP, FTP/FTPS, S3, SMB, WebDAV, and any
-  `rclone` remote
+- Dual-pane browser over SFTP ✅, SCP ✅, FTP/FTPS ✅, and any `rclone`
+  remote ✅ — which covers S3, WebDAV, B2, Google Drive and some seventy more
 - Sync modes: push/pull without deletes ✅, mirror with deletes ✅, two-way
-  bisync with conflict resolution ✅, and a file watcher
-- Confirmation window with per-row exclusion ✅, inline diffs, and checksum
-  re-verification
+  bisync with conflict resolution ✅, and a file watcher ✅
+- Confirmation window with per-row exclusion ✅; inline diffs and checksum
+  re-verification are not implemented
 - Synchronized browsing with ghost positions and a union view
 - Vim keybindings by default; every binding remappable per UI mode, with chord
   support (`gg`, `dd`), in the style of [inlyne][inlyne]'s keymap config
@@ -67,7 +68,7 @@ Planned for 1.0, phased in the order below. See
 - Resumable transfers, a transfer queue with progress and ETA, bandwidth caps
 - Safety rails: backup-dir instead of hard delete, and a max-delete threshold
   that aborts on a mistyped sync root
-- Headless `lazysync sync <profile> --yes` for cron, with an audit log
+- Headless `lazysync sync <profile> --yes` for cron ✅, with an audit log ✅
 
 ## Install
 
@@ -89,8 +90,10 @@ store is read-only, and anything copied in is clobbered on the next update:
 
 ```nix
 inputs.lazysync.packages.${system}.default.override {
-  # Optional sync executors put on lazysync's PATH. The native engine needs
-  # neither. Pass [ ] for a native-only build.
+  # External tools put on lazysync's PATH. `rsync` is purely an optional
+  # executor. `rclone` is also how `rclone://` remotes work at all -- and so
+  # how S3, WebDAV, B2 and Google Drive are reached -- so dropping it loses
+  # more than an executor.
   syncBackends = [ pkgs.rsync pkgs.rclone ];
 }
 ```
@@ -101,8 +104,9 @@ inputs.lazysync.packages.${system}.default.override {
 cargo install --locked --git https://github.com/guttermonk/lazysync
 ```
 
-`rsync` and `rclone` are optional; lazysync uses them when they're on `PATH`
-and falls back to its own engine with a note in the plan when they're not.
+`rsync` is optional: the native engine needs it for nothing, and is what runs
+unless a profile names a tool. `rclone` is optional too, but `rclone://`
+remotes need it -- which is how S3, WebDAV, B2 and Google Drive are reached.
 
 ## Usage
 
@@ -110,6 +114,7 @@ and falls back to its own engine with a note in the plan when they're not.
 lazysync                              # the saved connections
 lazysync open www-prod                # open one by name
 lazysync sftp://user@host/srv/www     # connect directly
+lazysync rclone://gdrive/Documents    # any remote in your rclone.conf
 lazysync /mnt/backup/proj             # the working directory against that
 lazysync ~/proj /mnt/backup/proj      # one directory in each pane
 lazysync keys --mode browser          # dump the resolved keymap
@@ -118,8 +123,8 @@ lazysync config                       # dump the resolved config as TOML
 lazysync sync deploy ~/proj /mnt/backup --dry-run   # print a plan, move nothing
 lazysync sync deploy ~/proj /mnt/backup --yes      # headless, for cron
 
-# Not yet implemented -- each says which phase it arrives in:
-lazysync import termscp               # import bookmarks          (phase 7)
+# Not implemented:
+lazysync import termscp               # import termscp bookmarks
 ```
 
 In the connection list: `enter` opens, `n` adds, `e` edits, `dd` deletes, `/`
@@ -129,7 +134,8 @@ In the browser: `h`/`j`/`k`/`l` navigate, `tab` switches panes, `S` toggles
 synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
 `o` cycles the sort, `?` shows every binding, `q` quits. `sp` plans a push,
 `sl` a pull, `sm` a mirror, `sb` a two-way bisync, `ss` uses the connection's
-own sync profile. All of it remappable — see below.
+own sync profile, `sw` watches the tree, `sL` shows the audit log. All of it
+remappable — see below.
 
 ### The confirmation window
 
@@ -211,14 +217,79 @@ Bisync is interactive-only. `lazysync sync` refuses a bisync profile rather
 than resolving conflicts on its own, because a cron job that silently picks a
 side is one that works until the day it matters.
 
+### Delegating to rsync or rclone
+
+`executor` in a sync profile picks what moves the bytes:
+
+```toml
+[profiles.deploy]
+mode = "push"
+executor = "rsync"      # "auto" | "native" | "rsync" | "rclone"
+```
+
+**`auto` means the native engine.** That is not what the name suggests, so it
+is worth saying why. A delegated transfer gives up three things:
+
+- the destination is no longer re-checked immediately before it is written, so
+  a file that changed *after* you reviewed the plan is overwritten rather than
+  skipped;
+- progress and cancellation become one aggregate line rather than per file;
+- a conflict resolved "keep both" does not get its displaced copy preserved.
+
+Those may be a fair trade for rsync's delta transfer on a large changed file.
+They are not a fair trade to make *silently*, under a setting that promises
+only "the best available" — so you get them by naming the tool. (Keep-both is
+refused outright even then: that one is data loss rather than a trade.)
+
+When a tool does run, it is used as a **transport, not a planner**. It is
+handed the exact list of paths the plan contains, with the flags that stop it
+deciding anything for itself — without `--ignore-times`, rsync's own
+size-and-mtime check silently skips files lazysync decided had changed.
+Deletions always stay with the native engine, so the backup directory and the
+delete limits keep working unchanged.
+
+### Watching a tree
+
+```toml
+[profiles.notes]
+mode = "push"
+watch = "batch"         # "off" | "batch" | "auto"
+debounce_ms = 2000
+```
+
+`sw` starts and stops it. Changes are collected until the tree has been quiet
+for `debounce_ms`, then `batch` opens one plan for review and `auto` applies
+without asking. A watcher that stops for a modal on every save is useless,
+and one that never confirms contradicts the rest of this program — so both
+exist and the unattended one is opt-in.
+
+Two details worth knowing. The batch decides *when* to sync, never what: the
+planner walks the trees as usual, because syncing only the paths that fired
+events would miss whatever inotify dropped. And lazysync's own partial and
+backup files are ignored, or a transfer would trigger the next sync for ever.
+
+### The audit log
+
+`sL` shows what previous runs actually did — newest first, failures first
+within a run, since "why is that file not there" is the question a log gets
+opened for. Refusals are recorded too: a safety rail stopping a sync is worth
+knowing about, and otherwise the only evidence is that nothing happened.
+
+It lives at `$XDG_STATE_HOME/lazysync/audit.jsonl`, one JSON object per line,
+so `jq` works on it and a crash mid-write can only ever truncate the last
+record. Runs nobody reviewed — `--yes` from cron, or watch mode's `auto` — are
+marked `unattended`.
+
 The `compare:` in the header is the rule that was *actually* used, not the one
 configured. Against a destination that cannot be made to keep a modification
 time — FTP, whose `MFMT` is not part of the base protocol — `size+mtime` drops
 to `size`, and rows read `same size, times not kept`. The alternative is worse
 than it sounds: every uploaded file carries the time it was uploaded, so
 comparing timestamps would call the entire tree changed on every single run.
-When size alone is not enough for you, `compare.method = "checksum"` is the
-answer.
+Size alone is weaker than it sounds for such a destination — a same-size edit
+slips through — and `compare.method = "checksum"` is not yet an answer:
+nothing hashes anything, so it degrades too. The header always names the rule
+that was actually applied.
 
 ### Transfers
 

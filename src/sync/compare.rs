@@ -241,7 +241,18 @@ impl Comparator {
         // `size_mtime` degrades to `size` rather than silently treating a
         // missing mtime as a difference.
         let method = match config.method {
-            CompareMethod::Checksum => Method::Checksum,
+            // **`checksum` degrades, because nothing hashes anything yet.**
+            //
+            // `compare` is only ever called with `None` for its digests, so a
+            // `Method::Checksum` comparator falls through to the timestamp
+            // path on every row -- while the window's header says
+            // `compare: checksum`. That header is a claim about what was
+            // checked, and this program's whole argument is that such claims
+            // are true. So the method reported is the one actually used, and
+            // the config documents `checksum` as not yet implemented rather
+            // than as a stronger check nobody performed.
+            CompareMethod::Checksum if timestamps_available => Method::SizeMtime,
+            CompareMethod::Checksum => Method::SizeOnly,
             CompareMethod::SizeOnly => Method::SizeOnly,
             CompareMethod::SizeMtime if timestamps_available => Method::SizeMtime,
             CompareMethod::SizeMtime => Method::SizeOnly,
@@ -549,14 +560,48 @@ mod tests {
         assert!(!reason.differs());
     }
 
+    /// **`compare.method = "checksum"` does not report a checksum**, because
+    /// nothing computes one: `compare` is only ever called with `None` for its
+    /// digests. Reporting `Method::Checksum` would put `compare: checksum` in
+    /// the window's header for a comparison made by size and timestamp, and
+    /// that header is a claim about what was actually checked.
+    ///
+    /// So it degrades like every other unavailable rule, and the config says
+    /// the feature is not implemented rather than offering a stronger check
+    /// nobody performs.
     #[test]
-    fn checksums_decide_when_asked_for() {
+    fn asking_for_a_checksum_does_not_claim_one_was_used() {
         let c = Comparator::new(&config(CompareMethod::Checksum, 2), local(), local());
-        assert_eq!(c.method(), Method::Checksum);
+        assert_eq!(
+            c.method(),
+            Method::SizeMtime,
+            "no hashing exists, so the reported rule must be the one applied"
+        );
+
+        // And against a destination with no usable timestamps it degrades
+        // further, exactly as `size_mtime` does.
+        let c = Comparator::new(&config(CompareMethod::Checksum, 2), local(), s3());
+        assert_eq!(c.method(), Method::SizeOnly);
+    }
+
+    /// The comparison itself is ready for when hashing arrives, so it keeps
+    /// its coverage: given two digests it uses them, and given none it reports
+    /// the weaker check it fell back to rather than claiming the stronger one.
+    ///
+    /// Reached by building the comparator directly, since `new` no longer
+    /// selects this method -- see the test above.
+    #[test]
+    fn the_checksum_comparison_is_correct_for_when_hashing_lands() {
+        let ready = Comparator {
+            method: Method::Checksum,
+            tolerance: 2,
+            timestamps_available: true,
+            times_reported_but_not_preservable: false,
+        };
 
         // Equal sizes, wildly different timestamps, but matching digests.
         assert_eq!(
-            c.compare(
+            ready.compare(
                 &entry(10, Some(9999)),
                 &entry(10, Some(1000)),
                 Some(("abc", "abc"))
@@ -564,22 +609,16 @@ mod tests {
             Reason::ChecksumMatches
         );
         assert_eq!(
-            c.compare(
+            ready.compare(
                 &entry(10, Some(1000)),
                 &entry(10, Some(1000)),
                 Some(("abc", "def"))
             ),
             Reason::ChecksumDiffers
         );
-    }
 
-    /// Asking for a checksum and not getting one must report the weaker check
-    /// that was actually made, not claim the stronger one.
-    #[test]
-    fn a_missing_checksum_falls_back_and_says_so() {
-        let c = Comparator::new(&config(CompareMethod::Checksum, 2), local(), local());
-        let reason = c.compare(&entry(10, Some(2000)), &entry(10, Some(1000)), None);
-
+        // Asked for a checksum and given none: report the fallback honestly.
+        let reason = ready.compare(&entry(10, Some(2000)), &entry(10, Some(1000)), None);
         assert_eq!(
             reason,
             Reason::SourceNewer,

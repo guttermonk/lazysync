@@ -17,15 +17,19 @@
 //! 4. [`executor::apply`] performs the included rows, re-checking each
 //!    destination immediately before touching it.
 
+pub mod audit;
 pub mod bisync;
 pub mod compare;
+pub mod delegate;
 pub mod diff;
 pub mod executor;
+pub mod external;
 pub mod filters;
 pub mod plan;
 pub mod safety;
 pub mod state;
 pub mod transfer;
+pub mod watch;
 
 use crate::config::SyncMode;
 

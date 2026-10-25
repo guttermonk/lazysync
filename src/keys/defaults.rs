@@ -123,6 +123,12 @@ fn browser() -> Keymap {
         // deletes on both sides once a snapshot exists and must not be one
         // keystroke away.
         (Action::SyncBisync, chord("sb")),
+        // `sw` for watch, under the same prefix. A watcher left on by
+        // accident syncs on every save, so it is not one keystroke away.
+        (Action::ToggleWatch, chord("sw")),
+        // The audit log. Under `s` with the rest of the sync commands,
+        // because what it shows is which syncs ran.
+        (Action::ShowLog, chord("sL")),
         // General.
         (Action::Help, c('?')),
         (Action::Cancel, n(Key::Esc)),

@@ -297,6 +297,10 @@ impl Vfs for LocalFs {
         })
     }
 
+    fn external_spec(&self, path: &Path) -> Option<crate::sync::external::Spec> {
+        Some(crate::sync::external::Spec::Local(path.to_path_buf()))
+    }
+
     fn home(&mut self) -> Option<PathBuf> {
         dirs::home_dir()
     }

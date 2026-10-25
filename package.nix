@@ -8,16 +8,23 @@
   stdenv,
   darwin,
 
-  # Optional sync executors. lazysync's own engine is always available and
-  # needs neither of these; they are picked up at runtime when present, and a
-  # sync profile that asks for one falls back to the native executor with a
-  # note in the plan when it is not.
+  # Optional external tools, put on lazysync's PATH.
+  #
+  # `rsync` is purely an executor: the native engine is always available, and
+  # `executor = "rsync"` falls back to it with a note when rsync is absent.
+  #
+  # **`rclone` is more than an executor.** It is also how lazysync reaches
+  # `rclone://` remotes at all -- and therefore how it reaches S3, WebDAV, B2,
+  # Google Drive and the rest, since those have no native backend here. Drop
+  # it from this list and `rclone://` bookmarks stop working, which is a larger
+  # loss than losing an executor. Everything else keeps working.
   #
   # Passed as a list rather than booleans so a consumer can supply their own
   # build -- an rclone with extra backends compiled in, say.
   #
   #   lazysync.override { syncBackends = [ pkgs.rsync pkgs.rclone ]; }
-  #   lazysync.override { syncBackends = [ ]; }   # native engine only
+  #   lazysync.override { syncBackends = [ pkgs.rclone ]; }  # no rsync executor
+  #   lazysync.override { syncBackends = [ ]; }   # native engine, no rclone://
   rsync,
   rclone,
   syncBackends ? [ rsync rclone ],

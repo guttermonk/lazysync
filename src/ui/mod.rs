@@ -9,6 +9,7 @@ pub mod confirm;
 pub mod form;
 mod form_view;
 mod help;
+pub mod log;
 mod panes;
 mod progress;
 mod status;
@@ -30,6 +31,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.screen {
         Screen::Bookmarks => bookmarks::draw(frame, app, body),
+        Screen::Log => log::draw(frame, app, &app.audit_entries, app.log_cursor, body),
         Screen::Browser => {
             let [left, right] =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])

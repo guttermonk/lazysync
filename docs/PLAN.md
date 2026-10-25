@@ -5,10 +5,11 @@ local ↔ local, remote ↔ remote) trees. termscp's feature set, vim keys by
 default, every binding remappable, and a confirmation window that shows you
 exactly what is about to be overwritten before anything moves.
 
-Status: **phase 6 of 7 complete**. Browsing, connections, all four sync modes
-and the transfer queue work over local, SFTP/SCP and FTP/FTPS; see the phase
-table in §10 for what each one actually delivered, and what it turned out not
-to have anticipated.
+Status: **phase 7 of 7 complete**. All four sync modes, the transfer queue,
+watch mode and the audit log work over local, SFTP/SCP, FTP/FTPS and any
+`rclone` remote — which is also how S3, WebDAV, B2 and Google Drive are
+reachable. See the phase table in §10 for what each phase delivered, and what
+it turned out not to have anticipated.
 
 ---
 
@@ -27,18 +28,35 @@ to have anticipated.
 Modelled on `jambi` for packaging/layout and `bluetui` for the ratatui + serde
 config idiom; the keybinding engine is modelled on `inlyne`.
 
+What is actually depended on:
+
 ```
 ratatui 0.30                    TUI (crossterm via ratatui::crossterm)
-remotefs-ssh / -ftp / -aws-s3   protocol backends (the crates termscp publishes)
-  / -smb / -webdav
-serde + toml                    config, bookmarks, sync profiles, themes
+remotefs 1.0 + -ssh + -ftp      SFTP/SCP/FTP/FTPS, behind one adapter
+ssh2                            the host key pre-check, which remotefs-ssh
+                                  does not do at all
+ssh2-config                     reading ~/.ssh/config
+serde + toml                    config, bookmarks, profiles, themes
+serde_json                      the bisync snapshot and the audit log
 keyring                         password storage (Secret Service / kwallet)
 notify                          watch mode
-blake3 + md5 + sha2             checksum verification (match provider hash)
 clap                            CLI
+chrono                          both sides' timestamps on every row
 tracing + tracing-appender      logs to $XDG_STATE_HOME/lazysync/
 thiserror / anyhow              errors
 ```
+
+Not depended on, and why:
+
+- **`remotefs-aws-s3` / `-webdav` / `-smb`** — the first two still require
+  `remotefs 0.3`, an incompatible version of the same trait, and SMB needs
+  `libsmbclient`. All three are reached through `rclone` instead.
+- **`blake3` / `md5` / `sha2`** — `compare.method = "checksum"` is parsed and
+  shapes the plan's reported method, but no hashing is implemented, so there
+  is nothing yet for a hash crate to do.
+- **`notify-debouncer-*`** — the debounce window is a config option, a burst
+  has to collapse into one *plan* rather than one event per file, and the
+  debouncer crates bring their own runtime to avoid about twenty lines.
 
 **No async runtime.** The plan originally called for tokio. It is not there,
 because the `remotefs-*` crates are themselves blocking: an async `Vfs` would
@@ -63,61 +81,73 @@ Tree-wide conventions copied from `jambi`: `rust-toolchain.toml`,
 
 ## 3. Module layout
 
+What is actually there, as built. The original sketch is in the git history;
+three differences are worth noting because they were decisions rather than
+drift:
+
+- **`vfs/remote.rs` instead of one file per protocol.** `remotefs-ssh`,
+  `-ftp` and the rest all implement the same trait, and everything on top of
+  it is identical — so SFTP, SCP, FTP and FTPS share one adapter and each
+  protocol module is only "build the client, hand it here" (phase 5).
+- **No `sync/executor/` directory and no `Executor` trait.** Delegation turned
+  out not to be a polymorphic choice of engine: it is one extra *stage* of the
+  existing queue, because the tool only ever moves bytes and the native engine
+  still performs the deletions (phase 7).
+- **`vfs/rclone.rs` is a `Vfs`, not just an executor**, which is how S3,
+  WebDAV, SMB and ~70 others are reached at all.
+
 ```
 src/
   main.rs            entry, CLI dispatch, headless vs TUI
   cli.rs             clap definitions
-  app.rs             App state machine + screen stack
-  event.rs           input/tick/job-event multiplexer
-  tui.rs             terminal init/restore, panic hook
+  lib.rs
+  app.rs             App state machine, screens, action dispatch
+  event.rs           key/chord multiplexer
+  tui.rs             terminal init/restore, panic hook, main loop
 
   config/
     mod.rs           Config, load/merge/validate, XDG paths
-    defaults.rs
-    theme.rs         colors, presets (catppuccin/gruvbox/nord), terminal-default
+    theme.rs         palettes and presets
 
   keys/              <- inlyne-shaped
-    action.rs        Action enum (per-mode)
-    combo.rs         Key, ModifiedKey, KeyCombo (chords: gg, dd, ZZ)
-    defaults.rs      vim defaults per mode
-    serialization.rs serde for "g"/{key,mod}/["g","g"]
-    resolver.rs      base/extra merge, chord timeout, prefix matching
-    tests.rs
+    action.rs  combo.rs  defaults.rs  keymap.rs  serialization.rs
 
   vfs/
-    mod.rs           trait Vfs + Entry/Metadata/Capabilities
-    local.rs  sftp.rs  scp.rs  ftp.rs  s3.rs  smb.rs  webdav.rs
-    rclone.rs        rclone rcd JSON-RPC backend (any of ~70 remotes)
-    cache.rs         listing cache + invalidation
-    hostkey.rs       known_hosts / TOFU prompt plumbing
+    mod.rs           trait Vfs + Entry/Capabilities/WriteMetadata
+    local.rs         the local filesystem
+    remote.rs        one adapter for every `remotefs` backend
+    ssh.rs  ftp.rs   per-protocol construction only
+    rclone.rs        a Vfs over the rclone CLI: ~70 remotes
+    hostkey.rs       known_hosts verification, written from scratch
 
   bookmarks/
-    mod.rs  store.rs (bookmarks.toml)  secrets.rs (keyring)  import.rs (termscp)
+    mod.rs           bookmarks.toml
+    secrets.rs       keyring
 
   browser/
-    pane.rs  sync_browse.rs  union_view.rs  sort.rs  filter.rs  marks.rs
+    pane.rs  sync_browse.rs  union.rs  sort.rs
 
   sync/
-    profile.rs       named reusable sync configs
-    diff.rs          tree walk + comparison (mtime/size/checksum)
-    plan.rs          Plan { creates, overwrites, deletes, conflicts, skipped }
-    modes.rs         Push/Pull/Mirror/Bisync
-    state.rs         bisync snapshot store
-    filters.rs       gitignore-style include/exclude
-    watch.rs         notify-driven continuous push
-    executor/
-      mod.rs         trait Executor + capability negotiation
-      native.rs      always available
-      rsync.rs       ssh remotes when rsync exists on both ends
-      rclone.rs      sync/bisync/check via rcd
+    compare.rs       what "the same file" means for a pair of backends
+    diff.rs          the one-directional tree walk
+    bisync.rs        the two-way classifier, plus its own symmetric walk
+    state.rs         the bisync snapshot
+    plan.rs          Plan/Row/Resolution/Section/Totals
+    safety.rs        the delete limits and refusals
+    filters.rs       gitignore-syntax excludes, memoised
+    transfer.rs      the stepped queue, and `Settings`
+    executor.rs      the blocking entry point, rename/delete primitives
+    external.rs      how a backend names itself to an external tool
+    delegate.rs      running rsync/rclone as a transport
+    watch.rs         notify + debouncing
+    audit.rs         the append-only run log
 
   ui/
-    layout.rs  panes.rs  confirm.rs  progress.rs  queue.rs  help.rs  prompt.rs
-    forms/  connection.rs  bookmark.rs  profile.rs
-    log.rs           transfer/audit log viewer
+    mod.rs  panes.rs  confirm.rs  progress.rs  status.rs  help.rs
+    bookmarks.rs  form.rs  form_view.rs  log.rs
 
   integrations/
-    zide.rs          cwd → bookmark resolution
+    zide.rs          cwd -> bookmark resolution
 ```
 
 ## 4. Keybindings
@@ -421,7 +451,7 @@ Ranked by how much I think they matter.
 | 4 | ✅ Transfer queue, progress, resume, filters, sync profiles. (Safety rails landed early, in phase 3.) The queue is a state machine the main loop steps a chunk per frame rather than a worker thread: the panes own the `Vfs` values and an SFTP session cannot be cloned without asking for the password again, so a thread would mean the browser losing its backends for the duration. Stepping gives progress and cancellation with no shared state. Two things worth noting: `Vfs` gained streaming handles, so a 4 GB file no longer costs 4 GB of memory; and the glob matcher had to be memoised after `*a*a*a*a*a*a*b` against forty `a`s took **3.7 seconds** — the patterns come from the user's own config, so that was a filter line able to freeze the planner. |
 | 5 | ✅ One generic `RemoteAdapter` for every `remotefs` backend; FTP + FTPS on top of it. The phase was planned as "all remaining backends plus the rsync/rclone executors" and was cut down deliberately: **WebDAV and S3 cannot go in at all right now** — `remotefs-webdav` and `remotefs-aws-s3` still depend on `remotefs 0.3`, which defines a *different, incompatible* `RemoteFs` trait, so adding either puts two versions of the trait in one binary. SMB needs `libsmbclient` and a share field the connection schema does not have. All three move to phase 6. What landed instead paid for itself twice over: generalising the adapter cut `ssh.rs` from 978 lines to 387, and the real-server fixture caught four bugs. One is a comparison bug affecting **every** destination that cannot set an mtime (see §9.2). The others were FTPS: the default port was 990, the *implicit* FTPS port, while `secure()` performs *explicit* FTPS — a plaintext connect then `AUTH TLS` — so `ftps://host` would have opened a plaintext connection to a port awaiting a TLS handshake; a rejected certificate surfaced as "the server refused the connection", because `remotefs` reports a failed handshake as `ConnectionError` with the cause in the source and `translate` was collapsing that into the payload-free `NotConnected`; and the certificate test itself passed for the wrong reason until the fixture stopped exporting a port before confirming something was listening on it. |
 | 6 | ✅ Bisync, state snapshots and the conflict UI. Scoped down again: S3/SMB/WebDAV are still blocked on `remotefs 1.0` ports, and the rsync/rclone executors move to phase 7 — bisync was the only one of the four sync modes still missing and it was worth doing properly rather than alongside two other large pieces. The structural change is that **a plan row now names the side it writes to**, so one plan can move files both ways and the plan-is-the-dry-run rule survives a two-way sync. That refactor is also where the phase's two worst bugs lived, both caught by existing tests: `executor::apply` took a source and a destination and so could not tell *which pane* its "source" was, which silently reversed every pull; and the queue re-derived each file's destination from a single plan-wide `dest_root` at completion time, so a bisync row writing locally had its partial file renamed onto the **remote** — reported as a successful transfer while landing on the wrong side. |
-| 7 | rsync + rclone executors; `RcloneFs`; watch mode, headless CLI + audit log, home-manager module, docs + demo cast |
+| 7 | ✅ rsync + rclone executors, `RcloneFs`, watch mode, audit log. The home-manager module and the demo cast were dropped by agreement rather than attempted badly. Two findings shaped the phase. First, **delegation must not make decisions**: `rsync --files-from` needs `--ignore-times` or rsync's own size-and-mtime check silently skips a row the window showed as an overwrite — verified by removing the flag and watching the test fail. Second, **`auto` had to stop delegating**: the moment it did, three existing tests failed, because a delegated transfer does not re-check the destination before writing (so a file changed after planning gets clobbered rather than skipped), has aggregate rather than per-file progress, and does not preserve a keep-both conflict's displaced copy. Those are trades worth offering to someone who types `executor = "rsync"`; making them silently under a setting that promises "the best available" is not. Keep-both is refused outright even when a tool is named — that one is data loss, not a trade. And `rclone moveto` turned out to delete the source while leaving the destination unchanged whenever the two were the same size, exit code 0: a finished partial file renamed into place is *always* the same size as what it replaces, so this would have silently reverted every rclone transfer. |
 
 Phases 1–3 are the usable milestone: dual-pane browsing over SFTP with
 sync-browse and a reviewed push.
@@ -434,13 +464,35 @@ sync-browse and a reviewed push.
    their blockers need. S3 wants new connection fields (bucket, region,
    credentials) and either a `remotefs 1.0` port or a hand-written backend;
    SMB wants `libsmbclient` as a system dependency.
-2. **rclone's role** — executor only (sync/bisync/check), or also a *browse*
-   backend so bookmarks can point at any rclone remote (gdrive, b2, …)?
+2. ~~**rclone's role**~~ — decided in phase 7: **both**. `vfs::rclone` is a
+   full `Vfs` over the `rclone` command line, so a bookmark can point at any
+   remote in `rclone.conf` and the browser, planner, confirmation window and
+   queue all work against it unchanged. That also routes around the
+   `remotefs 0.3`/`1.0` trait split that had blocked S3, WebDAV and SMB for
+   two phases: they are reachable as rclone remotes without waiting for
+   upstream ports of any of them.
+
+   A subprocess per operation rather than the `rcd` daemon. The daemon is
+   faster, but it needs an HTTP client and a port to bind — and binding a port
+   means answering what happens when it is taken, when the daemon dies
+   mid-transfer, and who stops it if lazysync is killed. One `rclone lsjson`
+   per directory entered is the same order as the round trips SFTP already
+   makes, and reads and writes stream over a single process for the whole
+   file.
 3. **Compare default** — size+mtime (fast, default) vs. always-checksum
    (correct, slow). And the mtime tolerance window default: 1s or 2s?
-4. **Watch mode confirmation** — auto-apply, or queue changes and confirm in
-   batches? A watcher that stops for a modal every save is useless; a watcher
-   that never confirms contradicts the whole review-first design.
+4. ~~**Watch mode confirmation**~~ — decided in phase 7: both, per profile.
+   `watch = "batch"` collects changes until the tree has been quiet for
+   `debounce_ms` and then opens one plan; `watch = "auto"` applies without
+   asking. The tension in the question was real, so it is resolved by making
+   the unattended version opt-in and clearly labelled rather than by picking
+   one. The audit log records which runs nobody saw.
+
+   The batching is over *paths*, not events — a burst touching one file forty
+   times is one path — and the batch decides *when* to plan, never what: the
+   planner walks the trees as usual, because syncing only the paths that fired
+   events would miss whatever inotify dropped and would make watch mode
+   disagree with what `sp` does on the same trees.
 5. ~~**Bisync state location**~~ — decided in phase 6:
    `$XDG_STATE_HOME/lazysync/bisync/<digest of the two roots>.json`. Beside the
    tree was tempting (survives a reinstall, visible from both ends) but does

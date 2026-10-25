@@ -69,8 +69,14 @@ ssh2-config = "0.9.0"
 ssh2 = "0.9"
 remotefs-ftp = { version = "1.0.0", features = ["rustls-aws-lc-rs"] }
 
-# notify, the checksum crates and the rsync/rclone executors arrive with the
-# phases that use them -- see docs/PLAN.md.
+# Watch mode. The debouncing is lazysync's own rather than
+# notify-debouncer-*: the window is a config option, a burst of saves has to
+# collapse into one *plan* rather than one event per file, and the debouncer
+# crates bring their own runtime to avoid about twenty lines.
+notify = "8.0"
+
+# The checksum crates arrive with `compare.method = "checksum"` doing real
+# hashing -- see docs/PLAN.md.
 
 # Password storage. Opt-in per bookmark; key and agent auth are preferred and
 # need no keyring entry at all.

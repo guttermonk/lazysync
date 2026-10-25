@@ -117,7 +117,7 @@ fn run_headless_sync(
     yes: bool,
 ) -> Result<()> {
     use lazysync::{
-        sync::{diff, executor, safety, transfer::Settings as TransferSettings},
+        sync::{audit, diff, executor, safety, transfer::Settings as TransferSettings},
         vfs::LocalFs,
     };
 
@@ -207,6 +207,17 @@ fn run_headless_sync(
     print_plan(&plan, profile.mode.label());
 
     if let Some(refusal) = &plan.refusal {
+        // Logged before bailing. A refusal is the most interesting thing a
+        // cron run can produce -- it means a sync was stopped from doing
+        // something unwanted -- and without a record the only evidence is a
+        // non-zero exit nobody was watching for.
+        let _ = audit::append(&audit::Entry::refusal(
+            chrono::Utc::now(),
+            profile.mode.label(),
+            &source_root.display().to_string(),
+            &dest_root.display().to_string(),
+            refusal,
+        ));
         anyhow::bail!("{refusal}");
     }
     if dry_run {
@@ -236,6 +247,20 @@ fn run_headless_sync(
         &plan,
         &TransferSettings::from_config(&config),
     );
+
+    // `--yes` means nobody reviewed this, which is the distinction the log
+    // exists to record.
+    if let Err(e) = audit::append(&audit::Entry::from_report(
+        chrono::Utc::now(),
+        profile.mode.label(),
+        "native",
+        &source_root.display().to_string(),
+        &dest_root.display().to_string(),
+        false,
+        &report,
+    )) {
+        eprintln!("the audit log could not be written: {e}");
+    }
 
     for failure in report.failures() {
         eprintln!(

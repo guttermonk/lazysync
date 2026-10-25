@@ -199,11 +199,46 @@ pub struct Transfer {
     /// Directories still to create, shallowest first, each with the pane it
     /// belongs on -- bisync can need a parent directory on either side.
     directories: VecDeque<(usize, PathBuf)>,
+
+    /// An external tool moving the bytes, if one was chosen. Stepped before
+    /// the native queue, and dropped once it exits.
+    delegated: Option<super::delegate::Delegated>,
 }
 
 impl Transfer {
-    /// Queue a plan's included rows.
+    /// Queue a plan's included rows for the native engine.
     pub fn new(plan: Plan, settings: Settings) -> Self {
+        Self::build(plan, settings, None)
+    }
+
+    /// Hand the transfers to an external tool, keeping the rest native.
+    ///
+    /// The tool gets the creates and overwrites; the deletions stay here. Not
+    /// a limitation of the plumbing but a deliberate split: `rsync --delete`
+    /// re-derives what is extraneous from the trees as it finds them, which is
+    /// precisely the judgement the plan already made and the user already
+    /// reviewed, and neither tool has an equivalent of the backup-directory
+    /// policy. Delegating the bytes keeps the delete semantics -- and
+    /// `safety`'s refusals -- exactly as they are for a native run.
+    ///
+    /// Spawning is the one thing that can fail here, so the caller can fall
+    /// back to [`Transfer::new`] on an error rather than losing the run.
+    pub fn delegated(
+        plan: Plan,
+        settings: Settings,
+        tool: super::delegate::Tool,
+        endpoints: &super::delegate::Endpoints,
+        extra_args: &[String],
+    ) -> std::io::Result<Self> {
+        let running = super::delegate::Delegated::start(tool, &plan, endpoints, extra_args)?;
+        Ok(Self::build(plan, settings, Some(running)))
+    }
+
+    fn build(
+        plan: Plan,
+        settings: Settings,
+        delegated: Option<super::delegate::Delegated>,
+    ) -> Self {
         // Transfers first, deletions last. A mirror that deletes before it
         // writes leaves the destination briefly missing files that the sync
         // was going to provide -- and if it is interrupted in between, missing
@@ -231,6 +266,13 @@ impl Transfer {
             }
         }
 
+        // An external tool is moving these, so the native queue must not move
+        // them as well -- that would copy every file twice, the second time
+        // over the tool's own output.
+        if delegated.is_some() {
+            transfers.clear();
+        }
+
         let total_bytes = transfers
             .iter()
             .filter_map(|i| plan.rows.get(*i))
@@ -243,11 +285,15 @@ impl Transfer {
         let now = Instant::now();
 
         Self {
-            state: if queue.is_empty() && plan.required_directories().is_empty() {
+            state: if queue.is_empty()
+                && plan.required_directories().is_empty()
+                && delegated.is_none()
+            {
                 State::Finished
             } else {
                 State::Running
             },
+            delegated,
             plan,
             queue,
             active: None,
@@ -387,6 +433,11 @@ impl Transfer {
             State::Finished => return true,
             State::Paused => return false,
             State::Cancelling => {
+                // Kill an external tool first: it has its own connection and
+                // would keep writing after the UI said stop.
+                if let Some(tool) = &mut self.delegated {
+                    tool.cancel();
+                }
                 // The partial file to clean up is on whichever side the active
                 // row was writing to.
                 if let Some(pane) = self.active_target_pane() {
@@ -397,6 +448,16 @@ impl Transfer {
                 return true;
             }
             State::Running => {}
+        }
+
+        // An external tool runs to completion before anything native starts:
+        // the deletions come after the writes, exactly as in a native run, so
+        // that an interrupted sync never leaves the destination missing a file
+        // the sync was about to provide.
+        // It finishing falls through, so the same call also starts on the
+        // deletions rather than costing an extra frame.
+        if self.delegated.is_some() && !self.step_delegated() {
+            return false;
         }
 
         // Directories first, shallowest to deepest, so no create can fail for
@@ -459,6 +520,80 @@ impl Transfer {
         }
 
         false
+    }
+
+    /// Drive the external tool. `true` once it has exited and been recorded.
+    ///
+    /// Each delegated path gets a [`Applied`] entry, so the report reads the
+    /// same whether the bytes moved natively or not -- the progress screen and
+    /// the audit log both consume it without knowing which happened.
+    ///
+    /// The tool reports success or failure for the *run*, not per file, so a
+    /// failure marks every delegated path as failed. That over-reports: some
+    /// of them did transfer. It is the honest direction to err in, because the
+    /// alternative is claiming a file reached the far end when the only
+    /// evidence says the tool did not finish.
+    fn step_delegated(&mut self) -> bool {
+        let Some(tool) = &mut self.delegated else {
+            return true;
+        };
+
+        if !tool.step() {
+            return false;
+        }
+
+        let label = tool.tool().label();
+        let paths: Vec<PathBuf> = tool.paths().to_vec();
+        let outcome = tool.outcome();
+        self.delegated = None;
+
+        // Credit the planned size of each row: on success that is what
+        // crossed the wire, and the tool's own totals cover the whole run
+        // rather than per file.
+        let planned: Vec<(PathBuf, Action, u64)> = paths
+            .iter()
+            .filter_map(|path| {
+                self.plan
+                    .rows
+                    .iter()
+                    .find(|row| &row.path == path)
+                    .map(|row| (path.clone(), row.action, row.bytes()))
+            })
+            .collect();
+
+        match outcome {
+            Ok(()) => {
+                for (path, action, bytes) in planned {
+                    self.bytes_done = self.bytes_done.saturating_add(bytes);
+                    self.report.bytes = self.report.bytes.saturating_add(bytes);
+                    self.report.applied.push(Applied {
+                        path,
+                        action,
+                        outcome: Outcome::Transferred { bytes },
+                    });
+                }
+                tracing::info!("{label} finished {} file(s)", self.report.applied.len());
+            }
+            Err(why) => {
+                for (path, action, _) in planned {
+                    self.report.applied.push(Applied {
+                        path,
+                        action,
+                        outcome: Outcome::Failed { why: why.clone() },
+                    });
+                }
+                tracing::warn!("{label} failed: {why}");
+            }
+        }
+
+        true
+    }
+
+    /// What the external tool last said, for the progress screen.
+    pub fn delegated_progress(&self) -> Option<(&'static str, Option<&str>)> {
+        self.delegated
+            .as_ref()
+            .map(|tool| (tool.tool().label(), tool.progress()))
     }
 
     /// The pane the in-flight row is writing to, if there is one.
