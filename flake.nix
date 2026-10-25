@@ -29,6 +29,18 @@
         lazysync = final.callPackage ./package.nix { };
       };
 
+      # Not `forAllSystems`: a home-manager module is evaluated against the
+      # consuming configuration's own pkgs, so it must not be keyed by the
+      # system of whoever built this flake.
+      #
+      # `homeManagerModules` rather than `homeModules`: the former is what
+      # home-manager's own documentation and the existing ecosystem use. The
+      # alias below covers the newer spelling so either works.
+      homeManagerModules.lazysync = import ./module.nix;
+      homeManagerModules.default = self.homeManagerModules.lazysync;
+      homeModules.lazysync = self.homeManagerModules.lazysync;
+      homeModules.default = self.homeManagerModules.lazysync;
+
       apps = forAllSystems (pkgs: rec {
         lazysync = {
           type = "app";

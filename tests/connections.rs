@@ -493,3 +493,138 @@ fn a_hand_written_bookmarks_file_loads() {
         "agent auth should open without asking for anything"
     );
 }
+
+// ── Declarative management ──────────────────────────────────────────────────
+
+/// A symlinked `bookmarks.toml` is written *through*, not replaced.
+///
+/// `rename(2)` onto a symlink replaces the link itself. That silently turns a
+/// dotfiles symlink into a regular file, and clobbers a home-manager symlink
+/// into the Nix store -- where the breakage shows up later as a failed
+/// `home-manager switch` complaining about an unexpected file.
+#[test]
+fn a_symlinked_store_is_written_through_rather_than_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("dotfiles/bookmarks.toml");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "").unwrap();
+
+    let link = dir.path().join("config/bookmarks.toml");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let mut store = BookmarkStore::default();
+    store.upsert(sftp("box", "example.com"));
+    store.save(&link).expect("saving through the symlink");
+
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink must survive the write"
+    );
+    assert!(
+        std::fs::read_to_string(&real).unwrap().contains("box"),
+        "and the content must have landed at the target"
+    );
+
+    // No debris beside the link.
+    assert!(
+        !link.with_extension("toml.tmp").exists(),
+        "the temporary file belongs beside the target, not the link"
+    );
+}
+
+/// And a symlink into somewhere unwritable is refused with an explanation,
+/// rather than appearing to work.
+///
+/// This is the declaratively-managed case: home-manager points the file at
+/// the Nix store, which is read-only.
+#[test]
+fn a_store_symlinked_somewhere_unwritable_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let readonly = dir.path().join("store");
+    std::fs::create_dir_all(&readonly).unwrap();
+    let real = readonly.join("bookmarks.toml");
+    std::fs::write(&real, "").unwrap();
+
+    // Make the *directory* read-only, which is what blocks the rename.
+    let mut permissions = std::fs::metadata(&readonly).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&readonly, permissions).unwrap();
+
+    let link = dir.path().join("config/bookmarks.toml");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let mut store = BookmarkStore::default();
+    store.upsert(sftp("box", "example.com"));
+
+    let error = store
+        .save(&link)
+        .expect_err("a read-only target cannot be written");
+    let message = error.to_string();
+    assert!(
+        message.contains("declaratively"),
+        "the message has to point at where the file is really managed: {message}"
+    );
+
+    // Restore permissions so the tempdir can be cleaned up.
+    let mut permissions = std::fs::metadata(&readonly).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&readonly, permissions).unwrap();
+}
+
+/// What the home-manager module generates has to be what lazysync parses.
+///
+/// This is the literal output of `module.nix` for a one-bookmark
+/// configuration, pasted in. The module builds `[[bookmark]]` from its
+/// `bookmarks` list, and the store deserializes `#[serde(rename = "bookmark")]`
+/// -- two separate places that have to agree on a name, in two different
+/// languages, with nothing but this test connecting them.
+///
+/// `deny_unknown_fields` is what makes it worth pinning: a field the module
+/// spells differently is a hard parse error at startup, not a quiet default.
+#[test]
+fn the_home_manager_modules_output_is_what_the_store_expects() {
+    let generated = r#"
+[[bookmark]]
+auth = "key"
+host = "box.example.com"
+local_path = "/home/tester/proj"
+name = "www-prod"
+protocol = "sftp"
+remote_path = "/srv/www"
+sync_profile = "deploy"
+username = "deploy"
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bookmarks.toml");
+    std::fs::write(&path, generated).unwrap();
+
+    let store = BookmarkStore::load(&path).expect("the module's own output must parse");
+    assert_eq!(store.bookmarks.len(), 1);
+
+    let bookmark = store.get("www-prod").expect("by name");
+    assert_eq!(bookmark.protocol, Protocol::Sftp);
+    assert_eq!(bookmark.auth, AuthMethod::Key);
+    assert_eq!(bookmark.username.as_deref(), Some("deploy"));
+    assert_eq!(
+        bookmark.local_path.as_deref(),
+        Some(Path::new("/home/tester/proj")),
+        "the local path is the field this project exists partly to keep"
+    );
+    assert_eq!(bookmark.sync_profile.as_deref(), Some("deploy"));
+
+    // And nothing resembling a secret, which the module must never write into
+    // the world-readable Nix store.
+    assert!(
+        !generated.contains("password"),
+        "a declarative bookmark must not carry a password"
+    );
+    assert!(!bookmark.remember_password);
+}

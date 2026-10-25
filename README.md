@@ -85,6 +85,43 @@ Planned for 1.0, phased in the order below. See
 }
 ```
 
+#### home-manager
+
+```nix
+{
+  imports = [ inputs.lazysync.homeManagerModules.lazysync ];
+
+  programs.lazysync = {
+    enable = true;
+
+    settings = {
+      show_hidden = false;
+      sync_browse.enabled = true;
+      compare.mtime_tolerance_secs = 2;
+
+      profiles.deploy = {
+        mode = "push";
+        exclude = [ "/target/" "*.log" ];
+      };
+    };
+  };
+}
+```
+
+`settings` becomes `config.toml`, which lazysync only ever reads — so owning
+it declaratively costs nothing, and an unknown key is a startup error rather
+than silently ignored.
+
+There is also a `bookmarks` option, deliberately off by default. lazysync
+*writes* `bookmarks.toml` when you add (`n`), edit (`e`) or delete (`dd`) a
+connection, and home-manager points that file at the read-only Nix store — so
+declaring your connections means the editor has nowhere to save. lazysync
+detects it and says so plainly rather than appearing to work, but the trade is
+real: set it only if you want your connection list to be configuration. Never
+put a password in it, since the Nix store is world-readable.
+
+#### Overriding the package
+
 Configure with `.override` rather than by copying files over the result — the
 store is read-only, and anything copied in is clobbered on the next update:
 

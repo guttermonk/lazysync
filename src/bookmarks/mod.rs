@@ -179,17 +179,52 @@ impl BookmarkStore {
     /// Via a temporary file and a rename, so an interrupted write cannot leave
     /// a truncated `bookmarks.toml` -- which would lose every saved
     /// connection at once.
+    ///
+    /// **A symlink is written *through*, not replaced.** `rename(2)` onto a
+    /// symlink replaces the link itself, which is wrong wherever something
+    /// else owns this file: a dotfiles repo symlink would be silently turned
+    /// into a regular file, and a home-manager symlink into the Nix store
+    /// would be clobbered -- with the breakage surfacing later, as a failed
+    /// `home-manager switch` complaining about an unexpected file.
+    ///
+    /// Resolving the link first means the write lands where the user pointed
+    /// it, and where that target is read-only -- which is exactly the
+    /// declaratively-managed case -- it fails here, with a message saying so,
+    /// instead of appearing to work.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
 
+        // `read_link` rather than `canonicalize`: the target may not exist
+        // yet, and canonicalize fails in that case.
+        let target = match fs::read_link(path) {
+            Ok(dest) if dest.is_absolute() => dest,
+            // A relative symlink resolves against the link's own directory.
+            Ok(dest) => path.parent().unwrap_or(Path::new(".")).join(dest),
+            // Not a symlink, or does not exist yet.
+            Err(_) => path.to_path_buf(),
+        };
+
+        if target != path && is_read_only(&target) {
+            anyhow::bail!(
+                "{} is a symlink to {}, which is not writable -- your bookmarks are managed \
+                 declaratively (home-manager, or similar), so add or edit them there rather \
+                 than here",
+                path.display(),
+                target.display()
+            );
+        }
+
         let rendered = toml::to_string_pretty(self).context("rendering bookmarks as TOML")?;
 
-        let temporary = path.with_extension("toml.tmp");
+        // The temporary file goes beside the *target*, because a rename cannot
+        // cross filesystems and the target may be somewhere else entirely.
+        let temporary = target.with_extension("toml.tmp");
         fs::write(&temporary, &rendered)
             .with_context(|| format!("writing {}", temporary.display()))?;
-        fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
+        fs::rename(&temporary, &target)
+            .with_context(|| format!("replacing {}", target.display()))?;
 
         Ok(())
     }
@@ -250,6 +285,28 @@ impl BookmarkStore {
 /// `$XDG_CONFIG_HOME/lazysync/bookmarks.toml`.
 pub fn path() -> PathBuf {
     crate::config::config_dir().join("bookmarks.toml")
+}
+
+/// Whether a path is somewhere lazysync cannot write.
+///
+/// Checked by permission rather than by looking for `/nix/store` in the path:
+/// the Nix store is the common case but not the only one, and a hard-coded
+/// path prefix would miss a read-only bind mount and would be wrong on a
+/// system where the store lives elsewhere.
+fn is_read_only(path: &Path) -> bool {
+    // A missing file is not read-only -- it is about to be created, and what
+    // matters then is the directory.
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    match std::fs::metadata(parent) {
+        Ok(metadata) => metadata.permissions().readonly(),
+        // Cannot tell. Treated as writable so the attempt goes ahead and
+        // reports whatever the real failure turns out to be, rather than
+        // refusing on a guess.
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
