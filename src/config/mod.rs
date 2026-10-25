@@ -361,6 +361,15 @@ pub struct Safety {
     /// Abort above this many deletions. 0 disables.
     pub max_delete_files: usize,
     pub confirm_outside_root: bool,
+    /// Suffix for the losing side of a conflict resolved with "keep both".
+    ///
+    /// The displaced file is renamed to `<name><suffix>` next to itself rather
+    /// than deleted, so nothing is lost -- and the winner then propagates to
+    /// both sides, which is what makes the pair *converge*. Keeping each
+    /// side's own version at the original name would leave the two
+    /// permanently different, and every later sync would raise the same
+    /// conflict again.
+    pub conflict_suffix: String,
 }
 
 impl Default for Safety {
@@ -370,6 +379,7 @@ impl Default for Safety {
             max_delete_fraction: 0.25,
             max_delete_files: 0,
             confirm_outside_root: true,
+            conflict_suffix: ".lazysync-conflict".into(),
         }
     }
 }

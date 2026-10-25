@@ -24,10 +24,92 @@ use std::{
 
 use super::{
     executor::{Applied, Outcome, Report},
-    plan::{Action, Plan, Row, Side},
+    plan::{Action, Plan, Resolution, Row, Side},
     safety::DeletePolicy,
 };
 use crate::vfs::{ReadHandle, Vfs, WriteHandle, WriteMetadata};
+
+/// Point a row's source and destination at the right panes.
+///
+/// Returns `(source, source_root, dest, dest_root)` for a row whose
+/// `target_pane` is `target`. The whole purpose of taking both panes through
+/// [`Transfer::step`] is that this decision is per row.
+fn split<'a>(
+    target: usize,
+    local: &'a mut dyn Vfs,
+    local_root: &'a Path,
+    remote: &'a mut dyn Vfs,
+    remote_root: &'a Path,
+) -> (&'a mut dyn Vfs, &'a Path, &'a mut dyn Vfs, &'a Path) {
+    if target == 0 {
+        // Writing locally, so the remote is the source.
+        (remote, remote_root, local, local_root)
+    } else {
+        (local, local_root, remote, remote_root)
+    }
+}
+
+/// Which pane a row writes to, accounting for a conflict's resolution.
+///
+/// A conflict row's `target_pane` is a placeholder until it is resolved -- the
+/// resolution is what decides. Keeping that mapping in one function is what
+/// stops the queue, the totals and the executor from disagreeing about which
+/// direction a conflict goes, which would be a silent wrong-way overwrite.
+pub fn written_pane(row: &Row) -> usize {
+    effective_target_pane(row)
+}
+
+fn effective_target_pane(row: &Row) -> usize {
+    match row.resolution.and_then(Resolution::target_pane) {
+        Some(pane) => pane,
+        None => row.target_pane,
+    }
+}
+
+/// How a plan is to be applied.
+///
+/// Grouped rather than passed as four more parameters. Partly because the
+/// alternative was an eight-argument `apply`, but mostly because these belong
+/// together: they are the policy decisions about *how* to write, read straight
+/// off the config, and every caller needs all of them. Phase 7's bandwidth cap
+/// goes here too rather than widening every signature again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settings {
+    /// Where deleted files go.
+    pub policy: DeletePolicy,
+    /// Suffix for the in-progress file, renamed into place when complete.
+    pub partial_suffix: String,
+    /// Suffix for the file displaced by a conflict resolved "keep both".
+    /// Empty means keep-both behaves as keep-local.
+    pub conflict_suffix: String,
+    /// Whether to pick up a partial file left by an earlier run.
+    pub resume: bool,
+}
+
+impl Settings {
+    /// Read the settings out of the config.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            policy: DeletePolicy::from_config(&config.safety),
+            partial_suffix: config.transfer.partial_suffix.clone(),
+            conflict_suffix: config.safety.conflict_suffix.clone(),
+            resume: config.transfer.resume,
+        }
+    }
+
+    /// Settings for a one-off run that must not leave anything behind.
+    ///
+    /// Used by the headless path and by tests, where a partial file left by a
+    /// failure would be a surprise rather than a feature.
+    pub fn transient(policy: DeletePolicy) -> Self {
+        Self {
+            policy,
+            partial_suffix: ".lazysync-part".into(),
+            conflict_suffix: ".lazysync-conflict".into(),
+            resume: false,
+        }
+    }
+}
 
 /// How much is copied per [`Transfer::step`].
 ///
@@ -73,6 +155,15 @@ impl Current {
 struct Active {
     row_index: usize,
     path: PathBuf,
+    /// The final absolute path on the side being written.
+    ///
+    /// Resolved once, when the transfer starts, and never recomputed. It used
+    /// to be derived from `plan.dest_root` at completion time -- a single
+    /// plan-wide root, which is wrong the moment a plan has rows going both
+    /// ways: a bisync row writing locally had its partial file written to the
+    /// local root and then renamed onto the *remote* one, so the file appeared
+    /// to transfer while landing on the wrong side.
+    to: PathBuf,
     /// Where the bytes are being written before the rename.
     partial: PathBuf,
     source: Box<dyn ReadHandle>,
@@ -94,9 +185,7 @@ pub struct Transfer {
     state: State,
     report: Report,
 
-    policy: DeletePolicy,
-    partial_suffix: String,
-    resume_enabled: bool,
+    settings: Settings,
 
     /// Total bytes the plan expects to move, for the aggregate bar.
     total_bytes: u64,
@@ -107,18 +196,14 @@ pub struct Transfer {
     sample: (Instant, u64),
     rate_bytes_per_sec: f64,
 
-    /// Directories still to create, shallowest first.
-    directories: VecDeque<PathBuf>,
+    /// Directories still to create, shallowest first, each with the pane it
+    /// belongs on -- bisync can need a parent directory on either side.
+    directories: VecDeque<(usize, PathBuf)>,
 }
 
 impl Transfer {
     /// Queue a plan's included rows.
-    pub fn new(
-        plan: Plan,
-        policy: DeletePolicy,
-        partial_suffix: String,
-        resume_enabled: bool,
-    ) -> Self {
+    pub fn new(plan: Plan, settings: Settings) -> Self {
         // Transfers first, deletions last. A mirror that deletes before it
         // writes leaves the destination briefly missing files that the sync
         // was going to provide -- and if it is interrupted in between, missing
@@ -133,6 +218,16 @@ impl Transfer {
                 Action::Create | Action::Overwrite => transfers.push(index),
                 Action::Delete => deletions.push(index),
                 Action::CreateDir | Action::Skip => {}
+                // A conflict is queued only once it has a resolution that
+                // moves something. An undecided one never reaches here --
+                // `Plan::can_apply` refuses the whole plan first -- but
+                // queueing it would be the dangerous reading, so this is
+                // explicit rather than a catch-all.
+                Action::Conflict => {
+                    if row.is_effective() {
+                        transfers.push(index);
+                    }
+                }
             }
         }
 
@@ -142,7 +237,7 @@ impl Transfer {
             .map(Row::bytes)
             .fold(0u64, u64::saturating_add);
 
-        let directories = plan.required_directories().into();
+        let directories: VecDeque<(usize, PathBuf)> = plan.required_directories().into();
 
         let queue: VecDeque<usize> = transfers.into_iter().chain(deletions).collect();
         let now = Instant::now();
@@ -157,9 +252,7 @@ impl Transfer {
             queue,
             active: None,
             report: Report::default(),
-            policy,
-            partial_suffix,
-            resume_enabled,
+            settings,
             total_bytes,
             bytes_done: 0,
             started: now,
@@ -181,6 +274,12 @@ impl Transfer {
         &self.report
     }
 
+    /// The plan being applied.
+    ///
+    /// Also how a bisync gets its plan back after applying: the queue takes
+    /// ownership, so reading it from here keeps exactly one copy. A second
+    /// copy kept alongside could drift from what was applied, and the
+    /// snapshot would then record agreement for a row that was excluded.
     pub const fn plan(&self) -> &Plan {
         &self.plan
     }
@@ -272,18 +371,28 @@ impl Transfer {
     ///
     /// Takes the backends on each call rather than owning them, so the panes
     /// keep theirs and the browser stays usable the moment the transfer ends.
+    /// Copy one chunk, or start or finish one row.
+    ///
+    /// Takes **both** panes rather than a source and a destination, because a
+    /// bisync plan moves files in both directions and each row names the side
+    /// it writes to. A one-directional plan simply has every row agree.
     pub fn step(
         &mut self,
-        source: &mut dyn Vfs,
-        source_root: &Path,
-        dest: &mut dyn Vfs,
-        dest_root: &Path,
+        local: &mut dyn Vfs,
+        local_root: &Path,
+        remote: &mut dyn Vfs,
+        remote_root: &Path,
     ) -> bool {
         match self.state {
             State::Finished => return true,
             State::Paused => return false,
             State::Cancelling => {
-                self.abandon_active(dest);
+                // The partial file to clean up is on whichever side the active
+                // row was writing to.
+                if let Some(pane) = self.active_target_pane() {
+                    let (_, _, dest, _) = split(pane, local, local_root, remote, remote_root);
+                    self.abandon_active(dest);
+                }
                 self.finish();
                 return true;
             }
@@ -292,7 +401,8 @@ impl Transfer {
 
         // Directories first, shallowest to deepest, so no create can fail for
         // a missing parent.
-        if let Some(relative) = self.directories.pop_front() {
+        if let Some((pane, relative)) = self.directories.pop_front() {
+            let (_, _, dest, dest_root) = split(pane, local, local_root, remote, remote_root);
             let target = dest_root.join(&relative);
             if let Err(e) = dest.create_dir(&target) {
                 self.report.applied.push(Applied {
@@ -304,7 +414,8 @@ impl Transfer {
             return false;
         }
 
-        if self.active.is_some() {
+        if let Some(pane) = self.active_target_pane() {
+            let (_, _, dest, _) = split(pane, local, local_root, remote, remote_root);
             self.copy_chunk(dest);
             return false;
         }
@@ -315,16 +426,25 @@ impl Transfer {
         };
 
         let row = self.plan.rows[index].clone();
+
+        // A resolved conflict is performed as the write its resolution names.
+        // `effective_target_pane` is the single place that mapping happens, so
+        // the queue, the totals and the executor cannot disagree about which
+        // way a conflict goes.
+        let target_pane = effective_target_pane(&row);
+        let (source, source_root, dest, dest_root) =
+            split(target_pane, local, local_root, remote, remote_root);
+
         match row.action {
             Action::Delete => {
-                let outcome = super::executor::delete(dest, dest_root, &row, &self.policy);
+                let outcome = super::executor::delete(dest, dest_root, &row, &self.settings.policy);
                 self.report.applied.push(Applied {
                     path: row.path.clone(),
                     action: row.action,
                     outcome,
                 });
             }
-            Action::Create | Action::Overwrite => {
+            Action::Create | Action::Overwrite | Action::Conflict => {
                 if let Err(outcome) =
                     self.begin_file(index, &row, source, source_root, dest, dest_root)
                 {
@@ -339,6 +459,13 @@ impl Transfer {
         }
 
         false
+    }
+
+    /// The pane the in-flight row is writing to, if there is one.
+    fn active_target_pane(&self) -> Option<usize> {
+        let active = self.active.as_ref()?;
+        let row = self.plan.rows.get(active.row_index)?;
+        Some(effective_target_pane(row))
     }
 
     /// Open both streams for one row.
@@ -364,7 +491,13 @@ impl Transfer {
         // Re-check the destination against the plan. Overwriting on the
         // strength of a snapshot that is no longer true is how a sync destroys
         // something the user never saw in the window.
-        if let Some(planned) = row.dest {
+        //
+        // Read by *pane*, not as `row.dest`. A conflict row stores both sides
+        // by pane, because until it is resolved neither is the destination --
+        // so after resolving to keep-remote, `row.dest` is the remote side
+        // while the write goes locally. Comparing those made every such
+        // resolution report the destination as changed and skip itself.
+        if let Some(planned) = row.side_of(effective_target_pane(row)) {
             match dest.stat(&to) {
                 Ok(now) if Side::from_entry(&now) != planned => {
                     return Err(Outcome::SkippedStale {
@@ -379,14 +512,44 @@ impl Transfer {
             }
         }
 
-        let partial = partial_path(&to, &self.partial_suffix);
+        // "Keep both": rename the file about to be displaced instead of
+        // letting the write replace it. Done before a byte is sent, so a
+        // transfer that fails half way has still not lost the old version.
+        //
+        // The winner then lands at the original name on both sides, which is
+        // what makes the pair converge -- leaving each side its own version
+        // under the original name would raise the same conflict for ever.
+        if row.resolution.is_some_and(Resolution::preserves_displaced)
+            && !self.settings.conflict_suffix.is_empty()
+        {
+            let aside = suffixed(&to, &self.settings.conflict_suffix);
+            match dest.rename(&to, &aside) {
+                Ok(()) => {
+                    tracing::info!(
+                        "kept the displaced copy of {} as {}",
+                        row.path.display(),
+                        aside.display()
+                    );
+                }
+                // Nothing there to displace, which is fine: the conflict was
+                // between an edit and a deletion.
+                Err(e) if e.is_not_found() => {}
+                Err(e) => {
+                    return Err(Outcome::Failed {
+                        why: format!("could not keep the displaced copy: {e}"),
+                    });
+                }
+            }
+        }
+
+        let partial = partial_path(&to, &self.settings.partial_suffix);
         let metadata = WriteMetadata::from_entry(&current);
 
         // Resume, if a partial file from an earlier run is there and both ends
         // can pick up mid-file. Anything longer than the source is debris from
         // a different version of the file, so it is discarded rather than
         // appended to.
-        let resumed_from = if self.resume_enabled
+        let resumed_from = if self.settings.resume
             && source.capabilities().ranged_writes
             && dest.capabilities().ranged_writes
         {
@@ -426,6 +589,9 @@ impl Transfer {
         self.active = Some(Active {
             row_index: index,
             path: row.path.clone(),
+            // The destination resolved here, from the root this row is
+            // actually writing to, rather than re-derived at completion.
+            to,
             partial,
             source: reader,
             dest: Some(writer),
@@ -486,7 +652,7 @@ impl Transfer {
         };
 
         let row = self.plan.rows[active.row_index].clone();
-        let to = row_target(&self.plan, &row);
+        let to = active.to.clone();
 
         // A short read means the file changed while being copied. Writing what
         // was read would put a truncated file at the destination, which is
@@ -574,7 +740,7 @@ impl Transfer {
             // The partial file stays only if resume is on: it is the point of
             // having one. Otherwise it would show up in the next plan as a
             // file to sync back.
-            if !self.resume_enabled {
+            if !self.settings.resume {
                 let _ = dest.remove_file(&active.partial);
             }
         }
@@ -598,7 +764,7 @@ impl Transfer {
 
         // Cancelling keeps the partial file when resume is on, so picking the
         // sync up again does not re-send what already went.
-        if !self.resume_enabled {
+        if !self.settings.resume {
             let _ = dest.remove_file(&active.partial);
         }
 
@@ -641,9 +807,14 @@ impl Transfer {
     }
 }
 
-/// Where a row's file goes.
-fn row_target(plan: &Plan, row: &Row) -> PathBuf {
-    plan.dest_root.join(&row.path)
+/// `path` with a suffix appended to its file name.
+pub fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.push_str(suffix);
+    path.with_file_name(name)
 }
 
 /// `path` with the partial-transfer suffix appended.
@@ -732,7 +903,13 @@ mod tests {
     }
 
     fn transfer(plan: Plan, resume: bool) -> Transfer {
-        Transfer::new(plan, DeletePolicy::Remove, ".lazysync-part".into(), resume)
+        Transfer::new(
+            plan,
+            Settings {
+                resume,
+                ..Settings::transient(DeletePolicy::Remove)
+            },
+        )
     }
 
     /// Run to completion, counting steps so a test can assert it really was

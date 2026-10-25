@@ -58,7 +58,7 @@ impl Direction {
 /// A guard against a symlink loop on a backend that resolves them server-side,
 /// or a filesystem that reports a directory as its own child. Hitting it is
 /// recorded in [`Plan::unreadable`] rather than silently truncating.
-const MAX_DEPTH: usize = 64;
+pub(crate) const MAX_DEPTH: usize = 64;
 
 /// Build a plan for syncing `source_root` onto `dest_root`.
 pub fn plan(
@@ -237,13 +237,14 @@ fn walk(
             // Symlinks: visible, and deliberately not transferred.
             (EntryKind::Symlink, _) => {
                 built.rows.push(Row {
-                    caveat: Some("symlink, not transferred (arrives with phase 6)"),
+                    caveat: Some("symlink, not transferred"),
                     ..plan::compare_row(
                         child,
                         entry,
                         counterpart.unwrap_or(entry),
                         super::compare::Reason::SameSizeNoTimestamps,
                         comparator.method(),
+                        direction.dest(),
                     )
                 });
             }
@@ -271,9 +272,12 @@ fn walk(
             // A directory that does not exist on the destination: create it,
             // then plan its contents.
             (EntryKind::Dir, None) => {
-                built
-                    .rows
-                    .push(plan::create_row(child.clone(), entry, comparator.method()));
+                built.rows.push(plan::create_row(
+                    child.clone(),
+                    entry,
+                    comparator.method(),
+                    direction.dest(),
+                ));
                 walk(
                     source,
                     source_root,
@@ -308,6 +312,7 @@ fn walk(
                         counterpart.unwrap_or(entry),
                         super::compare::Reason::SizeDiffers,
                         comparator.method(),
+                        direction.dest(),
                     )
                 });
             }
@@ -329,15 +334,19 @@ fn walk(
                         counterpart.unwrap_or(entry),
                         super::compare::Reason::SizeDiffers,
                         comparator.method(),
+                        direction.dest(),
                     )
                 });
             }
 
             // The ordinary cases.
             (EntryKind::File, None) => {
-                built
-                    .rows
-                    .push(plan::create_row(child, entry, comparator.method()));
+                built.rows.push(plan::create_row(
+                    child,
+                    entry,
+                    comparator.method(),
+                    direction.dest(),
+                ));
             }
             (EntryKind::File, Some(EntryKind::File)) => {
                 let other = counterpart.expect("matched Some above");
@@ -355,7 +364,14 @@ fn walk(
 
                 built.rows.push(Row {
                     caveat,
-                    ..plan::compare_row(child, entry, other, reason, comparator.method())
+                    ..plan::compare_row(
+                        child,
+                        entry,
+                        other,
+                        reason,
+                        comparator.method(),
+                        direction.dest(),
+                    )
                 });
             }
         }
@@ -392,9 +408,12 @@ fn walk(
             if filters.excludes(&child, is_dir) {
                 continue;
             }
-            built
-                .rows
-                .push(plan::delete_row(child, entry, comparator.method()));
+            built.rows.push(plan::delete_row(
+                child,
+                entry,
+                comparator.method(),
+                direction.dest(),
+            ));
         }
     }
 }
@@ -620,9 +639,11 @@ mod tests {
 
         assert_eq!(paths(&plan, Action::Create), ["src/api/handler.rs"]);
         assert_eq!(paths(&plan, Action::CreateDir), ["src", "src/api"]);
+        // Paired with the pane each belongs on. A push writes to pane 1, so
+        // every directory it needs is created there and none locally.
         assert_eq!(
             plan.required_directories(),
-            vec![PathBuf::from("src"), PathBuf::from("src/api")]
+            vec![(1, PathBuf::from("src")), (1, PathBuf::from("src/api"))]
         );
     }
 

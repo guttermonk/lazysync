@@ -70,6 +70,30 @@ pub enum Reason {
     NotOnDestination,
     /// Present only on the destination. What a mirror deletes.
     NotOnSource,
+
+    // ── Bisync only. These describe a path's history, not a comparison of
+    // two files, which is why they are separate reasons rather than a flag on
+    // the ones above: "both sides changed" is not a fact about sizes.
+    /// Changed on one side only since the last sync. The safe case: the
+    /// changed side wins, and nothing is lost.
+    ChangedOnOneSide,
+    /// Appeared on one side only since the last sync.
+    NewOnOneSide,
+    /// Removed on one side since the last sync, and untouched on the other,
+    /// so the deletion propagates.
+    DeletedOnOneSide,
+    /// Both sides changed since the last sync. Needs a decision.
+    BothChanged,
+    /// Both sides are new since the last sync, with different contents --
+    /// which is a conflict for the same reason, with no common ancestor.
+    BothNew,
+    /// Deleted on one side and modified on the other. A conflict, and the one
+    /// most easily got wrong: propagating the deletion discards an edit, and
+    /// propagating the edit resurrects a file somebody removed.
+    DeletedVersusChanged,
+    /// Both sides changed, but to the same content. Converged on their own;
+    /// nothing to do but record it.
+    BothChangedAlike,
 }
 
 impl Reason {
@@ -83,6 +107,34 @@ impl Reason {
                 | Self::ChecksumDiffers
                 | Self::NotOnDestination
                 | Self::NotOnSource
+                | Self::ChangedOnOneSide
+                | Self::NewOnOneSide
+                | Self::DeletedOnOneSide
+                | Self::BothChanged
+                | Self::BothNew
+                | Self::DeletedVersusChanged
+        )
+    }
+
+    /// Whether this reason is one only a two-way sync can produce.
+    pub const fn is_bisync(self) -> bool {
+        matches!(
+            self,
+            Self::ChangedOnOneSide
+                | Self::NewOnOneSide
+                | Self::DeletedOnOneSide
+                | Self::BothChanged
+                | Self::BothNew
+                | Self::DeletedVersusChanged
+                | Self::BothChangedAlike
+        )
+    }
+
+    /// Whether this reason means neither side can be preferred automatically.
+    pub const fn is_conflict(self) -> bool {
+        matches!(
+            self,
+            Self::BothChanged | Self::BothNew | Self::DeletedVersusChanged
         )
     }
 
@@ -104,6 +156,14 @@ impl Reason {
             Self::SameSizeTimesNotPreserved => "same size, times not kept",
             Self::NotOnDestination => "new",
             Self::NotOnSource => "not on the source",
+
+            Self::ChangedOnOneSide => "changed on one side",
+            Self::NewOnOneSide => "new on one side",
+            Self::DeletedOnOneSide => "deleted on one side",
+            Self::BothChanged => "BOTH SIDES CHANGED",
+            Self::BothNew => "BOTH SIDES NEW, AND DIFFERENT",
+            Self::DeletedVersusChanged => "DELETED ONE SIDE, CHANGED THE OTHER",
+            Self::BothChangedAlike => "both changed, now identical",
         }
     }
 }

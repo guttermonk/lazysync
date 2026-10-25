@@ -160,7 +160,7 @@ impl ConnectionForm {
                     selected: protocol_index,
                 },
                 placeholder: "",
-                hint: "sftp and scp work today; the rest arrive in phase 5.",
+                hint: "sftp, scp, ftp and ftps work today; s3, smb and webdav do not yet.",
             },
             Field {
                 id: FieldId::Host,

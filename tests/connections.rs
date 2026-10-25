@@ -391,7 +391,7 @@ fn a_password_is_not_requested_before_the_host_is_verified() {
 
 /// A protocol that cannot connect yet must be refused by name.
 #[test]
-fn an_unimplemented_protocol_is_refused_with_its_phase() {
+fn an_unimplemented_protocol_is_refused_with_the_reason() {
     let mut bookmark = sftp("bucket", "my-bucket");
     bookmark.protocol = Protocol::S3;
 
@@ -399,7 +399,14 @@ fn an_unimplemented_protocol_is_refused_with_its_phase() {
     h.enter();
 
     assert!(h.app.status.contains("s3"), "{}", h.app.status);
-    assert!(h.app.status.contains("phase 6"), "{}", h.app.status);
+    // The obstacle, not a phase number. A phase number is a promise, and
+    // these have already slipped two of them -- "arrives in phase 6" was
+    // still on screen the day phase 6 shipped without it.
+    assert!(
+        h.app.status.contains("bucket"),
+        "the refusal should say what is missing: {}",
+        h.app.status
+    );
 }
 
 // ── zide auto-open ──────────────────────────────────────────────────────────

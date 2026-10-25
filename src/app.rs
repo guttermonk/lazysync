@@ -19,11 +19,13 @@ use crate::{
     connection::Secret,
     keys::{Action, Keymaps, Mode},
     sync::{
-        diff,
+        bisync, diff,
+        executor::{Outcome, Report},
         filters::Filters,
-        plan::{Plan, Section},
+        plan::{Action as PlanAction, Plan, Resolution, Section, Side as PlanSide},
         safety::{self, DeletePolicy},
-        transfer::{State as TransferState, Transfer},
+        state::{Record, Snapshot},
+        transfer::{Settings as TransferSettings, State as TransferState, Transfer},
     },
     ui::{confirm, form::ConnectionForm},
     vfs::{ftp, hostkey::HostKey, ssh, LocalFs, Vfs},
@@ -172,6 +174,16 @@ pub struct App {
     pub folded: Vec<Section>,
     /// Which way the plan under review would move files.
     plan_mode: SyncMode,
+    /// The pair a bisync plan belongs to: the local root and the remote's
+    /// display form. Kept so the snapshot can be written against the same key
+    /// it was read with, even if a pane has since moved.
+    bisync_snapshot: Option<(PathBuf, String)>,
+    /// What the last applied run actually did.
+    ///
+    /// Needed by the bisync snapshot, which must record only the paths that
+    /// genuinely reached agreement -- claiming one that failed would have the
+    /// next run read the remaining difference as a fresh edit.
+    last_report: Option<Report>,
 
     /// The transfer in flight, stepped by the main loop between frames.
     pub transfer: Option<Transfer>,
@@ -237,6 +249,8 @@ impl App {
                 Vec::new()
             },
             plan_mode: SyncMode::Push,
+            bisync_snapshot: None,
+            last_report: None,
             transfer: None,
             active_profile: None,
             connecting: None,
@@ -518,9 +532,12 @@ impl App {
 
         if !target.protocol.is_implemented() {
             self.status = format!(
-                "{} arrives in phase {} -- see docs/PLAN.md",
+                "{} is not supported yet: {}",
                 target.protocol,
-                target.protocol.arrives_in_phase()
+                target
+                    .protocol
+                    .unavailable_because()
+                    .unwrap_or("see docs/PLAN.md")
             );
             return;
         }
@@ -818,12 +835,13 @@ impl App {
             Action::SyncPull => self.begin_sync(SyncMode::Pull),
             Action::SyncMirror => self.begin_sync(SyncMode::MirrorPush),
             Action::SyncProfile => self.begin_profile_sync(),
+            Action::SyncBisync => self.begin_sync(SyncMode::Bisync),
 
             Action::ToggleDirSizes => {
                 // Needs a recursive walk per directory, which over a network
                 // backend is slow enough that it belongs with the transfer
                 // queue rather than on the render path.
-                self.status = "recursive directory sizes arrive in phase 4".into();
+                self.status = "recursive directory sizes are not implemented yet".into();
             }
             Action::CycleSort => {
                 for pane in &mut self.panes {
@@ -954,7 +972,15 @@ impl App {
     /// there is no "sync now" that skips this.
     pub fn begin_sync(&mut self, mode: SyncMode) {
         if !mode.is_implemented() {
-            self.status = format!("{} arrives in phase 6 -- see docs/PLAN.md", mode.label());
+            self.status = format!(
+                "{} arrives in a later phase -- see docs/PLAN.md",
+                mode.label()
+            );
+            return;
+        }
+
+        if matches!(mode, SyncMode::Bisync) {
+            self.begin_bisync();
             return;
         }
 
@@ -1031,6 +1057,257 @@ impl App {
         self.plan = Some(plan);
         self.screen = Screen::Confirm;
         self.status.clear();
+    }
+
+    /// Plan a two-way sync.
+    ///
+    /// Separate from [`App::begin_sync`] because it is symmetric: there is no
+    /// source pane to arrange the arguments around, and the extra input is the
+    /// stored snapshot rather than a direction.
+    fn begin_bisync(&mut self) {
+        let local_root = self.panes[0].path().to_path_buf();
+        let remote_root = self.panes[1].path().to_path_buf();
+
+        if self.panes[0].is_ghost() || self.panes[1].is_ghost() {
+            self.status =
+                "one pane is standing on a directory that does not exist; nothing to sync".into();
+            return;
+        }
+
+        let filters = match self.resolve_filters(&local_root) {
+            Ok(filters) => filters,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+
+        // The snapshot is keyed by the pair of roots, including the remote's
+        // display form -- so the same local directory bisynced against two
+        // different servers keeps two histories rather than confusing them.
+        let remote_key = self.panes[1].vfs.display_path(&remote_root);
+        let snapshot = Snapshot::load(&local_root, &remote_key);
+        let first_run = snapshot.is_first_run();
+
+        self.status = "planning bisync...".into();
+
+        let (first, second) = self.panes.split_at_mut(1);
+        let mut plan = bisync::plan(
+            diff::Endpoint {
+                fs: first[0].vfs.as_mut(),
+                root: &local_root,
+                label: side_label(0).to_string(),
+            },
+            diff::Endpoint {
+                fs: second[0].vfs.as_mut(),
+                root: &remote_root,
+                label: side_label(1).to_string(),
+            },
+            &snapshot,
+            &self.config,
+            &filters,
+        );
+
+        safety::check(&mut plan, &self.config.safety);
+
+        if plan.is_empty() && plan.unreadable.is_empty() {
+            // Still record the snapshot: the trees agree, and saying so is
+            // what lets the *next* run tell a deletion from a creation. A
+            // first bisync of two already-identical trees would otherwise
+            // stay a first run for ever, never able to propagate a deletion.
+            self.store_snapshot(&local_root, &remote_key, &plan);
+            self.status = "nothing to bisync -- the trees already match".into();
+            return;
+        }
+
+        self.plan_mode = SyncMode::Bisync;
+        self.bisync_snapshot = Some((local_root, remote_key));
+        self.plan_cursor = 0;
+        self.folded = if self.config.confirm.fold_skipped {
+            vec![Section::Skipped]
+        } else {
+            Vec::new()
+        };
+        self.plan = Some(plan);
+        self.screen = Screen::Confirm;
+
+        self.status = if first_run {
+            // Said out loud, because the run behaves differently and the
+            // difference is a safety property rather than a detail.
+            "first bisync of this pair: nothing will be deleted, since a file on one side only \
+             is as likely to be new as removed"
+                .into()
+        } else {
+            String::new()
+        };
+    }
+
+    /// Settle the conflict under the cursor.
+    fn resolve_conflict(&mut self, resolution: Resolution) {
+        let Some(plan) = &mut self.plan else {
+            return;
+        };
+
+        let entries = confirm::entries(plan, &self.folded);
+        let Some(index) = confirm::row_at(&entries, self.plan_cursor) else {
+            return;
+        };
+
+        let Some(row) = plan.rows.get_mut(index) else {
+            return;
+        };
+        if !matches!(row.action, PlanAction::Conflict) {
+            self.status = "that row is not a conflict".into();
+            return;
+        }
+
+        row.resolution = Some(resolution);
+        let path = row.path.clone();
+
+        // Re-check safety: resolving a conflict can turn it into a write, and
+        // a plan that was under the delete limit before a decision may not be
+        // after it.
+        safety::check(plan, &self.config.safety);
+
+        let left = plan.undecided().count();
+        self.status = if left > 0 {
+            format!(
+                "{}: {} -- {left} conflict{} still undecided",
+                path.display(),
+                resolution.label(),
+                if left == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("{}: {}", path.display(), resolution.label())
+        };
+    }
+
+    /// Record the agreed state of a pair after a bisync.
+    ///
+    /// Three kinds of row contribute. Rows already in agreement are recorded
+    /// from the plan. Rows a run actually transferred are **re-stated on the
+    /// side that was written**, because what landed there is not always what
+    /// was sent: a backend that cannot set a modification time gives the file
+    /// its own, and recording the source's instead would make the next run see
+    /// an edit that never happened -- on a two-way sync, a phantom conflict.
+    /// Rows that were deleted leave the history entirely.
+    ///
+    /// A row the run *failed* on is recorded nowhere. Claiming agreement for a
+    /// file that did not transfer is the one entry that could cause real loss:
+    /// the next run would read the still-present difference as a fresh edit and
+    /// could propagate it the wrong way.
+    fn store_snapshot(&mut self, local_root: &Path, remote_key: &str, plan: &Plan) {
+        let mut snapshot = Snapshot::load(local_root, remote_key);
+
+        // What the last run managed, by path. Absent when no transfer ran --
+        // the trees already agreed -- in which case every `Skip` row still
+        // deserves recording.
+        let outcomes: std::collections::HashMap<&Path, &Outcome> = self
+            .last_report
+            .as_ref()
+            .map(|report| {
+                report
+                    .applied
+                    .iter()
+                    .map(|a| (a.path.as_path(), &a.outcome))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let local_root_owned = local_root.to_path_buf();
+        let remote_root = self.panes[1].path().to_path_buf();
+
+        for row in &plan.rows {
+            let outcome = outcomes.get(row.path.as_path()).copied();
+
+            match row.action {
+                PlanAction::Skip => {
+                    if let (Some(local), Some(remote)) = (row.side_of(0), row.side_of(1)) {
+                        snapshot.insert(
+                            &row.path,
+                            Record {
+                                local_size: local.size,
+                                local_mtime: local.mtime,
+                                remote_size: remote.size,
+                                remote_mtime: remote.mtime,
+                            },
+                        );
+                    }
+                }
+
+                PlanAction::Create | PlanAction::Overwrite | PlanAction::Conflict => {
+                    // Only if it actually transferred.
+                    if !matches!(outcome, Some(Outcome::Transferred { .. })) {
+                        continue;
+                    }
+
+                    let target = crate::sync::transfer::written_pane(row);
+                    let (root, other_root) = if target == 0 {
+                        (&local_root_owned, &remote_root)
+                    } else {
+                        (&remote_root, &local_root_owned)
+                    };
+                    let _ = other_root;
+
+                    let (first, second) = self.panes.split_at_mut(1);
+                    let pane = if target == 0 {
+                        &mut first[0]
+                    } else {
+                        &mut second[0]
+                    };
+
+                    let Ok(landed) = pane.vfs.stat(&root.join(&row.path)) else {
+                        // Could not confirm what is there, so nothing is
+                        // claimed about it. The next run will compare the
+                        // files themselves, which is the honest fallback.
+                        continue;
+                    };
+
+                    let sent = row.side_of(1 - target);
+                    let (Some(sent), landed) = (sent, PlanSide::from_entry(&landed)) else {
+                        continue;
+                    };
+
+                    let record = if target == 0 {
+                        Record {
+                            local_size: landed.size,
+                            local_mtime: landed.mtime,
+                            remote_size: sent.size,
+                            remote_mtime: sent.mtime,
+                        }
+                    } else {
+                        Record {
+                            local_size: sent.size,
+                            local_mtime: sent.mtime,
+                            remote_size: landed.size,
+                            remote_mtime: landed.mtime,
+                        }
+                    };
+                    snapshot.insert(&row.path, record);
+                }
+
+                // Gone from the pair, so gone from its history. Recorded only
+                // when the deletion actually happened.
+                PlanAction::Delete => {
+                    if outcome.is_none()
+                        || matches!(
+                            outcome,
+                            Some(Outcome::Deleted | Outcome::MovedToBackup { .. })
+                        )
+                    {
+                        snapshot.remove(&row.path);
+                    }
+                }
+
+                PlanAction::CreateDir => {}
+            }
+        }
+
+        if let Err(e) = snapshot.save(chrono::Utc::now()) {
+            // Not fatal, but it does mean the next run is another first run,
+            // so it is worth saying rather than logging quietly.
+            self.status = format!("the sync ran, but its state could not be saved: {e}");
+        }
     }
 
     /// Compile the exclude rules for the active profile.
@@ -1150,12 +1427,16 @@ impl App {
                 }
             }
 
+            Action::ResolveKeepLocal => self.resolve_conflict(Resolution::KeepLocal),
+            Action::ResolveKeepRemote => self.resolve_conflict(Resolution::KeepRemote),
+            Action::ResolveKeepBoth => self.resolve_conflict(Resolution::KeepBoth),
+            Action::ResolveSkip => self.resolve_conflict(Resolution::Skip),
+
             Action::Checksum => {
-                self.status =
-                    "re-checking by checksum arrives in phase 4, with the transfer queue".into();
+                self.status = "re-checking by checksum arrives in a later phase".into();
             }
             Action::DiffRow => {
-                self.status = "inline diffs arrive in phase 4".into();
+                self.status = "inline diffs arrive in a later phase".into();
             }
 
             Action::Apply => self.confirm_apply(),
@@ -1200,11 +1481,23 @@ impl App {
         let policy = DeletePolicy::from_config(&self.config.safety);
 
         if totals.deletes > 0 && matches!(policy, DeletePolicy::Remove) {
+            // Which side is named has to come from the rows, not from the
+            // mode: a bisync deletes on whichever side the file was removed
+            // from, and can do both in one plan. Naming one side there would
+            // understate what is about to happen.
+            let mut panes: Vec<usize> = plan.destructive_rows().map(|r| r.target_pane).collect();
+            panes.sort_unstable();
+            panes.dedup();
+
+            let where_ = match panes.as_slice() {
+                [pane] => format!("the {} side", side_label(*pane)),
+                _ => "both sides".to_string(),
+            };
+
             self.overlay = Overlay::Question(Question {
                 text: format!(
-                    "Permanently delete {} file(s) on the {} side? This cannot be undone.",
+                    "Permanently delete {} file(s) on {where_}? This cannot be undone.",
                     totals.deletes,
-                    side_label(self.plan_mode.direction().dest())
                 ),
                 on_yes: Pending::ApplyPlan,
                 on_no: Pending::Nothing,
@@ -1226,9 +1519,7 @@ impl App {
 
         self.transfer = Some(Transfer::new(
             plan,
-            DeletePolicy::from_config(&self.config.safety),
-            self.config.transfer.partial_suffix.clone(),
-            self.config.transfer.resume,
+            TransferSettings::from_config(&self.config),
         ));
         self.screen = Screen::Transfer;
         self.status.clear();
@@ -1243,25 +1534,22 @@ impl App {
             return;
         }
 
-        let direction = self.plan_mode.direction();
-        let source_index = direction.source;
-        let dest_index = direction.dest();
-
-        let source_root = self.panes[source_index].path().to_path_buf();
-        let dest_root = self.panes[dest_index].path().to_path_buf();
+        // Handed over as panes, in pane order, rather than sorted into a
+        // source and a destination: each row names the side it writes to, so
+        // a bisync plan moving files both ways works through the same call.
+        // The mode's direction is deliberately not consulted here any more --
+        // it is already baked into every row's `target_pane`, and reading it
+        // again would be a second source of truth about which way files go.
+        let local_root = self.panes[0].path().to_path_buf();
+        let remote_root = self.panes[1].path().to_path_buf();
 
         let (first, second) = self.panes.split_at_mut(1);
-        let (source, dest) = if source_index == 0 {
-            (&mut first[0], &mut second[0])
-        } else {
-            (&mut second[0], &mut first[0])
-        };
 
         let finished = transfer.step(
-            source.vfs.as_mut(),
-            &source_root,
-            dest.vfs.as_mut(),
-            &dest_root,
+            first[0].vfs.as_mut(),
+            &local_root,
+            second[0].vfs.as_mut(),
+            &remote_root,
         );
 
         if finished {
@@ -1278,12 +1566,27 @@ impl App {
             tracing::warn!("{}: {:?}", failure.path.display(), failure.outcome);
         }
         self.status = transfer.report().summary();
+        self.last_report = Some(transfer.report().clone());
 
         // Both panes get re-read: the destination obviously changed, and on a
         // local-to-local sync the source directory may have had a partial
         // file written next to it.
         for pane in &mut self.panes {
             pane.reload();
+        }
+
+        // Record what a bisync achieved, so the next run can tell a creation
+        // from a deletion. Done after the panes reload, because the snapshot
+        // re-stats what actually landed.
+        //
+        // The plan comes back off the *queue*, not from `self.plan`: applying
+        // moves it into the queue, so reading `self.plan` here found nothing
+        // and the snapshot was silently never written -- which made every
+        // bisync a first run for ever, and deletions never propagate.
+        let plan = self.transfer.as_ref().map(|t| t.plan().clone());
+        if let (Some((local_root, remote_key)), Some(plan)) = (self.bisync_snapshot.clone(), plan) {
+            self.store_snapshot(&local_root, &remote_key, &plan);
+            self.bisync_snapshot = None;
         }
     }
 
@@ -1445,7 +1748,7 @@ impl App {
             // A file, not a directory. Opening files arrives with the editor
             // integration; saying so beats doing nothing silently.
             if self.focused().selected().is_some() {
-                self.status = "opening files arrives in phase 7".into();
+                self.status = "opening files is not implemented yet".into();
             }
             return;
         }

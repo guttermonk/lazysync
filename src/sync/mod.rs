@@ -17,12 +17,14 @@
 //! 4. [`executor::apply`] performs the included rows, re-checking each
 //!    destination immediately before touching it.
 
+pub mod bisync;
 pub mod compare;
 pub mod diff;
 pub mod executor;
 pub mod filters;
 pub mod plan;
 pub mod safety;
+pub mod state;
 pub mod transfer;
 
 use crate::config::SyncMode;
@@ -31,7 +33,7 @@ pub use compare::{Comparator, Method, Reason};
 pub use diff::{Direction, Endpoint};
 pub use executor::{apply, Report};
 pub use filters::Filters;
-pub use plan::{Action, Plan, Row, Section, Totals};
+pub use plan::{Action, Plan, Resolution, Row, Section, Totals};
 pub use safety::DeletePolicy;
 pub use transfer::{State as TransferState, Transfer};
 
@@ -57,10 +59,12 @@ impl SyncMode {
                 source: 1,
                 delete_extraneous: true,
             },
-            // Bisync has no single direction: it is both, with a stored
-            // snapshot deciding per file. Phase 6. Treated as a pull here so
-            // that a profile naming it is not silently destructive -- the UI
-            // refuses it by name before this is reached.
+            // Bisync has no single direction: it is both, decided per file by
+            // the stored snapshot, and every row carries its own
+            // `target_pane`. Nothing in the bisync path reads this -- it
+            // exists because `Direction` is part of the shared signature --
+            // so it is set to the non-deleting pull, which is the harmless
+            // answer if anything ever does.
             Self::Bisync => Direction {
                 source: 1,
                 delete_extraneous: false,
@@ -79,13 +83,21 @@ impl SyncMode {
     }
 
     /// Whether this mode deletes anything.
+    ///
+    /// Bisync does, once a snapshot exists: a file removed on one side is
+    /// removed on the other. It cannot be read off `direction` like the
+    /// others, because its deletions are per row rather than a property of
+    /// the mode's direction.
     pub const fn deletes(self) -> bool {
-        self.direction().delete_extraneous
+        match self {
+            Self::Bisync => true,
+            _ => self.direction().delete_extraneous,
+        }
     }
 
     /// Whether lazysync can run this mode yet.
     pub const fn is_implemented(self) -> bool {
-        !matches!(self, Self::Bisync)
+        true
     }
 }
 
@@ -109,16 +121,40 @@ mod tests {
         assert!(SyncMode::MirrorPull.deletes());
     }
 
-    /// A mode that is not implemented must not be quietly destructive: a
-    /// profile naming bisync should fail to run, not run a mirror.
+    /// Bisync must declare that it deletes.
+    ///
+    /// It cannot be read off `direction` like the other modes -- a two-way
+    /// sync has no single direction and its deletions are decided per row --
+    /// so the risk is the opposite of the usual one: a mode that removes files
+    /// reporting that it does not. The second confirmation for permanent
+    /// deletion keys off this, so getting it wrong would skip the prompt.
     #[test]
-    fn bisync_is_not_implemented_and_not_destructive() {
-        assert!(!SyncMode::Bisync.is_implemented());
+    fn bisync_declares_that_it_deletes() {
         assert!(
-            !SyncMode::Bisync.deletes(),
-            "an unimplemented mode falling back to something that deletes would be the worst \
-             possible default"
+            SyncMode::Bisync.deletes(),
+            "bisync propagates deletions once a snapshot exists; reporting otherwise would \
+             skip the extra confirmation that permanent deletion gets"
         );
+        assert!(
+            !SyncMode::Bisync.direction().delete_extraneous,
+            "and it must not be reachable through `direction`, which bisync does not use"
+        );
+    }
+
+    /// Every mode is implemented now. Kept as a test rather than deleted
+    /// along with the flag: the flag is what the UI consults before planning,
+    /// and a mode added later must not default to runnable.
+    #[test]
+    fn every_mode_is_implemented() {
+        for mode in [
+            SyncMode::Push,
+            SyncMode::Pull,
+            SyncMode::MirrorPush,
+            SyncMode::MirrorPull,
+            SyncMode::Bisync,
+        ] {
+            assert!(mode.is_implemented(), "{} is not", mode.label());
+        }
     }
 
     #[test]

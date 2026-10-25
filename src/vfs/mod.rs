@@ -146,10 +146,9 @@ pub struct Capabilities {
 
 /// A read-only view of a filesystem.
 ///
-/// Methods were added in the phase that first performed them -- listings in
-/// phase 1, writes and deletes in phase 3, streaming handles in phase 4 -- so
-/// that nothing could ever call one the backends did not yet implement. What
-/// is here is what works against every implemented backend.
+/// A method is added only once something performs it, so nothing can call one
+/// the backends do not implement. What is here works against every implemented
+/// backend.
 pub trait Vfs: Send {
     /// Short name for the status bar: `local`, `sftp`, `s3`.
     fn scheme(&self) -> &str;

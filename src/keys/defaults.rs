@@ -119,6 +119,10 @@ fn browser() -> Keymap {
         (Action::SyncPull, chord("sl")),
         (Action::SyncMirror, chord("sm")),
         (Action::SyncProfile, chord("ss")),
+        // `sb` for bisync. Under the same `s` prefix as the rest, because it
+        // deletes on both sides once a snapshot exists and must not be one
+        // keystroke away.
+        (Action::SyncBisync, chord("sb")),
         // General.
         (Action::Help, c('?')),
         (Action::Cancel, n(Key::Esc)),
@@ -152,6 +156,18 @@ fn confirm() -> Keymap {
         // Folds, spelled as in vim.
         (Action::FoldSection, chord("zc")),
         (Action::UnfoldSection, chord("zo")),
+        // Conflict resolution, on the row under the cursor. Capitals, so
+        // they cannot be hit while reaching for a motion key -- settling a
+        // conflict the wrong way is exactly as destructive as the thing this
+        // window exists to prevent. `L` and `R` read as the two sides;
+        // `B` keeps both; `X` defers.
+        //
+        // `L`/`R` are free in this mode: the window has no horizontal
+        // movement, since `h`/`l` drill into and out of a directory's rows.
+        (Action::ResolveKeepLocal, c('L')),
+        (Action::ResolveKeepRemote, c('R')),
+        (Action::ResolveKeepBoth, c('B')),
+        (Action::ResolveSkip, c('X')),
         (Action::Help, c('?')),
     ]);
     Keymap(bindings)

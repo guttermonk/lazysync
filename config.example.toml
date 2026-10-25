@@ -148,6 +148,19 @@ max_delete_files = 0
 # transferred at all, so nothing can currently escape the root this way.
 confirm_outside_root = true
 
+# Suffix for the losing side of a bisync conflict resolved with "keep both"
+# (`B` in the confirmation window). The winner lands at the original name on
+# *both* sides and the copy it displaced is renamed to `<name><suffix>` next to
+# itself, so nothing is lost and the two sides end up agreeing.
+#
+# Leaving each side its own version under the original name would be the
+# obvious reading of "keep both" and is the wrong one: the sides would stay
+# different and raise the same conflict on every later run, for ever.
+#
+# Set to "" to make "keep both" behave as "keep local" and discard the
+# displaced copy.
+conflict_suffix = ".lazysync-conflict"
+
 # ─── Confirmation window ─────────────────────────────────────────────────────
 
 [confirm]
@@ -255,6 +268,10 @@ preset = "terminal"
 
 [profiles.deploy]
 # "push" | "pull" | "mirror-push" | "mirror-pull" | "bisync"
+#
+# "bisync" is interactive-only: `lazysync sync` refuses a bisync profile
+# rather than settling conflicts on its own. A cron job that silently picks a
+# side is one that works until the day it matters.
 mode = "push"
 
 # "auto" picks the best available: rsync for ssh remotes when rsync exists on
@@ -287,6 +304,12 @@ respect_gitignore = false
 # --yes.
 auto_confirm = false
 
+# A two-way profile. Run it with `sb`, or with `ss` when a bookmark names it.
+#
+# The pair's state lives in $XDG_STATE_HOME/lazysync/bisync/, keyed by the two
+# roots, so one machine can bisync several pairs without them colliding. The
+# first run of a pair never deletes anything -- with no snapshot, a file on one
+# side only is as likely to be new as removed.
 [profiles.notes]
 mode = "bisync"
 executor = "auto"

@@ -1,10 +1,15 @@
 //! Applying a plan.
 //!
-//! Sequential and synchronous, which is phase 3's deliberate limit: the
-//! transfer queue, parallelism, resume and progress reporting arrive in phase
-//! 4. What is here already is the part that cannot be retrofitted safely --
-//! every file is written to a partial name and renamed into place, so an
-//! interrupted sync never leaves a truncated file where a good one used to be.
+//! [`apply`] is the blocking entry point, used by the headless path and by
+//! tests: it drives [`Transfer`] to completion rather than copying anything
+//! itself. It did once have its own copy loop, which meant the interactive and
+//! headless paths could disagree about resume, ordering and cleanup -- the same
+//! class of drift the plan-is-the-dry-run rule exists to prevent. The queue is
+//! the only thing that moves bytes.
+//!
+//! What lives here is the part that is shared and must not be got wrong twice:
+//! the partial-file rename, the three-step swap for backends whose rename will
+//! not replace, and the delete policy.
 //!
 //! The executor applies exactly the rows the confirmation window showed. It
 //! re-checks each destination immediately before touching it, because a plan
@@ -17,7 +22,7 @@ use std::path::{Path, PathBuf};
 use super::{
     plan::{Action, Plan, Row},
     safety::DeletePolicy,
-    transfer::Transfer,
+    transfer::{Settings, Transfer},
 };
 use crate::vfs::{Vfs, VfsError};
 
@@ -121,14 +126,19 @@ impl Report {
 /// Stops at nothing: one file failing does not abandon the rest, because a
 /// half-applied sync you know the shape of is better than one that stopped
 /// somewhere unspecified. Every result lands in the [`Report`].
+///
+/// Takes the two endpoints as **panes** -- local first, remote second -- not
+/// as a source and a destination. Each row names the side it writes to, which
+/// is what lets one plan move files both ways; a source-and-destination
+/// signature could not express that, and worse, could not tell which pane a
+/// given "source" was, so a pull would be indistinguishable from a push.
 pub fn apply(
-    source: &mut dyn Vfs,
-    source_root: &Path,
-    dest: &mut dyn Vfs,
-    dest_root: &Path,
+    local: &mut dyn Vfs,
+    local_root: &Path,
+    remote: &mut dyn Vfs,
+    remote_root: &Path,
     plan: &Plan,
-    policy: &DeletePolicy,
-    partial_suffix: &str,
+    settings: &Settings,
 ) -> Report {
     if !plan.can_apply() {
         return Report::default();
@@ -139,18 +149,9 @@ pub fn apply(
     // paths could disagree about resume, ordering and cleanup -- the same
     // class of drift the plan-is-the-dry-run rule exists to prevent. The
     // queue is the only thing that moves bytes.
-    let mut queue = Transfer::new(
-        plan.clone(),
-        policy.clone(),
-        partial_suffix.to_owned(),
-        // Resume is off here: this entry point is used by the headless path
-        // and by tests, where a partial file left behind by a failure would
-        // be a surprise rather than a feature. The interactive path builds
-        // its own `Transfer` with the configured setting.
-        false,
-    );
+    let mut queue = Transfer::new(plan.clone(), settings.clone());
 
-    while !queue.step(source, source_root, dest, dest_root) {}
+    while !queue.step(local, local_root, remote, remote_root) {}
     queue.report().clone()
 }
 
@@ -384,8 +385,7 @@ mod tests {
             &mut dest,
             &t.right,
             plan,
-            policy,
-            ".lazysync-part",
+            &Settings::transient(policy.clone()),
         )
     }
 
@@ -763,8 +763,7 @@ mod tests {
             &mut dest,
             &t.right,
             &plan,
-            &DeletePolicy::Remove,
-            ".lazysync-part",
+            &Settings::transient(DeletePolicy::Remove.clone()),
         );
 
         assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
@@ -791,8 +790,7 @@ mod tests {
             &mut dest,
             &t.right,
             &plan,
-            &DeletePolicy::Remove,
-            ".lazysync-part",
+            &Settings::transient(DeletePolicy::Remove.clone()),
         );
 
         let names: Vec<String> = fs::read_dir(&t.right)
@@ -822,8 +820,7 @@ mod tests {
             &mut dest,
             &t.right,
             &plan,
-            &DeletePolicy::Remove,
-            ".lazysync-part",
+            &Settings::transient(DeletePolicy::Remove.clone()),
         );
 
         assert_eq!(report.failures().count(), 0, "{:?}", report.applied);

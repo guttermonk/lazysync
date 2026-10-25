@@ -141,11 +141,7 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     if let Some(bookmark) = app.selected_bookmark() {
         let what = if !bookmark.protocol.is_implemented() {
-            format!(
-                "{} arrives in phase {}",
-                bookmark.protocol,
-                bookmark.protocol.arrives_in_phase()
-            )
+            format!("{} is not supported yet", bookmark.protocol)
         } else if bookmark.needs_password_prompt() {
             "will ask for a password".to_string()
         } else if bookmark.remember_password {

@@ -57,9 +57,12 @@ pub enum Precheck {
 pub fn precheck(target: &Target) -> Result<Precheck, VfsError> {
     if !target.protocol.is_implemented() {
         return Err(VfsError::Unsupported(format!(
-            "{} arrives in phase {} -- see docs/PLAN.md",
+            "{} is not supported yet: {}",
             target.protocol,
-            target.protocol.arrives_in_phase()
+            target
+                .protocol
+                .unavailable_because()
+                .unwrap_or("see docs/PLAN.md")
         )));
     }
 
@@ -219,7 +222,10 @@ mod tests {
             Ok(_) => panic!("S3 should not pass a precheck yet"),
         };
         assert!(message.contains("s3"), "{message}");
-        assert!(message.contains("phase 6"), "{message}");
+        assert!(
+            message.contains("bucket"),
+            "the refusal should say what is missing, not name a phase: {message}"
+        );
     }
 
     /// The refusal has to come before any network traffic, since the point is

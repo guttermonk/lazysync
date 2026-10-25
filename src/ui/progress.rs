@@ -261,9 +261,7 @@ mod tests {
     fn empty_transfer() -> Transfer {
         Transfer::new(
             Plan::default(),
-            DeletePolicy::Remove,
-            ".lazysync-part".into(),
-            false,
+            crate::sync::transfer::Settings::transient(DeletePolicy::Remove),
         )
     }
 

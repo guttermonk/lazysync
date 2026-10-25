@@ -5,19 +5,20 @@ set, vim keys by default with every binding remappable, and a confirmation
 window that shows you both sides of every overwrite — size and timestamp,
 source and destination — before anything moves.
 
-> **Status: phase 5 of 7.** Plan a push, pull or mirror, review every row,
-> and watch it transfer — with progress, throughput, ETA, pause and cancel,
-> resumable partial files, and gitignore-style exclude rules driven by named
-> sync profiles. Over the local filesystem, SFTP/SCP or FTP/FTPS, with saved
-> connections, host key verification, keyring passwords, zide auto-open,
-> synchronized browsing with ghosting, union view, and vim keys throughout.
+> **Status: phase 6 of 7.** Plan a push, pull, mirror or **two-way bisync**,
+> review every row, and watch it transfer — with progress, throughput, ETA,
+> pause and cancel, resumable partial files, and gitignore-style exclude rules
+> driven by named sync profiles. Over the local filesystem, SFTP/SCP or
+> FTP/FTPS, with saved connections, host key verification, keyring passwords,
+> zide auto-open, synchronized browsing with ghosting, union view, and vim
+> keys throughout.
 >
-> What does not work yet: no bisync, no watch mode, no inline diffs, and no
-> checksum re-verification from the window. Transfers are sequential — one
-> file at a time. S3, SMB and WebDAV are refused by name, and are blocked on
-> more than time: the `remotefs` backends for WebDAV and S3 still require an
-> older, incompatible version of the trait every other backend implements.
-> Each subcommand says which phase it arrives in. See
+> What does not work yet: no watch mode, no `rsync`/`rclone` delegation, no
+> inline diffs, and no checksum re-verification from the window. Transfers are
+> sequential — one file at a time. S3, SMB and WebDAV are refused by name, and
+> are blocked on more than time: the `remotefs` backends for WebDAV and S3
+> still require an older, incompatible version of the trait every other
+> backend implements. Each subcommand says what it is waiting on. See
 > [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Why not termscp
@@ -53,7 +54,7 @@ Planned for 1.0, phased in the order below. See
 - Dual-pane browser over SFTP, SCP, FTP/FTPS, S3, SMB, WebDAV, and any
   `rclone` remote
 - Sync modes: push/pull without deletes ✅, mirror with deletes ✅, two-way
-  bisync with conflict resolution, and a file watcher
+  bisync with conflict resolution ✅, and a file watcher
 - Confirmation window with per-row exclusion ✅, inline diffs, and checksum
   re-verification
 - Synchronized browsing with ghost positions and a union view
@@ -127,8 +128,8 @@ filters, `esc` drops to the local browser.
 In the browser: `h`/`j`/`k`/`l` navigate, `tab` switches panes, `S` toggles
 synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
 `o` cycles the sort, `?` shows every binding, `q` quits. `sp` plans a push,
-`sl` a pull, `sm` a mirror, `ss` uses the connection's own sync profile. All
-of it remappable — see below.
+`sl` a pull, `sm` a mirror, `sb` a two-way bisync, `ss` uses the connection's
+own sync profile. All of it remappable — see below.
 
 ### The confirmation window
 
@@ -159,6 +160,56 @@ nothing else has a path to the executor.
 Deletions move to `.lazysync-backup/` by default rather than vanishing, and a
 mirror that would empty the destination is refused outright — that is what a
 mirror pointed at the wrong root looks like.
+
+### Two-way sync
+
+`sb` syncs both ways in one pass. The plan's header shows `⇄` rather than `→`,
+and rows point in whichever direction the file moved:
+
+```
+ Sync  ~/proj  ⇄  box:/srv/www        compare: size+mtime  tolerance: 2s  deletions move to .lazysync-backup/
+┌───────────────────────────────────────────────────────────────────────────────────────────────┐
+│    ▾ Create (2)                                                                               │
+│ +  notes/today.md                  2.1 K  2026-10-25 09:14        —                  +2.1 K   │
+│ +  build/report.json                 —                          8.4 K  2026-10-24 22:03  ←     │
+│    ▾ Delete (1)                                                                               │
+│ ✗  old-draft.md                       —                          1.2 K  2026-10-20 11:40  deleted on one side │
+│    ▾ Conflicts (1)                                                                            │
+│ ⚠  index.html                      11 K  2026-10-25 08:12       9 K  2026-10-25 08:30  BOTH SIDES CHANGED — L/R/B/X │
+└───────────────────────────────────────────────────────────────────────────────────────────────┘
+ 2 ops · 2.1 K out · 1 deleted (1.2 K) · 1 conflict(s) · 1 UNDECIDED
+ y apply · n cancel · space include/exclude · L keep local · R keep remote · B keep both · X leave alone
+```
+
+Two-way sync needs to know what the trees looked like **last time**, because
+"here on the left, missing on the right" has two readings that call for
+opposite actions: it was created on the left, or it was deleted on the right.
+Nothing in the current state of the two trees distinguishes them. lazysync
+keeps a snapshot per pair under `$XDG_STATE_HOME/lazysync/bisync/` — not inside
+the synced tree, where it would be part of what is being compared and would
+conflict with itself on every run.
+
+Two consequences worth knowing before you use it:
+
+- **The first bisync of a pair never deletes anything.** With no snapshot there
+  is no evidence that a one-sided file was removed rather than created, so both
+  sides simply gain what they are missing. The window says so.
+- **When both sides changed, lazysync will not guess.** The row becomes a
+  conflict and *the whole plan refuses to run* until you settle it — `L` keeps
+  the local copy, `R` the remote, `B` keeps both, `X` leaves it for next time.
+  Picking the newer file automatically is the obvious shortcut and it is wrong
+  twice over: it discards the other edit silently, and "newer" is a claim about
+  two clocks that may disagree by more than the edits do.
+
+`B` keeps the local version at the original name on *both* sides and renames
+the displaced copy beside itself with `safety.conflict_suffix`. Leaving each
+side its own version under the original name would be the obvious reading of
+"keep both" and would mean the pair never converges — the same conflict would
+come back on every run, for ever.
+
+Bisync is interactive-only. `lazysync sync` refuses a bisync profile rather
+than resolving conflicts on its own, because a cron job that silently picks a
+side is one that works until the day it matters.
 
 The `compare:` in the header is the rule that was *actually* used, not the one
 configured. Against a destination that cannot be made to keep a modification

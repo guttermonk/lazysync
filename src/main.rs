@@ -117,7 +117,7 @@ fn run_headless_sync(
     yes: bool,
 ) -> Result<()> {
     use lazysync::{
-        sync::{diff, executor, safety, safety::DeletePolicy},
+        sync::{diff, executor, safety, transfer::Settings as TransferSettings},
         vfs::LocalFs,
     };
 
@@ -137,8 +137,23 @@ fn run_headless_sync(
 
     if !profile.mode.is_implemented() {
         anyhow::bail!(
-            "the {} mode arrives in phase 6 -- see docs/PLAN.md",
+            "the {} mode arrives in a later phase -- see docs/PLAN.md",
             profile.mode.label()
+        );
+    }
+
+    // Bisync headlessly is refused, and not for want of a planner: the two-way
+    // planner is right here. What it lacks is anywhere to resolve a conflict.
+    // The options would be to pick a side automatically -- which is the one
+    // thing this design refuses to do, since it discards somebody's edit
+    // silently -- or to abort the whole run on the first conflict, which makes
+    // a cron job that works until the day it matters. Both are worse than
+    // saying so.
+    if matches!(profile.mode, lazysync::config::SyncMode::Bisync) {
+        anyhow::bail!(
+            "bisync needs a terminal: a conflict has no safe automatic answer, and resolving \
+             one is the whole point. Run it interactively, or use a one-directional profile \
+             here"
         );
     }
 
@@ -208,14 +223,18 @@ fn run_headless_sync(
         return Ok(());
     }
 
+    // `apply` takes the two endpoints as panes, because each row names the
+    // side it writes to. Pane 0 is the first argument and pane 1 the second,
+    // whichever way the profile's direction runs -- the swap above already
+    // accounted for that when choosing which root the planner called the
+    // source, and applying it twice would send a pull backwards.
     let report = executor::apply(
         &mut source,
-        &source_root,
+        source_arg,
         &mut dest,
-        &dest_root,
+        dest_arg,
         &plan,
-        &DeletePolicy::from_config(&config.safety),
-        &config.transfer.partial_suffix,
+        &TransferSettings::from_config(&config),
     );
 
     for failure in report.failures() {

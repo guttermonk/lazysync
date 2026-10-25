@@ -34,6 +34,74 @@ pub enum Action {
     /// Separate from `Create` because it transfers no bytes and is not
     /// something the user needs to review individually.
     CreateDir,
+    /// Both sides changed since the last sync, and lazysync will not guess.
+    ///
+    /// Only bisync produces these. A one-directional sync has an answer by
+    /// definition -- the source wins -- but in a two-way sync picking the
+    /// newer file silently discards the other edit, and "newer" is a claim
+    /// about two clocks that may not agree. So it carries a
+    /// [`Resolution`] the user supplies, and the plan refuses to apply while
+    /// any included conflict is still [`Resolution::Pending`].
+    Conflict,
+}
+
+/// What to do about a conflict.
+///
+/// Resolution lives on the row rather than being applied by rewriting it,
+/// because the row is what the window shows and what the executor reads: a
+/// decision recorded anywhere else would be a second source of truth about
+/// what is to happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// Undecided. Blocks the whole plan rather than defaulting, because every
+    /// possible default here loses somebody's work.
+    Pending,
+    /// The local copy wins and is written to the remote.
+    KeepLocal,
+    /// The remote copy wins and is written locally.
+    KeepRemote,
+    /// Neither loses: the other side's version is kept under a suffixed name
+    /// alongside the winner.
+    KeepBoth,
+    /// Leave both sides exactly as they are this run. The conflict will be
+    /// presented again next time, which is the honest outcome of deferring.
+    Skip,
+}
+
+impl Resolution {
+    /// The pane this resolution writes to, if it writes at all.
+    ///
+    /// `KeepBoth` writes to the remote, like `KeepLocal`: the difference is
+    /// not *where* but what happens to the file being displaced. Keeping each
+    /// side's own version at the original name would leave the pair
+    /// permanently different and raise the same conflict on every later run,
+    /// so instead the local copy wins on both sides and the remote's old
+    /// version is renamed aside next to itself. Nothing is lost and the pair
+    /// converges. See [`Resolution::preserves_displaced`].
+    pub const fn target_pane(self) -> Option<usize> {
+        match self {
+            // Local wins, so the remote is what changes.
+            Self::KeepLocal | Self::KeepBoth => Some(1),
+            Self::KeepRemote => Some(0),
+            Self::Pending | Self::Skip => None,
+        }
+    }
+
+    /// Whether the file being overwritten is renamed aside rather than
+    /// replaced.
+    pub const fn preserves_displaced(self) -> bool {
+        matches!(self, Self::KeepBoth)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "undecided",
+            Self::KeepLocal => "keep local",
+            Self::KeepRemote => "keep remote",
+            Self::KeepBoth => "keep both",
+            Self::Skip => "leave alone",
+        }
+    }
 }
 
 impl Action {
@@ -47,6 +115,7 @@ impl Action {
             Self::Delete => "\u{2717}",
             Self::Skip => "=",
             Self::CreateDir => "+",
+            Self::Conflict => "\u{26a0}",
         }
     }
 
@@ -57,6 +126,7 @@ impl Action {
             Self::Overwrite => Section::Overwrite,
             Self::Delete => Section::Delete,
             Self::Skip => Section::Skipped,
+            Self::Conflict => Section::Conflict,
         }
     }
 }
@@ -67,6 +137,8 @@ pub enum Section {
     Create,
     Overwrite,
     Delete,
+    /// Both sides changed. Needs a decision before the plan can run.
+    Conflict,
     Skipped,
 }
 
@@ -75,21 +147,30 @@ impl Section {
     ///
     /// Deletions come after overwrites and before the skipped list, so the
     /// destructive part of a plan is never below a fold of two hundred
-    /// unchanged files.
-    pub const ALL: [Self; 4] = [Self::Create, Self::Overwrite, Self::Delete, Self::Skipped];
+    /// unchanged files. Conflicts sit last of the actionable sections because
+    /// they are the ones you have to act on: nothing runs until they are
+    /// resolved, so they should be what the eye lands on.
+    pub const ALL: [Self; 5] = [
+        Self::Create,
+        Self::Overwrite,
+        Self::Delete,
+        Self::Conflict,
+        Self::Skipped,
+    ];
 
     pub const fn title(self) -> &'static str {
         match self {
             Self::Create => "Create",
             Self::Overwrite => "Overwrite",
             Self::Delete => "Delete",
+            Self::Conflict => "Conflicts",
             Self::Skipped => "Skipped, identical",
         }
     }
 
     /// Whether this section's rows destroy data if applied.
     pub const fn is_destructive(self) -> bool {
-        matches!(self, Self::Delete | Self::Overwrite)
+        matches!(self, Self::Delete | Self::Overwrite | Self::Conflict)
     }
 }
 
@@ -99,6 +180,19 @@ pub struct Row {
     /// Path relative to the sync roots, which is what both sides share.
     pub path: PathBuf,
     pub action: Action,
+
+    /// Which pane this row *writes to* -- 0 local, 1 remote.
+    ///
+    /// Per row rather than per plan, because bisync moves files in both
+    /// directions within one plan and the whole design rests on there being
+    /// exactly one plan that is both shown and applied. A one-directional mode
+    /// simply produces rows that all agree.
+    ///
+    /// Defined as the side that *changes*, which makes it meaningful for every
+    /// action: for a create or overwrite it is where the bytes land, and for a
+    /// delete it is where the file is removed. [`Row::source_pane`] is the
+    /// other one.
+    pub target_pane: usize,
     /// Why the two sides were judged different, or the same.
     pub reason: Reason,
     /// How they were compared, so the window can say which rule applied.
@@ -111,6 +205,12 @@ pub struct Row {
 
     /// Whether this row will be applied. Toggled in the window.
     pub included: bool,
+
+    /// How a conflict is to be settled. `None` for every other action.
+    ///
+    /// `Some(Resolution::Pending)` is the state a fresh conflict is in, and
+    /// the plan refuses to apply while any included row is in it.
+    pub resolution: Option<Resolution>,
 
     /// Set when the backend cannot preserve something the transfer implies --
     /// a timestamp on a destination that cannot set one, say. Shown on the
@@ -136,6 +236,26 @@ impl Side {
 }
 
 impl Row {
+    /// The pane this row's bytes come from. See [`Row::target_pane`].
+    pub const fn source_pane(&self) -> usize {
+        1 - self.target_pane
+    }
+
+    /// This row's view of one pane, by pane index.
+    ///
+    /// The window lays out its two columns by *pane* -- local on the left,
+    /// remote on the right -- while a row stores its sides by role. In a
+    /// bisync plan those differ from row to row, so rendering by role would
+    /// put the local file in the right-hand column for every row that happens
+    /// to be pulling.
+    pub const fn side_of(&self, pane: usize) -> Option<Side> {
+        if pane == self.target_pane {
+            self.dest
+        } else {
+            self.source
+        }
+    }
+
     /// Whether applying this row replaces newer data with older.
     pub const fn clobbers_newer(&self) -> bool {
         self.reason.clobbers_newer()
@@ -143,6 +263,35 @@ impl Row {
 
     /// Bytes this row transfers if applied.
     pub const fn bytes(&self) -> u64 {
+        if matches!(self.action, Action::Conflict) {
+            // A conflict's winning side is whichever the resolution names, so
+            // the byte count follows the decision rather than the row's
+            // nominal source. Undecided means no number, because there is no
+            // answer yet.
+            return match self.resolution {
+                Some(Resolution::KeepLocal) => match self.side_of(0) {
+                    Some(side) => side.size,
+                    None => 0,
+                },
+                Some(Resolution::KeepRemote) => match self.side_of(1) {
+                    Some(side) => side.size,
+                    None => 0,
+                },
+                Some(Resolution::KeepBoth) => {
+                    let local = match self.side_of(0) {
+                        Some(side) => side.size,
+                        None => 0,
+                    };
+                    let remote = match self.side_of(1) {
+                        Some(side) => side.size,
+                        None => 0,
+                    };
+                    local.saturating_add(remote)
+                }
+                _ => 0,
+            };
+        }
+
         match (self.action, &self.source) {
             (Action::Create | Action::Overwrite, Some(side)) => side.size,
             _ => 0,
@@ -177,6 +326,26 @@ impl Row {
     pub const fn needs_review(&self) -> bool {
         !matches!(self.action, Action::Skip | Action::CreateDir)
     }
+
+    /// Whether this row is a conflict still awaiting a decision.
+    pub const fn is_undecided(&self) -> bool {
+        matches!(self.resolution, Some(Resolution::Pending))
+    }
+
+    /// Whether applying this row moves any bytes.
+    ///
+    /// A conflict resolved to [`Resolution::Skip`] does not, which is the
+    /// difference between deferring a decision and making one.
+    pub const fn is_effective(&self) -> bool {
+        match self.action {
+            Action::Conflict => matches!(
+                self.resolution,
+                Some(Resolution::KeepLocal | Resolution::KeepRemote | Resolution::KeepBoth)
+            ),
+            Action::Create | Action::Overwrite | Action::Delete | Action::CreateDir => true,
+            Action::Skip => false,
+        }
+    }
 }
 
 /// Everything a sync would do.
@@ -205,6 +374,21 @@ pub struct Plan {
     /// Set when a safety rail refused the plan. The window shows it and
     /// refuses to apply.
     pub refusal: Option<String>,
+
+    /// Whether this plan moves files in both directions.
+    ///
+    /// The window needs it for the header -- `⇄` rather than `→`, since
+    /// "local → remote" would be a false description of a bisync -- and the
+    /// safety check needs it to apply its delete limits to *both* sides rather
+    /// than only the nominal destination.
+    pub bidirectional: bool,
+
+    /// Set on a first bisync, when there is no snapshot to compare against.
+    ///
+    /// Shown in the window, because the run behaves differently: nothing can
+    /// be deleted, since a path on one side only is as likely to be new as
+    /// removed.
+    pub first_run: bool,
 }
 
 impl Plan {
@@ -244,9 +428,25 @@ impl Plan {
         !self.rows.iter().any(Row::needs_review)
     }
 
+    /// Conflicts still awaiting a decision.
+    pub fn undecided(&self) -> impl Iterator<Item = &Row> {
+        self.rows.iter().filter(|r| r.included && r.is_undecided())
+    }
+
     /// Whether applying is allowed.
+    ///
+    /// An undecided conflict blocks the *whole* plan rather than being skipped
+    /// along with its own row. Running the other ninety-nine rows and quietly
+    /// leaving one unresolved would mean the next run compares against a tree
+    /// that is half-synced, and the user would have no indication that
+    /// anything was left behind. Exclude the row with `space` to say so
+    /// deliberately.
     pub fn can_apply(&self) -> bool {
-        self.refusal.is_none() && self.included().any(Row::needs_review)
+        self.refusal.is_none()
+            && self.undecided().next().is_none()
+            && self
+                .included()
+                .any(|r| r.needs_review() && r.is_effective())
     }
 
     /// Totals for the window's footer.
@@ -275,6 +475,28 @@ impl Plan {
                 }
                 Action::CreateDir => totals.directories += 1,
                 Action::Skip => totals.skipped += 1,
+
+                // A conflict counts as an operation only once it has a
+                // resolution that moves something. Counting an undecided one
+                // in `bytes_out` would put a number in the footer for work
+                // whose direction is not yet known -- and the plan cannot run
+                // at all while one exists.
+                Action::Conflict => {
+                    totals.conflicts += 1;
+                    match row.resolution {
+                        Some(Resolution::Pending) => totals.undecided += 1,
+                        // `Row::bytes` reads the resolution, including the
+                        // keep-both case where each side's version crosses to
+                        // the other.
+                        Some(
+                            Resolution::KeepLocal | Resolution::KeepRemote | Resolution::KeepBoth,
+                        ) => {
+                            totals.conflict_ops += 1;
+                            totals.bytes_out = totals.bytes_out.saturating_add(row.bytes());
+                        }
+                        Some(Resolution::Skip) | None => {}
+                    }
+                }
             }
         }
 
@@ -338,33 +560,58 @@ impl Plan {
     /// Derived from the rows rather than tracked separately, so a row excluded
     /// in the window cannot leave behind an empty directory that was only
     /// created for it.
-    pub fn required_directories(&self) -> Vec<PathBuf> {
-        let mut dirs: Vec<PathBuf> = Vec::new();
+    /// Directories to create, paired with the pane each belongs on.
+    ///
+    /// The pane matters because bisync writes both ways in one plan: a pull
+    /// needs its parent directories locally and a push needs them on the
+    /// remote, and creating every one on both sides would leave empty
+    /// directories on whichever side was not receiving anything.
+    pub fn required_directories(&self) -> Vec<(usize, PathBuf)> {
+        let mut dirs: Vec<(usize, PathBuf)> = Vec::new();
 
         for row in self.included() {
             if matches!(row.action, Action::Delete | Action::Skip) {
                 continue;
             }
+            if matches!(row.action, Action::Conflict) && !row.is_effective() {
+                continue;
+            }
+
             let target = if matches!(row.action, Action::CreateDir) {
                 Some(row.path.as_path())
             } else {
                 row.path.parent()
             };
 
-            let mut current = target;
-            while let Some(dir) = current {
-                if dir.as_os_str().is_empty() {
-                    break;
+            // Which side needs them. A conflict resolved to keep-both writes
+            // in both directions, so it needs its parents on both.
+            let panes: &[usize] = match (row.action, row.resolution) {
+                (Action::Conflict, Some(Resolution::KeepBoth)) => &[0, 1],
+                (Action::Conflict, Some(Resolution::KeepLocal)) => &[1],
+                (Action::Conflict, Some(Resolution::KeepRemote)) => &[0],
+                _ => match row.target_pane {
+                    0 => &[0],
+                    _ => &[1],
+                },
+            };
+
+            for &pane in panes {
+                let mut current = target;
+                while let Some(dir) = current {
+                    if dir.as_os_str().is_empty() {
+                        break;
+                    }
+                    let item = (pane, dir.to_path_buf());
+                    if !dirs.contains(&item) {
+                        dirs.push(item);
+                    }
+                    current = dir.parent();
                 }
-                if !dirs.contains(&dir.to_path_buf()) {
-                    dirs.push(dir.to_path_buf());
-                }
-                current = dir.parent();
             }
         }
 
         // Shallowest first, so a parent exists before its child is created.
-        dirs.sort_by_key(|d| d.components().count());
+        dirs.sort_by_key(|(pane, dir)| (dir.components().count(), *pane));
         dirs
     }
 }
@@ -379,21 +626,35 @@ pub struct Totals {
     pub skipped: usize,
     /// Overwrites that replace newer data with older.
     pub clobbers_newer: usize,
+    /// Rows where both sides changed. Bisync only.
+    pub conflicts: usize,
+    /// Of those, how many still have no decision. Nothing runs while this is
+    /// above zero, so the footer says it plainly.
+    pub undecided: usize,
+    /// Conflicts resolved to something that actually moves a file.
+    pub conflict_ops: usize,
     pub bytes_out: u64,
     pub bytes_deleted: u64,
 }
 
 impl Totals {
     /// Operations that transfer or remove something.
+    ///
+    /// Resolved conflicts count, because they move files; undecided ones and
+    /// those deferred with `leave alone` do not. A footer reading "0 ops"
+    /// while bytes crossed the wire would be exactly the kind of disagreement
+    /// between the shown plan and the applied one that this design exists to
+    /// prevent.
     pub const fn operations(&self) -> usize {
-        self.creates + self.overwrites + self.deletes
+        self.creates + self.overwrites + self.deletes + self.conflict_ops
     }
 }
 
 /// Build a row for a file present only on the source.
-pub fn create_row(path: PathBuf, source: &Entry, method: Method) -> Row {
+pub fn create_row(path: PathBuf, source: &Entry, method: Method, target_pane: usize) -> Row {
     Row {
         path,
+        target_pane,
         action: if matches!(source.kind, EntryKind::Dir) {
             Action::CreateDir
         } else {
@@ -406,6 +667,7 @@ pub fn create_row(path: PathBuf, source: &Entry, method: Method) -> Row {
         source: Some(Side::from_entry(source)),
         dest: None,
         included: true,
+        resolution: None,
         caveat: None,
     }
 }
@@ -417,9 +679,11 @@ pub fn compare_row(
     dest: &Entry,
     reason: Reason,
     method: Method,
+    target_pane: usize,
 ) -> Row {
     Row {
         path,
+        target_pane,
         action: if reason.differs() {
             Action::Overwrite
         } else {
@@ -430,20 +694,54 @@ pub fn compare_row(
         source: Some(Side::from_entry(source)),
         dest: Some(Side::from_entry(dest)),
         included: true,
+        resolution: None,
         caveat: None,
     }
 }
 
 /// Build a row for a file present only on the destination.
-pub fn delete_row(path: PathBuf, dest: &Entry, method: Method) -> Row {
+pub fn delete_row(path: PathBuf, dest: &Entry, method: Method, target_pane: usize) -> Row {
     Row {
         path,
+        target_pane,
         action: Action::Delete,
         reason: Reason::NotOnSource,
         method,
         source: None,
         dest: Some(Side::from_entry(dest)),
         included: true,
+        resolution: None,
+        caveat: None,
+    }
+}
+
+/// Build a conflict row: both sides changed since the last sync.
+///
+/// `target_pane` is set to the remote, arbitrarily, so that the field is never
+/// meaningless -- but nothing reads it until a [`Resolution`] supplies the
+/// real answer, and [`Plan::can_apply`] refuses while it is
+/// [`Resolution::Pending`]. Defaulting the *resolution* instead would be the
+/// mistake: there is no safe default when both sides have edits.
+pub fn conflict_row(
+    path: PathBuf,
+    local: Option<&Entry>,
+    remote: Option<&Entry>,
+    reason: Reason,
+    method: Method,
+) -> Row {
+    Row {
+        path,
+        action: Action::Conflict,
+        target_pane: 1,
+        reason,
+        method,
+        // Stored by pane, not by role: with no resolution yet there is no
+        // source and no destination. `side_of` reads them back the same way
+        // because `target_pane` is 1.
+        source: local.map(Side::from_entry),
+        dest: remote.map(Side::from_entry),
+        included: true,
+        resolution: Some(Resolution::Pending),
         caveat: None,
     }
 }
@@ -517,6 +815,7 @@ mod tests {
             "a.txt".into(),
             &entry("a.txt", 10, Some(1)),
             Method::SizeMtime,
+            1,
         );
         assert_eq!(row.action, Action::Create);
         assert_eq!(row.source.unwrap().size, 10);
@@ -527,7 +826,7 @@ mod tests {
 
     #[test]
     fn a_directory_is_its_own_action_and_needs_no_review() {
-        let row = create_row("src".into(), &dir("src"), Method::SizeMtime);
+        let row = create_row("src".into(), &dir("src"), Method::SizeMtime, 1);
         assert_eq!(row.action, Action::CreateDir);
         assert_eq!(row.bytes(), 0);
         assert!(
@@ -544,6 +843,7 @@ mod tests {
             &entry("a", 10, Some(1)),
             Reason::SameSizeAndTime,
             Method::SizeMtime,
+            1,
         );
         assert_eq!(row.action, Action::Skip);
         assert!(!row.needs_review());
@@ -556,6 +856,7 @@ mod tests {
             "gone".into(),
             &entry("gone", 50, Some(1)),
             Method::SizeMtime,
+            1,
         );
         assert_eq!(row.action, Action::Delete);
         assert!(row.source.is_none());
@@ -567,21 +868,33 @@ mod tests {
     #[test]
     fn totals_add_up() {
         let plan = plan_with(vec![
-            create_row("new".into(), &entry("new", 100, Some(1)), Method::SizeMtime),
+            create_row(
+                "new".into(),
+                &entry("new", 100, Some(1)),
+                Method::SizeMtime,
+                1,
+            ),
             compare_row(
                 "changed".into(),
                 &entry("changed", 200, Some(2)),
                 &entry("changed", 150, Some(1)),
                 Reason::SizeDiffers,
                 Method::SizeMtime,
+                1,
             ),
-            delete_row("old".into(), &entry("old", 30, Some(1)), Method::SizeMtime),
+            delete_row(
+                "old".into(),
+                &entry("old", 30, Some(1)),
+                Method::SizeMtime,
+                1,
+            ),
             compare_row(
                 "same".into(),
                 &entry("same", 10, Some(1)),
                 &entry("same", 10, Some(1)),
                 Reason::SameSizeAndTime,
                 Method::SizeMtime,
+                1,
             ),
         ]);
 
@@ -603,6 +916,7 @@ mod tests {
             &entry("notes", 10, Some(2000)),
             Reason::DestinationNewer,
             Method::SizeMtime,
+            1,
         )]);
 
         assert_eq!(plan.totals().clobbers_newer, 1);
@@ -614,8 +928,8 @@ mod tests {
     #[test]
     fn excluding_a_row_recomputes_the_totals() {
         let mut plan = plan_with(vec![
-            create_row("a".into(), &entry("a", 100, Some(1)), Method::SizeMtime),
-            create_row("b".into(), &entry("b", 50, Some(1)), Method::SizeMtime),
+            create_row("a".into(), &entry("a", 100, Some(1)), Method::SizeMtime, 1),
+            create_row("b".into(), &entry("b", 50, Some(1)), Method::SizeMtime, 1),
         ]);
         assert_eq!(plan.totals().bytes_out, 150);
 
@@ -627,8 +941,8 @@ mod tests {
     #[test]
     fn set_all_and_invert_leave_unreviewable_rows_alone() {
         let mut plan = plan_with(vec![
-            create_row("dir".into(), &dir("dir"), Method::SizeMtime),
-            create_row("a".into(), &entry("a", 1, Some(1)), Method::SizeMtime),
+            create_row("dir".into(), &dir("dir"), Method::SizeMtime, 1),
+            create_row("a".into(), &entry("a", 1, Some(1)), Method::SizeMtime, 1),
         ]);
 
         plan.set_all(false);
@@ -656,9 +970,9 @@ mod tests {
     #[test]
     fn only_includes_a_single_row() {
         let mut plan = plan_with(vec![
-            create_row("a".into(), &entry("a", 1, Some(1)), Method::SizeMtime),
-            create_row("b".into(), &entry("b", 1, Some(1)), Method::SizeMtime),
-            create_row("c".into(), &entry("c", 1, Some(1)), Method::SizeMtime),
+            create_row("a".into(), &entry("a", 1, Some(1)), Method::SizeMtime, 1),
+            create_row("b".into(), &entry("b", 1, Some(1)), Method::SizeMtime, 1),
+            create_row("c".into(), &entry("c", 1, Some(1)), Method::SizeMtime, 1),
         ]);
 
         plan.only(1);
@@ -678,9 +992,20 @@ mod tests {
                 &entry("z", 1, Some(1)),
                 Reason::SameSizeAndTime,
                 Method::SizeMtime,
+                1,
             ),
-            delete_row("a-gone".into(), &entry("a", 1, Some(1)), Method::SizeMtime),
-            create_row("m-new".into(), &entry("m", 1, Some(1)), Method::SizeMtime),
+            delete_row(
+                "a-gone".into(),
+                &entry("a", 1, Some(1)),
+                Method::SizeMtime,
+                1,
+            ),
+            create_row(
+                "m-new".into(),
+                &entry("m", 1, Some(1)),
+                Method::SizeMtime,
+                1,
+            ),
         ]);
 
         let sections: Vec<Section> = plan.rows.iter().map(|r| r.action.section()).collect();
@@ -702,6 +1027,7 @@ mod tests {
             &entry("same", 1, Some(1)),
             Reason::SameSizeAndTime,
             Method::SizeMtime,
+            1,
         )]);
         assert!(plan.is_empty());
         assert!(!plan.can_apply());
@@ -713,6 +1039,7 @@ mod tests {
             "a".into(),
             &entry("a", 1, Some(1)),
             Method::SizeMtime,
+            1,
         )]);
         assert!(plan.can_apply());
 
@@ -728,15 +1055,16 @@ mod tests {
             "src/api/v2/handler.rs".into(),
             &entry("handler.rs", 1, Some(1)),
             Method::SizeMtime,
+            1,
         )]);
 
         let dirs = plan.required_directories();
         assert_eq!(
             dirs,
             vec![
-                PathBuf::from("src"),
-                PathBuf::from("src/api"),
-                PathBuf::from("src/api/v2"),
+                (1, PathBuf::from("src")),
+                (1, PathBuf::from("src/api")),
+                (1, PathBuf::from("src/api/v2")),
             ]
         );
     }
@@ -748,6 +1076,7 @@ mod tests {
             "only/here/f".into(),
             &entry("f", 1, Some(1)),
             Method::SizeMtime,
+            1,
         )]);
         assert_eq!(plan.required_directories().len(), 2);
 
@@ -764,6 +1093,7 @@ mod tests {
             "a/b/c".into(),
             &entry("c", 1, Some(1)),
             Method::SizeMtime,
+            1,
         )]);
         assert!(plan.required_directories().is_empty());
     }
@@ -804,11 +1134,13 @@ mod tests {
                 "a".into(),
                 &entry("a", u64::MAX / 2, Some(1)),
                 Method::SizeMtime,
+                1,
             ),
             create_row(
                 "b".into(),
                 &entry("b", u64::MAX / 2, Some(1)),
                 Method::SizeMtime,
+                1,
             ),
         ]);
         // Saturating rather than wrapping would be wrong too, but panicking in

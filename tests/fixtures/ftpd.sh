@@ -111,14 +111,18 @@ nohup python3 -m pyftpdlib \
 
 echo $! >"$pidfile"
 
-# Wait for it to accept connections rather than sleeping a guessed amount.
+# Wait for it to accept connections rather than sleeping a guessed amount, and
+# stop waiting the moment the process is gone -- a server that exited on a bad
+# argument will never start listening, and every test pays for this loop.
 ready=""
+server_pid="$(cat "$pidfile")"
 for _ in $(seq 100); do
     if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
         exec 3<&- 3>&-
         ready="yes"
         break
     fi
+    kill -0 "$server_pid" 2>/dev/null || break
     sleep 0.1
 done
 if [[ -z "$ready" ]]; then

@@ -20,7 +20,7 @@ pub use url::{parse, ParseTargetError};
 
 /// Which protocol a target speaks.
 ///
-/// Only the SSH family is implemented. The rest are listed because a bookmark
+/// SFTP, SCP, FTP and FTPS are implemented. The rest are listed because a bookmark
 /// file written against the documented schema should load, and because the
 /// connection form has to offer something honest when you pick one -- see
 /// [`Protocol::is_implemented`].
@@ -94,23 +94,33 @@ impl Protocol {
         matches!(self, Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps)
     }
 
-    /// Which phase brings the rest, for the message shown when you pick one.
-    pub const fn arrives_in_phase(self) -> u8 {
+    /// What is standing in the way, for the message shown when you pick an
+    /// unimplemented protocol. `None` for the ones that work.
+    ///
+    /// A reason rather than a phase number. A phase number is a promise, and
+    /// these three have already slipped two phases: each needs something
+    /// lazysync does not have, and naming the obstacle is both more useful to
+    /// whoever picked the protocol and incapable of going stale.
+    pub const fn unavailable_because(self) -> Option<&'static str> {
         match self {
-            Self::Sftp | Self::Scp => 2,
-            Self::Ftp | Self::Ftps => 5,
-            // Each of these needs something lazysync does not have yet, and
-            // none of them is a small addition:
-            //
-            // - WebDAV: `remotefs-webdav`'s blocking client needs a
-            //   `tokio::runtime::Handle`, so supporting it means introducing
-            //   an async runtime to a project that deliberately has none.
-            //   Where that runtime lives is a decision in its own right.
-            // - S3: bucket, region, endpoint and access keys, none of which
-            //   the bookmark schema or the connection form has fields for.
-            // - SMB: a share name, plus `libsmbclient` as a system
-            //   dependency in the Nix build.
-            Self::Webdav | Self::S3 | Self::Smb => 6,
+            Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps => None,
+
+            // `remotefs-webdav` also still wants `remotefs 0.3`, whose
+            // `RemoteFs` is a different and incompatible trait -- so it cannot
+            // share the adapter every other backend uses.
+            Self::Webdav => Some(
+                "its client needs a tokio runtime, and lazysync deliberately has none; where \
+                 that runtime would live is a decision in its own right",
+            ),
+            // Same trait-version problem, plus schema work.
+            Self::S3 => Some(
+                "it needs bucket, region, endpoint and access-key fields, which neither the \
+                 bookmark schema nor the connection form has",
+            ),
+            Self::Smb => Some(
+                "it needs a share name, and libsmbclient as a system dependency in the Nix \
+                 build",
+            ),
         }
     }
 
@@ -416,7 +426,19 @@ mod tests {
         }
         for protocol in [Protocol::S3, Protocol::Smb, Protocol::Webdav] {
             assert!(!protocol.is_implemented(), "{protocol}");
-            assert_eq!(protocol.arrives_in_phase(), 6);
+            // An unimplemented protocol has to say what is blocking it. A
+            // phase number would be a promise, and these have already slipped
+            // two; the obstacle is both more useful and cannot go stale.
+            assert!(
+                protocol.unavailable_because().is_some(),
+                "{protocol} is refused without saying why"
+            );
+        }
+        for protocol in [Protocol::Sftp, Protocol::Scp, Protocol::Ftp, Protocol::Ftps] {
+            assert!(
+                protocol.unavailable_because().is_none(),
+                "{protocol} works, so it must not claim an obstacle"
+            );
         }
     }
 

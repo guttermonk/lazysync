@@ -5,10 +5,10 @@ local ↔ local, remote ↔ remote) trees. termscp's feature set, vim keys by
 default, every binding remappable, and a confirmation window that shows you
 exactly what is about to be overwritten before anything moves.
 
-Status: **phase 5 of 7 complete**. Browsing, connections, syncing and the
-transfer queue work over local, SFTP/SCP and FTP/FTPS; see the phase table in
-§10 for what each one actually delivered, and what it turned out not to have
-anticipated.
+Status: **phase 6 of 7 complete**. Browsing, connections, all four sync modes
+and the transfer queue work over local, SFTP/SCP and FTP/FTPS; see the phase
+table in §10 for what each one actually delivered, and what it turned out not
+to have anticipated.
 
 ---
 
@@ -43,10 +43,13 @@ thiserror / anyhow              errors
 **No async runtime.** The plan originally called for tokio. It is not there,
 because the `remotefs-*` crates are themselves blocking: an async `Vfs` would
 mean wrapping sync calls in `spawn_blocking` and paying async's complexity for
-none of its benefit. The trait is blocking, and phase 2 keeps the UI responsive
-by running each backend on its own worker thread and passing results to the UI
-thread — which is also how termscp does it. If a later phase needs real
-concurrency across many transfers, a thread pool is the smaller change.
+none of its benefit. The trait is blocking, and the UI stays responsive by
+*stepping* the transfer queue a chunk at a time on the main loop rather than
+handing a backend to a worker thread — the panes own the `Vfs` values and
+`Vfs` is `Send` but not `Sync`, so a thread would mean the browser losing its
+backends for the duration of every sync. See the phase 4 row. If a later phase
+needs real concurrency across many transfers, multiple channels within one SSH
+session is the smaller change.
 
 **crossterm is not a direct dependency.** `ratatui-crossterm` can build against
 either 0.28 or 0.29, so a second direct dependency risks resolving to the other
@@ -348,8 +351,22 @@ Ranked by how much I think they matter.
    overwrite), and resume from a partial left by a cancelled run. A partial
    longer than its source is discarded rather than appended to: it is debris
    from a different version of the file.
-7. **Bisync conflict resolution UI** — per-file keep-local / keep-remote /
-   keep-both (suffixed) / skip, driven from the Conflicts section.
+7. ~~**Bisync conflict resolution UI**~~ — done in phase 6. `L` keeps local,
+   `R` keeps remote, `B` keeps both and `X` defers, on the row under the
+   cursor, from the Conflicts section.
+
+   Two decisions worth recording. An **undecided conflict blocks the whole
+   plan**, rather than being skipped along with its own row: running the other
+   ninety-nine rows and quietly leaving one behind would mean the next run
+   compares against a half-synced tree with nothing on screen to say so.
+   Exclude it with `space` to defer it deliberately.
+
+   And **keep-both does not keep each side's own version at the original
+   name**, which is the obvious reading and is wrong — the two sides would
+   stay different and raise the same conflict on every later run, for ever.
+   The winner lands at the original name on *both* sides and the displaced
+   copy is renamed beside itself with `safety.conflict_suffix`. Nothing is
+   lost and the pair converges.
 8. ~~**Host-key verification UX**~~ — done in phase 2, and it turned out to be
    mandatory rather than a nicety: `remotefs-ssh`'s libssh2 backend does not
    consult `known_hosts` at all, so without this lazysync would hand both your
@@ -403,8 +420,8 @@ Ranked by how much I think they matter.
 | 3 | ✅ Diff planner + confirmation window + native executor (push/pull, mirror). Three things the design did not anticipate: **SFTP's rename does not replace an existing file** (OpenSSH answers `SSH_FX_PERMISSION_DENIED`), so overwrites go through a three-step swap — see `Capabilities::atomic_overwrite_rename`; a **percentage-only delete guard misfires on small trees**, where removing one of two files reads as 50%, so a floor was added with a separate all-or-nothing check that fires at any size; and the **backup directory had to be excluded from planning**, or the second mirror run deletes the backups the first one made. |
 | 4 | ✅ Transfer queue, progress, resume, filters, sync profiles. (Safety rails landed early, in phase 3.) The queue is a state machine the main loop steps a chunk per frame rather than a worker thread: the panes own the `Vfs` values and an SFTP session cannot be cloned without asking for the password again, so a thread would mean the browser losing its backends for the duration. Stepping gives progress and cancellation with no shared state. Two things worth noting: `Vfs` gained streaming handles, so a 4 GB file no longer costs 4 GB of memory; and the glob matcher had to be memoised after `*a*a*a*a*a*a*b` against forty `a`s took **3.7 seconds** — the patterns come from the user's own config, so that was a filter line able to freeze the planner. |
 | 5 | ✅ One generic `RemoteAdapter` for every `remotefs` backend; FTP + FTPS on top of it. The phase was planned as "all remaining backends plus the rsync/rclone executors" and was cut down deliberately: **WebDAV and S3 cannot go in at all right now** — `remotefs-webdav` and `remotefs-aws-s3` still depend on `remotefs 0.3`, which defines a *different, incompatible* `RemoteFs` trait, so adding either puts two versions of the trait in one binary. SMB needs `libsmbclient` and a share field the connection schema does not have. All three move to phase 6. What landed instead paid for itself twice over: generalising the adapter cut `ssh.rs` from 978 lines to 387, and the real-server fixture caught four bugs. One is a comparison bug affecting **every** destination that cannot set an mtime (see §9.2). The others were FTPS: the default port was 990, the *implicit* FTPS port, while `secure()` performs *explicit* FTPS — a plaintext connect then `AUTH TLS` — so `ftps://host` would have opened a plaintext connection to a port awaiting a TLS handshake; a rejected certificate surfaced as "the server refused the connection", because `remotefs` reports a failed handshake as `ConnectionError` with the cause in the source and `translate` was collapsing that into the payload-free `NotConnected`; and the certificate test itself passed for the wrong reason until the fixture stopped exporting a port before confirming something was listening on it. |
-| 6 | Bisync + state snapshots + conflict UI; S3/SMB/WebDAV once `remotefs 1.0` ports exist; rsync + rclone executors; `RcloneFs` |
-| 7 | Watch mode, headless CLI + audit log, home-manager module, docs + demo cast |
+| 6 | ✅ Bisync, state snapshots and the conflict UI. Scoped down again: S3/SMB/WebDAV are still blocked on `remotefs 1.0` ports, and the rsync/rclone executors move to phase 7 — bisync was the only one of the four sync modes still missing and it was worth doing properly rather than alongside two other large pieces. The structural change is that **a plan row now names the side it writes to**, so one plan can move files both ways and the plan-is-the-dry-run rule survives a two-way sync. That refactor is also where the phase's two worst bugs lived, both caught by existing tests: `executor::apply` took a source and a destination and so could not tell *which pane* its "source" was, which silently reversed every pull; and the queue re-derived each file's destination from a single plan-wide `dest_root` at completion time, so a bisync row writing locally had its partial file renamed onto the **remote** — reported as a successful transfer while landing on the wrong side. |
+| 7 | rsync + rclone executors; `RcloneFs`; watch mode, headless CLI + audit log, home-manager module, docs + demo cast |
 
 Phases 1–3 are the usable milestone: dual-pane browsing over SFTP with
 sync-browse and a reviewed push.
@@ -424,8 +441,15 @@ sync-browse and a reviewed push.
 4. **Watch mode confirmation** — auto-apply, or queue changes and confirm in
    batches? A watcher that stops for a modal every save is useless; a watcher
    that never confirms contradicts the whole review-first design.
-5. **Bisync state location** — per-bookmark under `$XDG_STATE_HOME`, or
-   alongside the synced tree (survives reinstalls, visible to both ends)?
+5. ~~**Bisync state location**~~ — decided in phase 6:
+   `$XDG_STATE_HOME/lazysync/bisync/<digest of the two roots>.json`. Beside the
+   tree was tempting (survives a reinstall, visible from both ends) but does
+   not work: a file inside the tree is *part of the tree being compared*, so it
+   would be synced — it changes on every run, both machines would write their
+   own, and the two would conflict with each other on every single sync.
+   Excluding it by name fixes that and creates a worse problem, since the
+   exclusion would have to hold for every profile and a user who overrode the
+   filters would silently start syncing their own bookkeeping.
 6. **Single instance** — should a second zide popup reattach to the running
    instance over a socket, or just start fresh?
 7. **Deletes in mirror mode** — default to `backup_dir` (recoverable) or real

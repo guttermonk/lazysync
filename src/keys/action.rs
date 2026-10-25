@@ -139,6 +139,14 @@ pub enum Action {
     DiffRow,
     FoldSection,
     UnfoldSection,
+    /// Settle the conflict under the cursor by keeping the local copy.
+    ResolveKeepLocal,
+    /// Settle it by keeping the remote copy.
+    ResolveKeepRemote,
+    /// Settle it by keeping both, the loser under a suffixed name.
+    ResolveKeepBoth,
+    /// Leave both sides alone this run, and be asked again next time.
+    ResolveSkip,
 
     // ── Sync ─────────────────────────────────────────────────────────────
     /// Plan a push: local to remote, without deleting anything.
@@ -149,6 +157,9 @@ pub enum Action {
     SyncMirror,
     /// Plan using the open connection's own sync profile.
     SyncProfile,
+    /// Plan a two-way sync, using the stored snapshot to tell a creation on
+    /// one side from a deletion on the other.
+    SyncBisync,
     /// Pause or resume the transfer in flight.
     TogglePause,
 
@@ -222,11 +233,16 @@ impl Action {
             Self::DiffRow => "Show a diff for this row",
             Self::FoldSection => "Fold this section",
             Self::UnfoldSection => "Unfold this section",
+            Self::ResolveKeepLocal => "Conflict: keep the local copy",
+            Self::ResolveKeepRemote => "Conflict: keep the remote copy",
+            Self::ResolveKeepBoth => "Conflict: keep both, one suffixed",
+            Self::ResolveSkip => "Conflict: leave both alone this run",
 
             Self::SyncPush => "Plan a push to the other pane",
             Self::SyncPull => "Plan a pull from the other pane",
             Self::SyncMirror => "Plan a mirror, deletions included",
             Self::SyncProfile => "Plan using this connection's sync profile",
+            Self::SyncBisync => "Plan a two-way sync",
             Self::TogglePause => "Pause or resume the transfer",
 
             Self::OpenItem => "Open the selected connection",
@@ -280,12 +296,17 @@ impl Action {
             | Self::Checksum
             | Self::DiffRow
             | Self::FoldSection
-            | Self::UnfoldSection => "Plan",
+            | Self::UnfoldSection
+            | Self::ResolveKeepLocal
+            | Self::ResolveKeepRemote
+            | Self::ResolveKeepBoth
+            | Self::ResolveSkip => "Plan",
 
             Self::SyncPush
             | Self::SyncPull
             | Self::SyncMirror
             | Self::SyncProfile
+            | Self::SyncBisync
             | Self::TogglePause => "Sync",
 
             Self::OpenItem

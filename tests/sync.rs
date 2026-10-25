@@ -40,13 +40,31 @@ struct Harness {
     app: App,
     dispatcher: Dispatcher,
     dir: TempDir,
+    /// Held for the lifetime of the harness: `LAZYSYNC_DEV_STATE_DIR` is
+    /// process-wide, so two tests setting it at once would read each other's
+    /// bisync snapshots.
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
+
+/// Serialises the tests that touch the state directory.
+static STATE_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Harness {
     fn new(config: Config) -> Self {
+        let guard = STATE_DIR.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("left")).unwrap();
         fs::create_dir_all(dir.path().join("right")).unwrap();
+
+        // Bisync writes a snapshot under the state directory. Without this
+        // every run would write into the developer's real `~/.local/state`,
+        // and -- worse for the tests -- a pair of roots reused across cases
+        // would carry history between them, so a "first run" assertion would
+        // pass or fail depending on what had run before it.
+        //
+        // SAFETY: the mutex above makes this the only thread touching the
+        // variable, and each harness sets it before building its `App`.
+        unsafe { std::env::set_var("LAZYSYNC_DEV_STATE_DIR", dir.path().join("state")) };
 
         let app = App::new(config, dir.path().join("left"), dir.path().join("right")).unwrap();
 
@@ -54,6 +72,7 @@ impl Harness {
             dispatcher: Dispatcher::new(Duration::from_millis(500)),
             app,
             dir,
+            _guard: guard,
         }
     }
 
@@ -1037,7 +1056,7 @@ fn ss_without_a_profile_says_so() {
 }
 
 #[test]
-fn a_profile_naming_bisync_is_refused_rather_than_run_as_something_else() {
+fn a_profile_naming_bisync_plans_a_two_way_sync() {
     let config: Config = toml::from_str(
         r#"
         [profiles.both]
@@ -1053,8 +1072,340 @@ fn a_profile_naming_bisync_is_refused_rather_than_run_as_something_else() {
     h.app.active_profile = Some("both".into());
     h.press("ss");
 
-    assert!(h.app.plan.is_none());
-    assert!(h.app.status.contains("phase 6"), "{}", h.app.status);
+    let plan = h.app.plan.as_ref().expect("a bisync plan");
+    assert!(plan.bidirectional, "a bisync plan moves files both ways");
+}
+
+// ── Bisync ──────────────────────────────────────────────────────────────────
+
+/// Each side's new file ends up on the other, in one plan and one pass.
+#[test]
+fn sb_copies_each_sides_new_file_to_the_other() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("only-left"), "L", 1_000_000);
+    write(&h.right().join("only-right"), "R", 1_000_000);
+    h.refresh();
+
+    h.press("sb");
+
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert!(plan.bidirectional);
+    assert!(plan.first_run, "this pair has never been synced");
+
+    // Both directions in one plan -- the thing a one-way plan cannot express.
+    let targets: Vec<usize> = plan
+        .rows
+        .iter()
+        .filter(|r| r.needs_review())
+        .map(|r| r.target_pane)
+        .collect();
+    assert!(targets.contains(&0) && targets.contains(&1), "{targets:?}");
+
+    h.apply();
+
+    assert_eq!(
+        fs::read_to_string(h.right().join("only-left")).unwrap(),
+        "L",
+        "the local file should have gone to the remote"
+    );
+    assert_eq!(
+        fs::read_to_string(h.left().join("only-right")).unwrap(),
+        "R",
+        "and the remote file to the local side"
+    );
+}
+
+/// **The first-run safety property, end to end.** With no snapshot, a file on
+/// one side only is copied, never deleted -- there is no evidence which it is.
+#[test]
+fn a_first_bisync_never_deletes() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "x", 1_000_000);
+    h.refresh();
+
+    h.press("sb");
+
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert_eq!(
+        plan.totals().deletes,
+        0,
+        "a first bisync has no basis for calling anything a deletion"
+    );
+    assert!(
+        h.app.status.contains("nothing will be deleted"),
+        "{}",
+        h.app.status
+    );
+
+    h.apply();
+    assert!(h.left().join("a").exists(), "and nothing was deleted");
+    assert!(h.right().join("a").exists());
+}
+
+/// And the point of the snapshot: once there *is* history, a deletion on one
+/// side propagates to the other.
+#[test]
+fn a_deletion_propagates_on_the_second_bisync() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "x", 1_000_000);
+    write(&h.left().join("b"), "y", 1_000_000);
+    h.refresh();
+
+    // First run: both files reach the right-hand side and the pair's state is
+    // recorded.
+    h.press("sb");
+    h.apply();
+    h.dismiss();
+    assert!(h.right().join("a").exists());
+    assert!(h.right().join("b").exists());
+
+    // Now remove one locally.
+    fs::remove_file(h.left().join("a")).unwrap();
+    h.refresh();
+
+    h.press("sb");
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert!(
+        !plan.first_run,
+        "the snapshot from the first run should be there"
+    );
+    assert_eq!(
+        plan.totals().deletes,
+        1,
+        "the removal should propagate now that there is history: {:?}",
+        plan.rows
+            .iter()
+            .filter(|r| r.needs_review())
+            .map(|r| (&r.path, r.action, r.reason))
+            .collect::<Vec<_>>()
+    );
+
+    h.apply();
+    assert!(
+        !h.right().join("a").exists(),
+        "a file deleted on one side should go from the other"
+    );
+    assert!(h.right().join("b").exists(), "and the untouched file stays");
+}
+
+/// Both sides edited: a conflict, and nothing runs until it is settled.
+#[test]
+fn both_sides_changed_is_a_conflict_that_blocks_the_plan() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "original", 1_000_000);
+    h.refresh();
+    h.press("sb");
+    h.apply();
+    h.dismiss();
+
+    // Diverge: different content on each side, both newer than the snapshot.
+    write(&h.left().join("a"), "local edit", 2_000_000);
+    write(&h.right().join("a"), "remote edit!", 3_000_000);
+    h.refresh();
+
+    h.press("sb");
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert_eq!(plan.totals().conflicts, 1, "{:?}", plan.rows);
+    assert_eq!(plan.totals().undecided, 1);
+    assert!(
+        !plan.can_apply(),
+        "an undecided conflict must block the whole plan rather than being skipped quietly"
+    );
+}
+
+/// Resolving one unblocks it, and the chosen side wins.
+#[test]
+fn resolving_a_conflict_keeps_the_side_you_chose() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "original", 1_000_000);
+    h.refresh();
+    h.press("sb");
+    h.apply();
+    h.dismiss();
+
+    write(&h.left().join("a"), "local edit", 2_000_000);
+    write(&h.right().join("a"), "remote edit!", 3_000_000);
+    h.refresh();
+    h.press("sb");
+
+    // Move to the conflict row and keep the local copy.
+    let cursor = conflict_cursor(&h);
+    h.app.plan_cursor = cursor;
+    h.press("L");
+
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert_eq!(plan.totals().undecided, 0);
+    assert!(
+        plan.can_apply(),
+        "a settled conflict should no longer block"
+    );
+
+    h.apply();
+    assert_eq!(
+        fs::read_to_string(h.right().join("a")).unwrap(),
+        "local edit",
+        "keeping the local copy writes it to the remote"
+    );
+    assert_eq!(
+        fs::read_to_string(h.left().join("a")).unwrap(),
+        "local edit",
+        "and leaves the local side alone"
+    );
+}
+
+/// The other direction, to prove the choice is read rather than assumed.
+#[test]
+fn keeping_the_remote_copy_writes_it_locally() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "original", 1_000_000);
+    h.refresh();
+    h.press("sb");
+    h.apply();
+    h.dismiss();
+
+    write(&h.left().join("a"), "local edit", 2_000_000);
+    write(&h.right().join("a"), "remote edit!", 3_000_000);
+    h.refresh();
+    h.press("sb");
+
+    h.app.plan_cursor = conflict_cursor(&h);
+    h.press("R");
+    h.apply();
+
+    assert_eq!(
+        fs::read_to_string(h.left().join("a")).unwrap(),
+        "remote edit!"
+    );
+}
+
+/// Deferring is a real choice: nothing moves, and neither side is touched.
+#[test]
+fn leaving_a_conflict_alone_changes_nothing() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "original", 1_000_000);
+    h.refresh();
+    h.press("sb");
+    h.apply();
+    h.dismiss();
+
+    write(&h.left().join("a"), "local edit", 2_000_000);
+    write(&h.right().join("a"), "remote edit!", 3_000_000);
+    h.refresh();
+    h.press("sb");
+
+    h.app.plan_cursor = conflict_cursor(&h);
+    h.press("X");
+
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert_eq!(plan.totals().undecided, 0);
+    assert_eq!(
+        plan.totals().conflict_ops,
+        0,
+        "leaving it alone must not be counted as work"
+    );
+
+    assert_eq!(
+        fs::read_to_string(h.left().join("a")).unwrap(),
+        "local edit"
+    );
+    assert_eq!(
+        fs::read_to_string(h.right().join("a")).unwrap(),
+        "remote edit!"
+    );
+}
+
+/// Keep-both loses nothing, and the pair **converges**.
+///
+/// The winner lands at the original name on both sides and the displaced copy
+/// is renamed aside next to itself. Leaving each side its own version at the
+/// original name would be the obvious reading of "keep both" and is wrong: the
+/// two sides would stay different and raise the same conflict for ever.
+#[test]
+fn keeping_both_preserves_the_displaced_copy_and_converges() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "original", 1_000_000);
+    h.refresh();
+    h.press("sb");
+    h.apply();
+    h.dismiss();
+
+    write(&h.left().join("a"), "local edit", 2_000_000);
+    write(&h.right().join("a"), "remote edit!", 3_000_000);
+    h.refresh();
+    h.press("sb");
+
+    h.app.plan_cursor = conflict_cursor(&h);
+    h.press("B");
+    h.apply();
+
+    // Both sides agree on `a`, so the next run has nothing to raise.
+    assert_eq!(
+        fs::read_to_string(h.left().join("a")).unwrap(),
+        "local edit"
+    );
+    assert_eq!(
+        fs::read_to_string(h.right().join("a")).unwrap(),
+        "local edit",
+        "the winner has to reach both sides, or the pair never converges"
+    );
+
+    // And the version that lost is still there, under its own name.
+    let displaced = h.right().join("a.lazysync-conflict");
+    assert!(
+        displaced.exists(),
+        "keep-both must not lose the copy it displaced; {:?}",
+        walk(&h.right())
+    );
+    assert_eq!(
+        fs::read_to_string(&displaced).unwrap(),
+        "remote edit!",
+        "and it must be the remote's version, not a copy of the winner"
+    );
+}
+
+/// A second bisync of an unchanged pair finds nothing to do. The two-way
+/// version of the property that matters most: a sync that keeps re-copying is
+/// a sync nobody trusts.
+#[test]
+fn a_second_bisync_of_an_unchanged_pair_finds_nothing() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a"), "x", 1_000_000);
+    write(&h.right().join("b"), "y", 1_000_000);
+    h.refresh();
+
+    h.press("sb");
+    h.apply();
+    h.dismiss();
+
+    h.refresh();
+    h.press("sb");
+
+    assert!(
+        h.app.plan.is_none(),
+        "a settled pair should report nothing to do rather than opening a window: {:?}",
+        h.app.plan.as_ref().map(|p| p
+            .rows
+            .iter()
+            .filter(|r| r.needs_review())
+            .map(|r| (r.path.clone(), r.action, r.reason))
+            .collect::<Vec<_>>())
+    );
+    assert!(h.app.status.contains("already match"), "{}", h.app.status);
+}
+
+/// Where the cursor has to be for a resolution key to apply.
+fn conflict_cursor(h: &Harness) -> usize {
+    let plan = h.app.plan.as_ref().expect("a plan");
+    let entries = lazysync::ui::confirm::entries(plan, &h.app.folded);
+    entries
+        .iter()
+        .position(|e| match e {
+            lazysync::ui::confirm::Entry::Row { row, .. } => {
+                matches!(row.action, lazysync::sync::Action::Conflict)
+            }
+            _ => false,
+        })
+        .expect("a conflict row in the list")
 }
 
 fn walk(root: &Path) -> Vec<std::path::PathBuf> {

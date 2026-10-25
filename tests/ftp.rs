@@ -317,6 +317,7 @@ fn a_push_over_ftp_transfers_files() {
             diff::{self, Direction},
             executor,
             safety::DeletePolicy,
+            transfer::Settings,
         },
         vfs::LocalFs,
     };
@@ -376,8 +377,7 @@ fn a_push_over_ftp_transfers_files() {
         &mut remote,
         &remote_root,
         &plan,
-        &DeletePolicy::Remove,
-        ".lazysync-part",
+        &Settings::transient(DeletePolicy::Remove),
     );
 
     assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
@@ -430,6 +430,7 @@ fn a_second_push_over_ftp_finds_nothing_to_do() {
             diff::{self, Direction},
             executor,
             safety::DeletePolicy,
+            transfer::Settings,
         },
         vfs::LocalFs,
     };
@@ -481,8 +482,7 @@ fn a_second_push_over_ftp_finds_nothing_to_do() {
         &mut remote,
         &remote_root,
         &first,
-        &DeletePolicy::Remove,
-        ".lazysync-part",
+        &Settings::transient(DeletePolicy::Remove),
     );
     assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
 
@@ -552,7 +552,10 @@ fn the_declared_mtime_granularity_covers_what_list_loses() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let cases = [("recent.txt", today / 60 * 60 + 17), ("old.txt", 1_700_000_017)];
+    let cases = [
+        ("recent.txt", today / 60 * 60 + 17),
+        ("old.txt", 1_700_000_017),
+    ];
 
     for (name, epoch) in cases {
         std::fs::write(server.root.join(name), b"xxxxx").unwrap();

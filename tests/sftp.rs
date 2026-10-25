@@ -537,6 +537,7 @@ fn a_push_over_sftp_transfers_and_preserves_timestamps() {
             diff::{self, Direction},
             executor,
             safety::DeletePolicy,
+            transfer::Settings,
         },
         vfs::LocalFs,
     };
@@ -610,8 +611,7 @@ fn a_push_over_sftp_transfers_and_preserves_timestamps() {
             &mut remote,
             &server.served,
             &plan,
-            &DeletePolicy::Remove,
-            ".lazysync-part",
+            &Settings::transient(DeletePolicy::Remove),
         );
 
         assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
@@ -664,6 +664,7 @@ fn a_second_push_over_sftp_finds_nothing_to_do() {
             diff::{self, Direction},
             executor,
             safety::DeletePolicy,
+            transfer::Settings,
         },
         vfs::LocalFs,
     };
@@ -723,8 +724,7 @@ fn a_second_push_over_sftp_finds_nothing_to_do() {
             &mut remote,
             &server.served,
             &first,
-            &DeletePolicy::Remove,
-            ".lazysync-part",
+            &Settings::transient(DeletePolicy::Remove),
         );
         assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
 
@@ -761,4 +761,166 @@ fn an_unreachable_host_fails_rather_than_hanging() {
         "took {:?}, which is past the connect timeout",
         started.elapsed()
     );
+}
+
+/// Bisync over a real SSH connection, including a deletion propagating.
+///
+/// The local-to-local tests cover the classification matrix; this covers what
+/// only a network backend exercises. Two things in particular: the per-row
+/// direction has to survive a plan whose two sides are different *kinds* of
+/// backend, and the snapshot has to record what actually landed on the remote
+/// rather than what was sent -- which is where a backend that rounds or drops
+/// a timestamp would make the next run see a phantom edit.
+#[test]
+fn a_bisync_over_sftp_moves_both_ways_and_then_settles() {
+    use lazysync::{
+        config::Config,
+        sync::{
+            bisync, diff, executor,
+            safety::DeletePolicy,
+            state::{Record, Snapshot},
+            transfer::Settings,
+        },
+        vfs::LocalFs,
+    };
+
+    let server = server!();
+
+    with_home(&server.home, || {
+        let (_, key) = hostkey::verify(
+            "127.0.0.1",
+            server.port,
+            std::time::Duration::from_secs(10),
+            Some(&server.known_hosts()),
+        )
+        .expect("verification");
+        hostkey::remember(&key, Some(&server.known_hosts())).expect("recording");
+
+        let mut remote = ssh::open(&server.target(), None).expect("open");
+        let mut local = LocalFs::new();
+        let config = Config::default();
+
+        let local_dir = server.work.join("bisync-local");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::write(local_dir.join("from-local.txt"), b"L").unwrap();
+        std::fs::write(server.served.join("from-remote.txt"), b"R").unwrap();
+
+        // The snapshot is built in memory rather than read from disk: this
+        // test is about the planner and executor over a real connection, not
+        // about where the file lives.
+        let mut snapshot = Snapshot::new(&local_dir, "sftp://127.0.0.1/served");
+
+        let build = |local: &mut LocalFs,
+                     remote: &mut lazysync::vfs::RemoteAdapter,
+                     snapshot: &Snapshot| {
+            bisync::plan(
+                diff::Endpoint {
+                    fs: local,
+                    root: &local_dir,
+                    label: "local".into(),
+                },
+                diff::Endpoint {
+                    fs: remote,
+                    root: &server.served,
+                    label: "remote".into(),
+                },
+                snapshot,
+                &config,
+                &Default::default(),
+            )
+        };
+
+        // ── First run: each side's file crosses to the other ──────────────
+        let plan = build(&mut local, &mut remote, &snapshot);
+        assert!(plan.bidirectional);
+        assert!(plan.first_run);
+        assert_eq!(
+            plan.totals().deletes,
+            0,
+            "a first bisync has no basis for calling anything a deletion"
+        );
+
+        let report = executor::apply(
+            &mut local,
+            &local_dir,
+            &mut remote,
+            &server.served,
+            &plan,
+            &Settings::transient(DeletePolicy::Remove),
+        );
+        assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
+
+        // Checked on the server's own disk, not through the client that wrote
+        // it: a backend that misreported what it did would otherwise agree
+        // with itself.
+        assert_eq!(
+            std::fs::read_to_string(server.served.join("from-local.txt")).unwrap(),
+            "L",
+            "the local file should have reached the remote"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local_dir.join("from-remote.txt")).unwrap(),
+            "R",
+            "and the remote file the local side -- the direction a one-way plan cannot express"
+        );
+
+        // Record the pair's state as the app does, from what is now on disk.
+        for name in ["from-local.txt", "from-remote.txt"] {
+            let here = local.stat(&local_dir.join(name)).expect("local stat");
+            let there = remote.stat(&server.served.join(name)).expect("remote stat");
+            snapshot.insert(
+                std::path::Path::new(name),
+                Record::from_entries(&here, &there),
+            );
+        }
+        snapshot.taken = Some(chrono::Utc::now());
+
+        // ── Second run: nothing to do ─────────────────────────────────────
+        let settled = build(&mut local, &mut remote, &snapshot);
+        assert_eq!(
+            settled.totals().operations(),
+            0,
+            "a settled pair must not re-copy: {:?}",
+            settled
+                .rows
+                .iter()
+                .filter(|r| r.needs_review())
+                .map(|r| (&r.path, r.action, r.reason))
+                .collect::<Vec<_>>()
+        );
+
+        // ── Third run: a deletion propagates to the remote ────────────────
+        std::fs::remove_file(local_dir.join("from-remote.txt")).unwrap();
+
+        let plan = build(&mut local, &mut remote, &snapshot);
+        assert_eq!(
+            plan.totals().deletes,
+            1,
+            "with history, a removal on one side should propagate: {:?}",
+            plan.rows
+                .iter()
+                .filter(|r| r.needs_review())
+                .map(|r| (&r.path, r.action, r.reason))
+                .collect::<Vec<_>>()
+        );
+
+        let report = executor::apply(
+            &mut local,
+            &local_dir,
+            &mut remote,
+            &server.served,
+            &plan,
+            &Settings::transient(DeletePolicy::Remove),
+        );
+        assert_eq!(report.failures().count(), 0, "{:?}", report.applied);
+
+        assert!(
+            !server.served.join("from-remote.txt").exists(),
+            "the deletion should have reached the remote"
+        );
+        assert!(
+            server.served.join("from-local.txt").exists(),
+            "and the untouched file should still be there"
+        );
+    });
 }

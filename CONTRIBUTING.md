@@ -47,6 +47,16 @@ confusing every time.
   it can do; code that assumes mtimes exist breaks on S3. When a plan can't
   preserve something, it has to say so in the row rather than silently
   proceeding.
+- **Direction is per row, never per plan.** `Row::target_pane` names the side
+  that changes, and bisync relies on one plan carrying rows that go both ways.
+  Anything that re-derives a destination from a plan-wide root, or sorts the
+  two endpoints into a "source" and a "destination" before the row is in hand,
+  is a bug waiting to happen — both of phase 6's worst ones were exactly that,
+  and both reported success while writing to the wrong side.
+- **When both sides changed, do not guess.** Preferring the newer file is the
+  tempting shortcut and it discards somebody's edit silently, on the strength
+  of two clocks that may disagree by more than the edits do. It becomes a
+  conflict, and the plan refuses to run until a human settles it.
 - **Protocol work needs a real server.** `tests/fixtures/sshd.sh` and
   `tests/fixtures/ftpd.sh` each start one on loopback, as you, on a high port,
   serving a throwaway tree; the dev shell provides `openssh`, `pyftpdlib` and

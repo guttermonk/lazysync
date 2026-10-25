@@ -31,7 +31,7 @@ use crate::{
     app::App,
     config::Palette,
     sync::{
-        plan::{Action, Plan, Row, Section, Side},
+        plan::{Action, Plan, Resolution, Row, Section, Side},
         safety::DeletePolicy,
     },
 };
@@ -200,7 +200,17 @@ fn draw_header(
                 shorten_path(&plan.source_root.display().to_string(), width),
                 Style::default().fg(palette.fg),
             ),
-            Span::styled("  \u{2192}  ", Style::default().fg(palette.accent)),
+            // A two-way arrow for a bisync. "local -> remote" would be a
+            // false description of a plan whose rows go both ways, and the
+            // header is the first thing read.
+            Span::styled(
+                if plan.bidirectional {
+                    "  \u{21c4}  "
+                } else {
+                    "  \u{2192}  "
+                },
+                Style::default().fg(palette.accent),
+            ),
             Span::styled(
                 shorten_path(&plan.dest_root.display().to_string(), width),
                 Style::default().fg(palette.fg),
@@ -238,7 +248,9 @@ fn heading_row<'a>(
     palette: &Palette,
 ) -> TableRow<'a> {
     let color = match section {
-        Section::Delete => palette.danger,
+        // Conflicts are the same red as deletions, because that is what they
+        // can cost: a decision made carelessly here discards one side's work.
+        Section::Delete | Section::Conflict => palette.danger,
         Section::Overwrite => palette.warn,
         Section::Create => palette.ok,
         Section::Skipped => palette.dim,
@@ -272,12 +284,27 @@ fn plan_row<'a>(row: &Row, palette: &Palette, width: u16) -> TableRow<'a> {
         Action::Overwrite => palette.warn,
         Action::Create | Action::CreateDir => palette.ok,
         Action::Skip => palette.dim,
+        // An undecided conflict is the thing stopping the plan, so it stays
+        // red until it is settled; once settled it is an ordinary overwrite.
+        Action::Conflict if row.is_undecided() => palette.danger,
+        Action::Conflict => palette.warn,
     };
 
     // Direction is in the glyph: an arrow down means the thing replacing is
     // the older of the two.
     let glyph = if danger {
         "\u{2193}"
+    } else if matches!(row.action, Action::Conflict) {
+        // Once resolved, show which way it will move -- the arrow is the only
+        // thing on the row that distinguishes keep-local from keep-remote at a
+        // glance.
+        match row.resolution {
+            Some(Resolution::KeepLocal) => "\u{2192}",
+            Some(Resolution::KeepRemote) => "\u{2190}",
+            Some(Resolution::KeepBoth) => "\u{2194}",
+            Some(Resolution::Skip) => "\u{00b7}",
+            _ => row.action.glyph(),
+        }
     } else {
         row.action.glyph()
     };
@@ -308,13 +335,33 @@ fn plan_row<'a>(row: &Row, palette: &Palette, width: u16) -> TableRow<'a> {
             shorten_path(&row.path.display().to_string(), path_width),
             path_style,
         ))),
-        Cell::from(side(row.source, palette, row.included)),
-        Cell::from(side(row.dest, palette, row.included)),
+        // By *pane*, not by role. The columns are "local" and "remote", and a
+        // bisync plan has rows pointing both ways -- rendering `source` then
+        // `dest` would put the remote file in the left-hand column for every
+        // row that happens to be pulling, so the two columns would mean
+        // different things on different lines.
+        Cell::from(side(row.side_of(0), palette, row.included)),
+        Cell::from(side(row.side_of(1), palette, row.included)),
     ];
 
     // The rightmost column: why, and by how much.
     let mut detail = Vec::new();
-    if danger {
+    if let Some(resolution) = row.resolution {
+        // A conflict shows its decision, or the lack of one. The reason it is
+        // a conflict is already in the row's glyph and section; what the user
+        // needs here is what they have chosen.
+        let (text, color) = match resolution {
+            Resolution::Pending => (
+                format!("{} \u{2014} L/R/B/X", row.reason.describe()),
+                palette.danger,
+            ),
+            settled => (settled.label().to_string(), palette.ok),
+        };
+        detail.push(Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    } else if danger {
         detail.push(Span::styled(
             row.reason.describe().to_string(),
             Style::default()
@@ -426,6 +473,21 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, plan: &Plan, palette: &Palette,
                 Style::default().fg(palette.dim),
             ));
         }
+        if totals.conflicts > 0 {
+            parts.push(Span::styled(
+                format!(" \u{b7} {} conflict(s)", totals.conflicts),
+                Style::default().fg(palette.danger),
+            ));
+        }
+        if totals.undecided > 0 {
+            // The reason `y` will not work, said where the eye already is.
+            parts.push(Span::styled(
+                format!(" \u{b7} {} UNDECIDED", totals.undecided),
+                Style::default()
+                    .fg(palette.danger)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if totals.clobbers_newer > 0 {
             parts.push(Span::styled(
                 format!(
@@ -463,9 +525,28 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, plan: &Plan, palette: &Palette,
         )));
     }
 
-    lines.push(Line::from(Span::styled(
+    // A first bisync behaves differently, and the difference is a safety
+    // property rather than a detail: with no snapshot there is no evidence
+    // that anything was deleted rather than created, so nothing is.
+    if plan.first_run {
+        lines.push(Line::from(Span::styled(
+            " first sync of this pair: nothing will be deleted, since a file on one side only              is as likely to be new as removed",
+            Style::default().fg(palette.warn),
+        )));
+    }
+
+    // The resolution keys are offered only when there is something to
+    // resolve. A footer listing four keys that do nothing is a footer nobody
+    // reads the useful half of.
+    let keys = if totals.conflicts > 0 {
+        " y apply \u{b7} n cancel \u{b7} space include/exclude \u{b7} L keep local \u{b7} \
+         R keep remote \u{b7} B keep both \u{b7} X leave alone \u{b7} ? help"
+    } else {
         " y apply \u{b7} n cancel \u{b7} space include/exclude \u{b7} a all \u{b7} i invert \
-         \u{b7} o only \u{b7} zc/zo fold \u{b7} ? help",
+         \u{b7} o only \u{b7} zc/zo fold \u{b7} ? help"
+    };
+    lines.push(Line::from(Span::styled(
+        keys,
         Style::default().fg(palette.dim),
     )));
 
@@ -502,13 +583,14 @@ mod tests {
     fn sample() -> Plan {
         let mut p = Plan {
             rows: vec![
-                plan::create_row("new.txt".into(), &entry(100, Some(1)), Method::SizeMtime),
+                plan::create_row("new.txt".into(), &entry(100, Some(1)), Method::SizeMtime, 1),
                 plan::compare_row(
                     "changed.txt".into(),
                     &entry(200, Some(2000)),
                     &entry(150, Some(1000)),
                     Reason::SizeDiffers,
                     Method::SizeMtime,
+                    1,
                 ),
                 plan::compare_row(
                     "danger.txt".into(),
@@ -516,14 +598,16 @@ mod tests {
                     &entry(50, Some(9000)),
                     Reason::DestinationNewer,
                     Method::SizeMtime,
+                    1,
                 ),
-                plan::delete_row("gone.txt".into(), &entry(30, Some(1)), Method::SizeMtime),
+                plan::delete_row("gone.txt".into(), &entry(30, Some(1)), Method::SizeMtime, 1),
                 plan::compare_row(
                     "same.txt".into(),
                     &entry(10, Some(1)),
                     &entry(10, Some(1)),
                     Reason::SameSizeAndTime,
                     Method::SizeMtime,
+                    1,
                 ),
             ],
             ..Plan::default()
@@ -566,6 +650,7 @@ mod tests {
                 "a".into(),
                 &entry(1, Some(1)),
                 Method::SizeMtime,
+                1,
             )],
             ..Plan::default()
         };
