@@ -25,7 +25,7 @@ clap = { version = "4.5", features = ["derive"] }
 
 # Config, bookmarks, sync profiles, themes
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 
 # The bisync state snapshot, and only that. Not TOML like everything else
 # above, for two reasons: the snapshot is a machine-written index that can run
