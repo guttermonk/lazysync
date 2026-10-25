@@ -185,7 +185,18 @@ pub fn usable(tool: Tool, plan: &Plan, endpoints: &Endpoints) -> Result<(), Unus
     if !external::available(tool.program()) {
         return Err(Unusable::NotInstalled(tool.program()));
     }
+    suits(tool, plan, endpoints)
+}
 
+/// Whether `tool` *could* run this plan, setting aside whether it is
+/// installed.
+///
+/// Split out from [`usable`] because the two are different questions and
+/// conflating them made the tests lie: every check below was unreachable
+/// wherever the tool happened to be absent, so a suite that passed in the dev
+/// shell failed inside the Nix sandbox -- which has no rsync on `PATH` --
+/// reporting `NotInstalled` for seven cases that were testing the logic here.
+pub fn suits(tool: Tool, plan: &Plan, endpoints: &Endpoints) -> Result<(), Unusable> {
     // A delegated run only moves bytes. With nothing to move there is nothing
     // to delegate, and spawning a tool to copy no files would be pure
     // overhead.
@@ -642,7 +653,7 @@ mod tests {
     /// prompt for it again over the TUI.
     #[test]
     fn a_password_session_is_never_delegated() {
-        let why = usable(Tool::Rsync, &push_plan(), &ssh_pair(true)).unwrap_err();
+        let why = suits(Tool::Rsync, &push_plan(), &ssh_pair(true)).unwrap_err();
         assert_eq!(why, Unusable::NeedsPassword);
     }
 
@@ -654,7 +665,7 @@ mod tests {
             local: Some(Spec::Local("/home/greg/proj".into())),
             remote: None,
         };
-        let why = usable(Tool::Rsync, &push_plan(), &endpoints).unwrap_err();
+        let why = suits(Tool::Rsync, &push_plan(), &endpoints).unwrap_err();
         assert!(matches!(why, Unusable::CannotAddress { .. }), "{why:?}");
     }
 
@@ -677,7 +688,7 @@ mod tests {
             remote: remote("b"),
         };
         assert_eq!(
-            usable(Tool::Rsync, &push_plan(), &endpoints).unwrap_err(),
+            suits(Tool::Rsync, &push_plan(), &endpoints).unwrap_err(),
             Unusable::UnsupportedPair
         );
     }
@@ -702,7 +713,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            usable(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
+            suits(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
             Unusable::UnsupportedPair
         );
     }
@@ -718,7 +729,7 @@ mod tests {
             1,
         )]);
         assert_eq!(
-            usable(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
+            suits(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
             Unusable::NothingToTransfer
         );
     }
@@ -730,7 +741,7 @@ mod tests {
         let mut plan = push_plan();
         plan.rows[0].included = false;
         assert_eq!(
-            usable(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
+            suits(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
             Unusable::NothingToTransfer
         );
     }
@@ -747,7 +758,7 @@ mod tests {
             crate::sync::Method::SizeMtime,
         )]);
         assert_eq!(
-            usable(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
+            suits(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
             Unusable::NothingToTransfer
         );
     }

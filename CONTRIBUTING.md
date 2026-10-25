@@ -7,9 +7,24 @@ nix develop        # or `direnv allow`, which does the same via .envrc
 cargo test
 ```
 
-Without Nix: a stable Rust toolchain (see `rust-toolchain.toml`), `pkg-config`
-and `openssl`. `rsync` and `rclone` are optional at runtime and only needed to
-exercise those executors.
+Without Nix, on Linux: a stable Rust toolchain (see `rust-toolchain.toml`),
+`pkg-config`, `openssl`, and **`libdbus-1-dev`** — `keyring`'s Secret Service
+backend links libdbus, and without its headers `libdbus-sys` fails at
+pkg-config before any of lazysync compiles. On Debian or Ubuntu:
+
+```sh
+sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev
+```
+
+macOS needs none of that: it uses the Keychain.
+
+That omission is worth stating loudly because it cost five red CI jobs.
+`flake.nix` carries `dbus` in `buildInputs`, so every build anyone ran
+locally had it and the failure was invisible until a plain Ubuntu runner
+tried.
+
+`rsync` and `rclone` are optional at runtime. `rclone` is also what
+`rclone://` remotes need, so without it those bookmarks will not open.
 
 ## Before opening a PR
 
@@ -53,6 +68,17 @@ confusing every time.
   two endpoints into a "source" and a "destination" before the row is in hand,
   is a bug waiting to happen — both of phase 6's worst ones were exactly that,
   and both reported success while writing to the wrong side.
+- **A test must not assume its environment.** Three separate CI failures came
+  from tests that quietly depended on where they ran: one asserted `sh` was on
+  `PATH`, seven asserted a `delegate` reason that is unreachable unless rsync
+  is installed, and one asserted that a filesystem-event backend reports
+  exactly one path per changed file — true of inotify, false of FSEvents. All
+  three passed in the dev shell, which is why they survived.
+
+  Two rules follow. Assert the property *lazysync* guarantees, not the one the
+  platform happens to provide. And where a check depends on an external tool,
+  separate "is it installed" from "would it work", so the second is testable
+  without the first — see `delegate::suits` next to `delegate::usable`.
 - **When both sides changed, do not guess.** Preferring the newer file is the
   tempting shortcut and it discards somebody's edit silently, on the strength
   of two clocks that may disagree by more than the edits do. It becomes a

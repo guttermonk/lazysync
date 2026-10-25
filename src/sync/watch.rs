@@ -18,6 +18,20 @@
 //! as nothing at all -- and would make the watcher's output differ from what
 //! `sp` would do on the same trees. One planner, one answer.
 //!
+//! That is also why **what a platform reports does not have to be precise**.
+//! inotify names the changed file; FSEvents is directory-granular and reports
+//! the containing directory alongside it. Either is fine, because a path only
+//! ever decides *whether* to plan and feeds the status line's count. A path
+//! that turns out to be uninteresting produces a plan with nothing in it, the
+//! batch is cleared, and the watcher goes quiet -- so the imprecision costs
+//! one wasted plan and cannot loop.
+//!
+//! **Three separate things stop a sync triggering the next one.** Partial and
+//! backup files are filtered by name ([`is_ours`]); `App::step_watch` does
+//! nothing while a transfer is in flight, so a sync cannot observe its own
+//! writes as they happen; and a batch is taken before its plan is built, so
+//! even a plan that finds nothing ends the cycle rather than re-arming it.
+//!
 //! **A watcher that applies without confirming is a different promise** from
 //! the rest of lazysync, so it is a separate setting
 //! ([`crate::config::Watch::Auto`]) and it keeps the safety rails: a plan that
@@ -241,30 +255,78 @@ mod tests {
         assert!(ready, "the batch should be ready once the tree is quiet");
     }
 
-    /// A burst touching one file forty times is one path, so one plan.
+    /// A burst touching one file forty times collapses into one *batch*, and
+    /// into far fewer paths than there were writes.
+    ///
+    /// Deliberately not asserting exactly one path. That is a fact about what
+    /// the platform reports, not about lazysync: inotify names the file, while
+    /// FSEvents is directory-granular and adds the containing directory
+    /// alongside it -- so this asserted 1 and got 2 on macOS, failing CI for a
+    /// difference that changes nothing. What lazysync promises is that a burst
+    /// does not become a plan per event, and that is what is checked.
+    ///
+    /// The extra path is harmless even when it is a directory. It makes the
+    /// status line say "2 changes" instead of 1, and nothing else: the paths
+    /// are never what the planner syncs -- it walks the trees -- so an
+    /// uninteresting path produces a plan with nothing in it, the batch is
+    /// cleared, and the watcher goes quiet again.
     #[test]
-    fn repeated_changes_to_one_file_collapse_into_one_path() {
+    fn a_burst_of_writes_collapses_into_one_batch() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = watcher(dir.path(), 50);
 
         let path = dir.path().join("busy.txt");
-        for i in 0..40 {
+        const WRITES: usize = 40;
+        for i in 0..WRITES {
             std::fs::write(&path, format!("{i}")).unwrap();
         }
 
         assert!(wait_for_pending(&mut w));
         // Settle, then count.
+        let mut ready = false;
         for _ in 0..100 {
             if w.poll() {
+                ready = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        assert!(ready, "the burst should have produced a batch");
+        assert!(
+            w.pending_count() < WRITES,
+            "forty writes must not become forty paths to sync: got {}",
+            w.pending_count()
+        );
+
+        // And it is *one* batch: taking it leaves nothing behind, so the
+        // burst produces one plan rather than one per write.
+        let batch = w.take();
+        assert!(!batch.is_empty());
+        assert!(!w.poll(), "the burst was one batch, and it has been taken");
+    }
+
+    /// Deduplication itself, with no filesystem in the way.
+    ///
+    /// The test above can only assert a bound, because how many paths an
+    /// event burst produces is the platform's business. This pins the part
+    /// that is lazysync's: the same path arriving repeatedly is stored once.
+    #[test]
+    fn the_same_path_arriving_repeatedly_is_stored_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = watcher(dir.path(), 10_000);
+
+        // Injected directly, so the count is not at the mercy of inotify
+        // versus FSEvents.
+        for _ in 0..40 {
+            w.pending.insert(PathBuf::from("busy.txt"));
+        }
+        w.pending.insert(PathBuf::from("other.txt"));
+
         assert_eq!(
             w.pending_count(),
-            1,
-            "forty writes to one file is one path to sync"
+            2,
+            "a set, so forty arrivals of one path are one entry"
         );
     }
 
@@ -281,20 +343,31 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_file_does_not_make_a_batch_ready() {
+    fn a_partial_file_is_never_queued() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = watcher(dir.path(), 20);
 
         std::fs::write(dir.path().join("a.txt.lazysync-part"), b"in flight").unwrap();
 
-        // Give inotify a chance, then confirm nothing is pending.
-        for _ in 0..30 {
+        // Give the platform a chance to deliver.
+        for _ in 0..50 {
             w.poll();
             std::thread::sleep(Duration::from_millis(10));
         }
+
+        // The assertion is that the partial file is not among the pending
+        // paths -- not that nothing at all is pending. A directory-granular
+        // backend reports the containing directory too, and that path is
+        // harmless: see the module docs. Asserting "nothing pending" would
+        // make this fail on macOS for something that is not a bug.
         assert!(
-            !w.has_pending(),
-            "a transfer's own partial file must not trigger the next sync"
+            w.pending.iter().all(|p| !is_ours(p)),
+            "a transfer's own output must never be queued: {:?}",
+            w.pending
+        );
+        assert!(
+            !w.pending.iter().any(|p| p.ends_with("a.txt.lazysync-part")),
+            "the partial file itself reached the queue"
         );
     }
 

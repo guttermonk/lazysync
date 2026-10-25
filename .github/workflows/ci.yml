@@ -20,6 +20,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # `keyring`'s Secret Service backend links libdbus, and the GitHub
+      # runner does not ship its headers. Linux only: macOS uses the Keychain
+      # and needs nothing.
+      #
+      # This is why the Nix job was green while both Linux jobs failed --
+      # flake.nix has `dbus` in buildInputs, so the only build anyone ran
+      # locally had it.
+      - name: Install libdbus
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Install toolchain
         run: |
           rustup update --no-self-update ${{ matrix.toolchain }}
@@ -34,6 +47,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      # `keyring`'s Secret Service backend links libdbus, and the GitHub
+      # runner does not ship its headers. Linux only: macOS uses the Keychain
+      # and needs nothing.
+      #
+      # This is why the Nix job was green while both Linux jobs failed --
+      # flake.nix has `dbus` in buildInputs, so the only build anyone ran
+      # locally had it.
+      - name: Install libdbus
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Install toolchain
         run: |

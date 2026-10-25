@@ -286,13 +286,57 @@ mod tests {
         }
     }
 
-    /// A program that is certainly there, and one that certainly is not.
+    /// Availability is read off `PATH`, checked against a directory this test
+    /// builds rather than against whatever the environment happens to hold.
+    ///
+    /// It used to assert that `sh` was on `PATH` -- true nearly everywhere,
+    /// and so it looked safe. But a test whose premise is "the environment is
+    /// normal" fails exactly where testing matters, and this suite already
+    /// runs inside a Nix sandbox with a deliberately sparse `PATH`.
     #[test]
     fn availability_is_checked_against_path() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let program = dir.path().join("lazysync-test-tool");
+        std::fs::write(&program, b"#!/bin/sh\n").unwrap();
+
+        // Present on PATH but not executable, which is not the same as
+        // usable -- so the check has to look at the mode, not just the name.
+        let not_executable = dir.path().join("lazysync-test-not-exec");
+        std::fs::write(&not_executable, b"data").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+
+        let previous = std::env::var_os("PATH");
+        // SAFETY: the mutex above makes this the only thread touching PATH,
+        // and it is restored below before the guard drops.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+
+        let found = available("lazysync-test-tool");
+        let missing = available("lazysync-definitely-not-a-real-program");
+        let unexecutable = available("lazysync-test-not-exec");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert!(found, "an executable on PATH should be found");
+        assert!(!missing, "a name that is not there should not be");
+        #[cfg(unix)]
         assert!(
-            available("sh") || available("sh.exe"),
-            "sh should be on PATH"
+            !unexecutable,
+            "a non-executable file on PATH is not a usable program"
         );
-        assert!(!available("lazysync-definitely-not-a-real-program"));
     }
 }

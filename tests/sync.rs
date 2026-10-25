@@ -1427,8 +1427,13 @@ fn walk(root: &Path) -> Vec<std::path::PathBuf> {
 // ── Watch mode ──────────────────────────────────────────────────────────────
 
 /// Drive the watcher the way the main loop does, until it acts or gives up.
+///
+/// The budget is generous on purpose. inotify delivers in microseconds, but
+/// FSEvents on macOS batches with its own latency before notify sees anything
+/// -- and a loaded CI runner adds to that. A timing budget tuned to the fast
+/// platform is a test that fails on the slow one for no reason.
 fn pump_watch(h: &mut Harness) -> bool {
-    for _ in 0..300 {
+    for _ in 0..1_500 {
         h.app.step_watch();
         if h.app.plan.is_some() || h.app.transfer.is_some() {
             return true;
@@ -1545,9 +1550,18 @@ fn a_transfers_own_partial_file_does_not_trigger_another_sync() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    // No plan, and nothing transferred. A directory-granular backend may
+    // report the containing directory alongside the partial file, which is
+    // harmless -- the resulting plan finds the trees already in agreement and
+    // no plan is opened at all. What must never happen is the partial file
+    // being treated as content to sync.
     assert!(
         h.app.plan.is_none(),
         "a partial file is lazysync's own output, and syncing it would never stop"
+    );
+    assert!(
+        !h.right().join("a.txt.lazysync-part").exists(),
+        "and it must certainly never be transferred"
     );
 }
 
