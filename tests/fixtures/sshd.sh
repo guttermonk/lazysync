@@ -106,6 +106,31 @@ for _ in $(seq 50); do
     sleep 0.1
 done
 
+# **Confirm the server we started is the one on that port.**
+#
+# The port search above asks "is anything listening here" and then binds --
+# which is a race, because cargo runs these tests in parallel and two
+# fixtures can see the same port free at the same moment. One wins the bind
+# and the other's sshd exits.
+#
+# The loser's readiness probe then *succeeds*, because the winner is
+# listening on exactly that port. So the fixture would report success, hand
+# back a port it does not own, and the test would fail with "connection
+# refused" later -- once the winner finished and shut down. That is precisely
+# how `a_recorded_key_is_readable_by_ssh_keygen` failed on one CI job out of
+# four while passing everywhere else.
+#
+# sshd writes its pidfile only after it has bound, so the pidfile existing
+# and naming a live process is proof the port is ours. Failing here makes the
+# tests *skip*, which is the right answer for a fixture that could not start
+# -- far better than a flake nobody can reproduce.
+if [[ ! -f "$pidfile" ]] || ! kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    echo "sshd did not start on port $port (another process probably won the \
+bind):" >&2
+    cat "$work/sshd.log" >&2 || true
+    exit 1
+fi
+
 cat <<EOF
 export LAZYSYNC_TEST_SSH_PORT=$port
 export LAZYSYNC_TEST_SSH_USER=$(id -un)

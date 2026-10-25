@@ -259,6 +259,45 @@ pub fn suits(tool: Tool, plan: &Plan, endpoints: &Endpoints) -> Result<(), Unusa
     }
 }
 
+/// Whether the local rsync understands `--info=progress2`, i.e. is 3.1 or
+/// newer.
+///
+/// Probed rather than assumed. macOS ships rsync 2.6.9, which rejects the
+/// flag by printing its usage and exiting 1 -- so assuming it turned every
+/// delegated transfer on a Mac into a failure whose message was a wall of
+/// rsync's own help text.
+fn rsync_supports_progress2() -> bool {
+    let Ok(output) = Command::new("rsync").arg("--version").output() else {
+        return false;
+    };
+    supports_progress2(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Whether `rsync --version` output reports 3.1 or newer.
+///
+/// Split from the subprocess call so it is testable: the machine running
+/// these tests has rsync 3.5, so without this the old-rsync branch -- the one
+/// that exists *because* of a CI failure -- would never be exercised at all.
+/// Separating "run the tool" from "interpret the answer" is the same fix as
+/// `usable` versus `suits`.
+fn supports_progress2(version_output: &str) -> bool {
+    // "rsync  version 3.5.0  protocol version 32" -- the first dotted number
+    // on the first line.
+    let Some(version) = version_output
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().find(|word| word.contains('.')))
+    else {
+        return false;
+    };
+
+    let mut parts = version.split('.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+
+    major > 3 || (major == 3 && minor >= 1)
+}
+
 /// The rows a tool would move: creates, overwrites, and settled conflicts.
 fn transfers(plan: &Plan) -> impl Iterator<Item = &Row> {
     plan.rows.iter().filter(|row| {
@@ -322,18 +361,35 @@ impl Delegated {
                     // Keep a partial file on failure, which is what makes a
                     // retry cheap -- and matches what the native queue does.
                     "--partial",
-                    // The two flags that make rsync a transport rather than a
-                    // planner. See the module docs.
+                    // The flags that make rsync a transport rather than a
+                    // planner. See the module docs. All three date back to
+                    // rsync 2.6, so they are safe everywhere.
                     "--files-from=-",
                     "--from0",
                     "--ignore-times",
-                    // Machine-readable totals rather than a line per file.
-                    "--info=progress2",
-                    // Without this rsync builds its file list incrementally
-                    // and the totals in `progress2` climb as it goes, so the
-                    // percentage runs backwards.
-                    "--no-inc-recursive",
                 ]);
+
+                // Progress reporting is version-gated, and that is not
+                // fussiness: `--info=progress2` arrived in rsync 3.1 and
+                // `--no-inc-recursive` in 3.0, and macOS still ships 2.6.9 --
+                // where passing either makes rsync print its usage message
+                // and exit 1, so *every* delegated transfer failed. Found by
+                // CI on macOS, having passed on every Linux.
+                //
+                // Losing progress on an old rsync is a real cost but a small
+                // one. Losing the transfer is not acceptable, and silently
+                // using a flag the local rsync has never heard of is how that
+                // happens.
+                if rsync_supports_progress2() {
+                    command.args([
+                        // Machine-readable totals rather than a line per file.
+                        "--info=progress2",
+                        // Without this rsync builds its file list
+                        // incrementally and the totals in `progress2` climb as
+                        // it goes, so the percentage runs backwards.
+                        "--no-inc-recursive",
+                    ]);
+                }
                 if let Some(transport) = source.ssh_transport().or_else(|| dest.ssh_transport()) {
                     command.arg("-e").arg(transport);
                 }
@@ -761,6 +817,40 @@ mod tests {
             suits(Tool::Rsync, &plan, &local_pair()).unwrap_err(),
             Unusable::NothingToTransfer
         );
+    }
+
+    /// The versions that matter, including the one that caused the failure.
+    ///
+    /// macOS ships rsync 2.6.9, where `--info=progress2` makes rsync print
+    /// its usage and exit 1 -- so every delegated transfer on a Mac failed
+    /// with a wall of rsync help text. Passing the flag is gated on this
+    /// answer, so the answer has to be right for old versions too.
+    #[test]
+    fn the_progress_flag_is_gated_on_the_rsync_version() {
+        // macOS stock. The reason this function exists.
+        assert!(!supports_progress2(
+            "rsync  version 2.6.9  protocol version 29"
+        ));
+        // 3.0 has --no-inc-recursive but not --info=progress2.
+        assert!(!supports_progress2(
+            "rsync  version 3.0.9  protocol version 30"
+        ));
+
+        // 3.1 is where --info arrived.
+        assert!(supports_progress2(
+            "rsync  version 3.1.0  protocol version 31"
+        ));
+        assert!(supports_progress2(
+            "rsync  version 3.5.0  protocol version 32"
+        ));
+        assert!(supports_progress2("rsync  version 4.0.0"));
+
+        // Unparsable output is treated as too old. Losing progress on an
+        // rsync we cannot identify is a cosmetic loss; passing it a flag it
+        // may not have is a failed transfer.
+        assert!(!supports_progress2(""));
+        assert!(!supports_progress2("something else entirely"));
+        assert!(!supports_progress2("rsync version unknown"));
     }
 
     #[test]
