@@ -47,9 +47,21 @@
           # garage rather than minio for the S3 side: minio was removed from
           # nixpkgs after being abandoned upstream. rclone above doubles as the
           # S3 client, so there is no separate one here.
-          fixtures = with pkgs; [
-            openssh
-            garage
+          fixtures = [
+            pkgs.openssh
+            # pyftpdlib for the FTP side, not pure-ftpd or vsftpd. Both of
+            # those want root -- for the chroot jail and the setuid -- and a
+            # test fixture does not have it; pure-ftpd just exits 252 with
+            # nothing on stderr. pyftpdlib is a real server (real LIST, PASV,
+            # MFMT, the lot) built to run as an ordinary user, which is why
+            # it is what most FTP *clients* are tested against.
+            # pyopenssl alongside it: pyftpdlib's `--tls` refuses to start
+            # without it, and the FTPS tests then skip instead of running.
+            (pkgs.python3.withPackages (ps: [
+              ps.pyftpdlib
+              ps.pyopenssl
+            ]))
+            pkgs.garage
           ];
         in
         {

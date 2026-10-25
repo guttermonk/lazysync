@@ -13,37 +13,16 @@
 //! pessimistic: claiming a precision the server does not have is what makes a
 //! sync want to re-copy a tree that has not changed.
 
-use std::{
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::path::PathBuf;
 
-use remotefs::{
-    fs::{
-        Capabilities as RemoteCapabilities, File, FileType, ReadOptions, SetMetadata, UnixPex,
-        WriteOptions,
-    },
-    RemoteError, RemoteErrorType, RemoteFs,
-};
+use remotefs::RemoteFs;
 use remotefs_ssh::{ScpFs, SftpFs, SshAgentIdentity, SshKeyStorage, SshOpts};
 
-use super::{
-    Capabilities, Entry, EntryKind, ReadHandle, Vfs, VfsError, WriteHandle, WriteMetadata,
-};
+use super::{remote::RemoteAdapter, VfsError};
 use crate::{
     connection::{AuthMethod, Protocol, Secret, Target, CONNECT_TIMEOUT},
     vfs::hostkey::{self, HostKey, Verdict},
 };
-
-/// A connected SSH session, browsable as a filesystem.
-pub struct SshFs {
-    client: Box<dyn RemoteFs + Send>,
-    protocol: Protocol,
-    target: Target,
-    /// Where `GoHome` goes, resolved once at connect time.
-    home: Option<PathBuf>,
-}
 
 /// What the host key check found.
 ///
@@ -120,10 +99,10 @@ pub fn trust(key: &HostKey) -> Result<PathBuf, VfsError> {
 /// Assumes [`precheck`] has already approved the host key. `secret` is the
 /// password for [`AuthMethod::Password`], or a key passphrase for
 /// [`AuthMethod::Key`]; it is not retained after this call.
-pub fn open(target: &Target, secret: Option<&Secret>) -> Result<SshFs, VfsError> {
+pub fn open(target: &Target, secret: Option<&Secret>) -> Result<RemoteAdapter, VfsError> {
     let opts = build_opts(target, secret);
 
-    let mut client: Box<dyn RemoteFs + Send> = match target.protocol {
+    let client: Box<dyn RemoteFs + Send> = match target.protocol {
         Protocol::Sftp => Box::new(SftpFs::libssh2(opts)),
         Protocol::Scp => Box::new(ScpFs::libssh2(opts)),
         other => {
@@ -133,17 +112,17 @@ pub fn open(target: &Target, secret: Option<&Secret>) -> Result<SshFs, VfsError>
         }
     };
 
-    client.connect().map_err(|e| translate(e, "connecting"))?;
+    let mut adapter = RemoteAdapter::new(client, target.protocol, target.clone(), None);
+    adapter.connect_now()?;
 
-    let mut fs = SshFs {
-        client,
-        protocol: target.protocol,
-        target: target.clone(),
-        home: None,
-    };
-    fs.home = fs.resolve_home();
+    // SFTP has no "home" request, so this runs `pwd` over an exec channel --
+    // which is what the path is relative to on login. A server that allows
+    // SFTP but no exec (`ForceCommand internal-sftp`, which is common)
+    // answers nothing, and the root is used instead.
+    let home = adapter.probe_home_via_shell_pwd();
+    adapter.set_home(home);
 
-    Ok(fs)
+    Ok(adapter)
 }
 
 /// One key file, for every host.
@@ -225,543 +204,9 @@ fn build_opts(target: &Target, secret: Option<&Secret>) -> SshOpts {
     opts
 }
 
-impl SshFs {
-    pub fn target(&self) -> &Target {
-        &self.target
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.client.is_connected()
-    }
-
-    pub fn disconnect(&mut self) {
-        if let Err(e) = self.client.disconnect() {
-            // Worth a log line and nothing more: the session is being thrown
-            // away regardless.
-            tracing::debug!("disconnect from {}: {e}", self.target.display());
-        }
-    }
-
-    /// The remote home directory.
-    ///
-    /// SFTP has no "home" request, so this runs `pwd` over an exec channel --
-    /// which is what the path is relative to on login. A server that allows
-    /// SFTP but no exec (a `ForceCommand internal-sftp` setup, which is
-    /// common) returns nothing, and the root is used instead.
-    fn resolve_home(&mut self) -> Option<PathBuf> {
-        let output = self.client.exec("pwd").ok()?;
-        let path = output.stdout.trim();
-        if path.starts_with('/') {
-            Some(PathBuf::from(path))
-        } else {
-            tracing::debug!("`pwd` on {} gave {path:?}", self.target.display());
-            None
-        }
-    }
-}
-
-impl Vfs for SshFs {
-    fn scheme(&self) -> &str {
-        self.protocol.scheme()
-    }
-
-    fn display_path(&self, path: &Path) -> String {
-        // Host plus path, so the two panes cannot be confused for each other
-        // when both are showing `/srv/www`.
-        format!("{}:{}", self.target.host, path.display())
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        let remote = self.client.capabilities();
-
-        Capabilities {
-            // Both SFTP and SCP report mtimes.
-            mtime: true,
-            set_mtime: remote.contains(RemoteCapabilities::SET_METADATA),
-            mode: remote.contains(RemoteCapabilities::POSIX_MODE),
-            symlinks: remote.contains(RemoteCapabilities::SYMLINK),
-            // Resuming a partial transfer needs to write at an offset, which
-            // is seek-on-write rather than append.
-            ranged_writes: remote.contains(RemoteCapabilities::SEEK_WRITE),
-            // SFTP's rename refuses an existing target: OpenSSH answers
-            // SSH_FX_PERMISSION_DENIED rather than replacing it. Overwrites
-            // therefore go through the executor's swap path.
-            atomic_overwrite_rename: false,
-            // One second, not zero. The SFTP protocol carries whole-second
-            // mtimes in its base attribute set, and while version 4 added
-            // nanoseconds, plenty of servers do not send them. Claiming
-            // better precision than that is what makes every file look
-            // changed against a local filesystem.
-            mtime_granularity_secs: 1,
-        }
-    }
-
-    fn list(&mut self, path: &Path) -> Result<Vec<Entry>, VfsError> {
-        let files = self
-            .client
-            .list_dir(path)
-            .map_err(|e| translate(e, &format!("listing {}", path.display())))?;
-
-        Ok(files.iter().map(convert).collect())
-    }
-
-    fn is_dir(&mut self, path: &Path) -> bool {
-        // `stat` rather than `exists`, because synchronized browsing needs to
-        // know it is a *directory*: following the other pane into a path that
-        // happens to be a file would show an empty listing with no
-        // explanation.
-        match self.client.stat(path) {
-            Ok(file) => matches!(file.metadata.file_type, FileType::Directory),
-            Err(_) => false,
-        }
-    }
-
-    fn create_dir(&mut self, path: &Path) -> Result<(), VfsError> {
-        // 0o755, matching `mkdir` with a standard umask. The remote server
-        // applies its own umask on top.
-        let mode = UnixPex::from(0o755);
-
-        // remotefs creates one level only, so walk the missing ancestors.
-        // An existing directory is not an error here: two panes following
-        // each other can both ask for the same path.
-        let mut missing = Vec::new();
-        let mut current = Some(path);
-        while let Some(dir) = current {
-            if self.is_dir(dir) {
-                break;
-            }
-            missing.push(dir.to_path_buf());
-            current = dir.parent();
-        }
-
-        for dir in missing.iter().rev() {
-            match self.client.create_dir(dir, Some(mode)) {
-                Ok(()) => {}
-                // Not an error: two panes following each other can both ask
-                // for the same path, and a race between them is harmless.
-                Err(e) if matches!(e.kind(), RemoteErrorType::AlreadyExists) => {}
-                Err(e) => {
-                    return Err(translate(e, &format!("creating {}", dir.display())));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn stat(&mut self, path: &Path) -> Result<Entry, VfsError> {
-        let file = self
-            .client
-            .stat(path)
-            .map_err(|e| translate(e, &format!("stat {}", path.display())))?;
-        Ok(convert(&file))
-    }
-
-    fn open_read(&mut self, path: &Path, offset: u64) -> Result<Box<dyn ReadHandle>, VfsError> {
-        let mut opts = ReadOptions::default();
-        if offset > 0 {
-            opts = opts.offset(offset);
-        }
-        let stream = self
-            .client
-            .open(path, &opts)
-            .map_err(|e| translate(e, &format!("opening {}", path.display())))?;
-        Ok(Box::new(SshRead {
-            stream: Some(stream),
-            path: path.to_path_buf(),
-        }))
-    }
-
-    fn open_write(
-        &mut self,
-        path: &Path,
-        metadata: &WriteMetadata,
-        append: bool,
-    ) -> Result<Box<dyn WriteHandle>, VfsError> {
-        let mut opts = WriteOptions::default().size_hint(metadata.size);
-        if let Some(mtime) = metadata.mtime {
-            opts = opts.modified(mtime.into());
-        }
-        if let Some(mode) = metadata.mode {
-            opts = opts.mode(UnixPex::from(mode & 0o7777));
-        }
-
-        let stream = if append {
-            self.client.append(path, &opts)
-        } else {
-            self.client.create(path, &opts)
-        }
-        .map_err(|e| translate(e, &format!("opening {} for writing", path.display())))?;
-
-        Ok(Box::new(SshWrite {
-            stream: Some(stream),
-            path: path.to_path_buf(),
-        }))
-    }
-
-    fn read_into(&mut self, path: &Path, dest: &mut (dyn Write + Send)) -> Result<u64, VfsError> {
-        self.client
-            .read_file(path, &ReadOptions::default(), dest)
-            .map_err(|e| translate(e, &format!("reading {}", path.display())))
-    }
-
-    fn write_from(
-        &mut self,
-        path: &Path,
-        metadata: &WriteMetadata,
-        src: &mut (dyn Read + Send),
-    ) -> Result<u64, VfsError> {
-        // The size hint is not a nicety here: SCP sends a length before the
-        // data, so a wrong one corrupts the transfer rather than merely
-        // slowing it.
-        let mut opts = WriteOptions::default().size_hint(metadata.size);
-
-        // Applied during the write where the protocol allows it, which is one
-        // round trip instead of two and leaves no window where the file exists
-        // with the wrong timestamp.
-        if let Some(mtime) = metadata.mtime {
-            opts = opts.modified(mtime.into());
-        }
-        if let Some(mode) = metadata.mode {
-            opts = opts.mode(UnixPex::from(mode & 0o7777));
-        }
-
-        self.client
-            .write_file(path, &opts, src)
-            .map_err(|e| translate(e, &format!("writing {}", path.display())))
-    }
-
-    fn set_times(&mut self, path: &Path, metadata: &WriteMetadata) -> Result<(), VfsError> {
-        if !self.capabilities().set_mtime {
-            return Err(VfsError::Unsupported(format!(
-                "{} cannot set timestamps",
-                self.protocol
-            )));
-        }
-
-        let mut set = SetMetadata::default();
-        if let Some(mtime) = metadata.mtime {
-            set = set.modified(mtime.into());
-        }
-        if let Some(mode) = metadata.mode {
-            set = set.mode(UnixPex::from(mode & 0o7777));
-        }
-
-        self.client
-            .set_metadata(path, &set)
-            .map_err(|e| translate(e, &format!("setting metadata on {}", path.display())))
-    }
-
-    fn remove_file(&mut self, path: &Path) -> Result<(), VfsError> {
-        self.client
-            .remove_file(path)
-            .map_err(|e| translate(e, &format!("removing {}", path.display())))
-    }
-
-    fn remove_dir_all(&mut self, path: &Path) -> Result<(), VfsError> {
-        self.client
-            .remove_dir_all(path)
-            .map_err(|e| translate(e, &format!("removing {}", path.display())))
-    }
-
-    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), VfsError> {
-        self.client.rename(from, to).map_err(|e| {
-            translate(
-                e,
-                &format!("renaming {} to {}", from.display(), to.display()),
-            )
-        })
-    }
-
-    fn home(&mut self) -> Option<PathBuf> {
-        self.home.clone()
-    }
-
-    fn root(&self) -> PathBuf {
-        PathBuf::from("/")
-    }
-}
-
-impl Drop for SshFs {
-    fn drop(&mut self) {
-        self.disconnect();
-    }
-}
-
-/// A remote file open for reading.
-///
-/// The stream is in an `Option` because `finish` consumes it and the trait
-/// method takes a boxed `self`; there is nowhere to move it out of otherwise.
-struct SshRead {
-    stream: Option<remotefs::fs::ReadStream>,
-    path: PathBuf,
-}
-
-impl Read for SshRead {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match &mut self.stream {
-            Some(stream) => stream.read(buf),
-            None => Ok(0),
-        }
-    }
-}
-
-impl ReadHandle for SshRead {
-    fn finish(mut self: Box<Self>) -> Result<(), VfsError> {
-        match self.stream.take() {
-            Some(stream) => stream
-                .finish()
-                .map_err(|e| translate(e, &format!("closing the read of {}", self.path.display()))),
-            None => Ok(()),
-        }
-    }
-}
-
-/// A remote file open for writing.
-struct SshWrite {
-    stream: Option<remotefs::fs::WriteStream>,
-    path: PathBuf,
-}
-
-impl Write for SshWrite {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match &mut self.stream {
-            Some(stream) => stream.write(buf),
-            None => Err(std::io::Error::other("the stream was already finished")),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match &mut self.stream {
-            Some(stream) => stream.flush(),
-            None => Ok(()),
-        }
-    }
-}
-
-impl WriteHandle for SshWrite {
-    fn finish(mut self: Box<Self>) -> Result<(), VfsError> {
-        let Some(mut stream) = self.stream.take() else {
-            return Ok(());
-        };
-
-        // Flush before finishing: `finish` closes the channel, and buffered
-        // bytes that never reached the server would leave a short file the
-        // caller would then rename into place.
-        stream.flush().map_err(|e| VfsError::Io {
-            context: format!("flushing {}", self.path.display()),
-            source: e,
-        })?;
-
-        stream
-            .finish()
-            .map_err(|e| translate(e, &format!("closing {}", self.path.display())))
-    }
-}
-
-impl Drop for SshWrite {
-    fn drop(&mut self) {
-        if self.stream.is_some() {
-            // A dropped write stream is a bug: the caller is about to rename a
-            // file whose last bytes may never have been sent.
-            tracing::warn!(
-                "{} was dropped without being finished; it may be incomplete",
-                self.path.display()
-            );
-        }
-    }
-}
-
-/// Turn a `remotefs` entry into ours.
-fn convert(file: &File) -> Entry {
-    let metadata = &file.metadata;
-    let kind = match metadata.file_type {
-        FileType::Directory => EntryKind::Dir,
-        FileType::Symlink => EntryKind::Symlink,
-        // `FileType` is non-exhaustive, so a future variant has to land
-        // somewhere. `File` is the safe default: it is browsable and not
-        // enterable, which is how an unrecognised entry should behave.
-        FileType::File | _ => EntryKind::File,
-    };
-
-    Entry {
-        name: file.path.file_name().map_or_else(
-            || file.path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        ),
-        kind,
-        size: if matches!(kind, EntryKind::Dir) {
-            0
-        } else {
-            metadata.size.unwrap_or(0)
-        },
-        mtime: metadata.modified.map(Into::into),
-        mode: metadata.mode.map(u32::from),
-        symlink_target: metadata.symlink.clone(),
-        // A listing gives the link target but not what it resolves to, and
-        // stat'ing every link would cost a round trip per entry -- slow enough
-        // to feel on a directory of a few hundred. A link whose target ends in
-        // a separator is the only free hint; otherwise this stays false and
-        // entering the link falls back to `is_dir`.
-        symlink_to_dir: false,
-    }
-}
-
-/// Map a `remotefs` error onto the variants the UI distinguishes.
-fn translate(error: RemoteError, context: &str) -> VfsError {
-    match error.kind() {
-        // `StatFailed` joins the not-found cases on purpose: an SFTP server
-        // answering a stat for a path that is not there is the usual way
-        // "missing" arrives, and synchronized browsing has to read it as
-        // absent-and-fine rather than as an error worth a status message.
-        RemoteErrorType::NoSuchFileOrDirectory
-        | RemoteErrorType::CouldNotOpenFile
-        | RemoteErrorType::StatFailed => VfsError::NotFound(context.to_owned()),
-        RemoteErrorType::PermissionDenied | RemoteErrorType::FileCreateDenied => {
-            VfsError::PermissionDenied(context.to_owned())
-        }
-        RemoteErrorType::NotConnected | RemoteErrorType::ConnectionError => VfsError::NotConnected,
-        // Authentication is the one a user can act on immediately, so it keeps
-        // its own variant rather than becoming a generic protocol error.
-        RemoteErrorType::AuthenticationFailed => VfsError::AuthFailed(error.to_string()),
-        RemoteErrorType::UnsupportedFeature => VfsError::Unsupported(error.to_string()),
-        _ => VfsError::Protocol {
-            context: context.to_owned(),
-            message: error.to_string(),
-        },
-    }
-}
-
-/// How long a single remote operation may take before it is treated as hung.
-///
-/// Separate from [`CONNECT_TIMEOUT`]: establishing a session is slow, but a
-/// directory listing on a live connection should not be.
-pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration as StdDuration, SystemTime};
-
-    use remotefs::fs::Metadata;
-
     use super::*;
-
-    fn file(name: &str, file_type: FileType) -> File {
-        File::new(
-            PathBuf::from("/srv/www").join(name),
-            Metadata::default().file_type(file_type),
-        )
-    }
-
-    #[test]
-    fn a_listing_entry_keeps_only_its_name() {
-        let entry = convert(&file("index.html", FileType::File));
-        assert_eq!(entry.name, "index.html");
-        assert_eq!(entry.kind, EntryKind::File);
-    }
-
-    #[test]
-    fn a_directory_reports_no_apparent_size() {
-        let mut dir = file("src", FileType::Directory);
-        dir.metadata.size = Some(4096);
-
-        let entry = convert(&dir);
-        assert_eq!(entry.kind, EntryKind::Dir);
-        assert_eq!(
-            entry.size, 0,
-            "a directory's apparent size is meaningless, and 4096 would be shown as a real size"
-        );
-        assert!(entry.is_dir_like());
-    }
-
-    #[test]
-    fn size_mode_and_mtime_come_through() {
-        let when = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
-        let mut f = file("notes.md", FileType::File);
-        f.metadata.size = Some(1234);
-        f.metadata.modified = Some(when);
-        f.metadata.mode = Some(UnixPex::from(0o644));
-
-        let entry = convert(&f);
-        assert_eq!(entry.size, 1234);
-        assert_eq!(entry.mode, Some(0o644));
-        assert_eq!(entry.mtime.unwrap().timestamp(), 1_700_000_000);
-    }
-
-    #[test]
-    fn an_executable_is_detected_from_its_mode() {
-        let mut f = file("deploy.sh", FileType::File);
-        f.metadata.mode = Some(UnixPex::from(0o755));
-        assert!(convert(&f).is_executable());
-
-        let mut f = file("notes.md", FileType::File);
-        f.metadata.mode = Some(UnixPex::from(0o644));
-        assert!(!convert(&f).is_executable());
-    }
-
-    /// A server with no timestamps must produce `None`, not epoch zero: the
-    /// confirmation window renders the difference, and 1970 would read as a
-    /// real date.
-    #[test]
-    fn a_missing_timestamp_stays_missing() {
-        let entry = convert(&file("x", FileType::File));
-        assert_eq!(entry.mtime, None);
-        assert_eq!(entry.mode, None);
-    }
-
-    #[test]
-    fn a_symlink_keeps_its_target() {
-        let mut f = file("current", FileType::Symlink);
-        f.metadata.symlink = Some(PathBuf::from("/srv/www/releases/7"));
-
-        let entry = convert(&f);
-        assert_eq!(entry.kind, EntryKind::Symlink);
-        assert_eq!(
-            entry.symlink_target,
-            Some(PathBuf::from("/srv/www/releases/7"))
-        );
-    }
-
-    #[test]
-    fn errors_map_to_actionable_variants() {
-        assert!(matches!(
-            translate(
-                RemoteError::new(RemoteErrorType::NoSuchFileOrDirectory),
-                "listing /nope"
-            ),
-            VfsError::NotFound(_)
-        ));
-        assert!(matches!(
-            translate(
-                RemoteError::new(RemoteErrorType::PermissionDenied),
-                "listing /root"
-            ),
-            VfsError::PermissionDenied(_)
-        ));
-        assert!(matches!(
-            translate(
-                RemoteError::new(RemoteErrorType::AuthenticationFailed),
-                "connecting"
-            ),
-            VfsError::AuthFailed(_)
-        ));
-        assert!(matches!(
-            translate(RemoteError::new(RemoteErrorType::NotConnected), "listing"),
-            VfsError::NotConnected
-        ));
-    }
-
-    #[test]
-    fn a_not_found_error_is_recognised_as_such() {
-        let error = translate(
-            RemoteError::new(RemoteErrorType::NoSuchFileOrDirectory),
-            "listing /nope",
-        );
-        assert!(
-            error.is_not_found(),
-            "synchronized browsing relies on this to ghost rather than report an error"
-        );
-    }
 
     /// An unimplemented protocol must be refused by name, before any network
     /// traffic, rather than failing somewhere obscure.
@@ -774,7 +219,7 @@ mod tests {
             Ok(_) => panic!("S3 should not pass a precheck yet"),
         };
         assert!(message.contains("s3"), "{message}");
-        assert!(message.contains("phase 5"), "{message}");
+        assert!(message.contains("phase 6"), "{message}");
     }
 
     /// The refusal has to come before any network traffic, since the point is
@@ -785,6 +230,16 @@ mod tests {
         // protocol check came too late.
         let target = Target::new(Protocol::Webdav, "nonexistent.invalid");
         assert!(matches!(precheck(&target), Err(VfsError::Unsupported(_))));
+    }
+
+    /// FTP is implemented but has no host key, so it must not be routed
+    /// through the SSH precheck -- which would reject it as "not an SSH
+    /// protocol" and make FTP unusable.
+    #[test]
+    fn ftp_is_implemented_but_is_not_an_ssh_protocol() {
+        assert!(Protocol::Ftp.is_implemented());
+        assert!(!Protocol::Ftp.is_ssh());
+        assert!(Protocol::Sftp.is_ssh());
     }
 
     /// Password auth must not also try agent keys: on a server with a low
@@ -816,6 +271,18 @@ mod tests {
             target.auth = auth;
             let _ = build_opts(&target, Some(&Secret::new("x")));
             let _ = build_opts(&target, None);
+        }
+    }
+
+    /// SFTP's rename refuses an existing target, which is why the executor has
+    /// a swap path at all. Pinned here because flipping it would silently
+    /// break every overwrite.
+    #[test]
+    fn ssh_does_not_claim_an_overwriting_rename() {
+        for protocol in [Protocol::Sftp, Protocol::Scp] {
+            let caps = protocol.capabilities();
+            assert!(!caps.atomic_overwrite_rename);
+            assert!(caps.mtime && caps.set_mtime && caps.mode);
         }
     }
 }

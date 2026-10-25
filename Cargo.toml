@@ -57,6 +57,7 @@ ssh2-config = "0.9.0"
 # nothing in it consults known_hosts. Used directly for a pre-flight handshake
 # that checks the key before any credential is sent. See vfs::hostkey.
 ssh2 = "0.9"
+remotefs-ftp = { version = "1.0.0", features = ["rustls-aws-lc-rs"] }
 
 # notify, the checksum crates and the rsync/rclone executors arrive with the
 # phases that use them -- see docs/PLAN.md.

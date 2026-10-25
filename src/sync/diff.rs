@@ -237,7 +237,7 @@ fn walk(
             // Symlinks: visible, and deliberately not transferred.
             (EntryKind::Symlink, _) => {
                 built.rows.push(Row {
-                    caveat: Some("symlink, not transferred (arrives with phase 5)"),
+                    caveat: Some("symlink, not transferred (arrives with phase 6)"),
                     ..plan::compare_row(
                         child,
                         entry,

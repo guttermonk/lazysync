@@ -52,6 +52,14 @@ pub enum Reason {
     /// equal, and the window says so -- on S3 this is all the information
     /// there is without reading both files.
     SameSizeNoTimestamps,
+    /// Same size, and the destination reports timestamps but cannot be made
+    /// to keep the source's.
+    ///
+    /// Distinct from `SameSizeNoTimestamps` because the window would otherwise
+    /// claim there are no timestamps while displaying two of them. The
+    /// timestamps exist; they just describe when each file was *written*, so
+    /// comparing them says nothing about whether the contents match.
+    SameSizeTimesNotPreserved,
 
     /// Present only on the source.
     ///
@@ -93,6 +101,7 @@ impl Reason {
             Self::SameSizeAndTime => "same size and time",
             Self::ChecksumMatches => "checksum matches",
             Self::SameSizeNoTimestamps => "same size, no timestamps",
+            Self::SameSizeTimesNotPreserved => "same size, times not kept",
             Self::NotOnDestination => "new",
             Self::NotOnSource => "not on the source",
         }
@@ -124,8 +133,14 @@ pub struct Comparator {
     method: Method,
     /// Seconds within which two timestamps count as equal.
     tolerance: i64,
-    /// Whether both sides report timestamps at all.
+    /// Whether a timestamp comparison can mean anything here. See
+    /// [`Comparator::new`].
     timestamps_available: bool,
+    /// Whether the reason timestamps are unusable is that the destination
+    /// cannot preserve them, rather than that nobody reports them. Only
+    /// affects which [`Reason`] an equal pair gets, so the window does not
+    /// claim there are no timestamps while displaying two.
+    times_reported_but_not_preservable: bool,
 }
 
 impl Comparator {
@@ -146,7 +161,21 @@ impl Comparator {
         )
         .unwrap_or(i64::MAX);
 
-        let timestamps_available = source.mtime && dest.mtime;
+        // Comparing by timestamp needs more than both sides reporting one: the
+        // destination has to be able to *preserve* the source's. Where it
+        // cannot -- FTP, whose `MFMT` is not in the base protocol -- every
+        // file carries the time it was written, which never matches the
+        // source, so an mtime comparison would call the whole tree changed on
+        // every run, forever. That is not a theoretical worry: it is what the
+        // FTP fixture test caught.
+        //
+        // Degrading to size is a real loss, since a same-size edit then slips
+        // through, and it is why `compare.method = "checksum"` exists. But it
+        // is the most this protocol allows, and the window names the method it
+        // actually used rather than implying a precision it did not have.
+        let times_reported = source.mtime && dest.mtime;
+        let timestamps_available = times_reported && dest.set_mtime;
+        let times_reported_but_not_preservable = times_reported && !dest.set_mtime;
 
         // A backend with no timestamps cannot be compared by timestamp, so
         // `size_mtime` degrades to `size` rather than silently treating a
@@ -162,6 +191,7 @@ impl Comparator {
             method,
             tolerance: configured.max(granularity),
             timestamps_available,
+            times_reported_but_not_preservable,
         }
     }
 
@@ -191,10 +221,11 @@ impl Comparator {
         }
 
         match self.method {
-            // Timestamps are deliberately not consulted, either because
-            // size-only was asked for or because one side has none. Reporting
-            // `SameSizeAndTime` would claim a check that was not made.
-            Method::SizeOnly => Reason::SameSizeNoTimestamps,
+            // Timestamps are deliberately not consulted: size-only was asked
+            // for, or one side has none, or the destination cannot be made to
+            // keep the source's. Reporting `SameSizeAndTime` would claim a
+            // check that was not made.
+            Method::SizeOnly => self.same_size_reason(),
 
             Method::Checksum => match checksums {
                 Some((a, b)) if a == b => Reason::ChecksumMatches,
@@ -209,13 +240,23 @@ impl Comparator {
         }
     }
 
+    /// Which "equal as far as we can tell" reason applies, given *why* the
+    /// timestamps went unused.
+    const fn same_size_reason(&self) -> Reason {
+        if self.times_reported_but_not_preservable {
+            Reason::SameSizeTimesNotPreserved
+        } else {
+            Reason::SameSizeNoTimestamps
+        }
+    }
+
     /// Compare two timestamps within the tolerance.
     fn by_time(&self, source: Option<DateTime<Utc>>, dest: Option<DateTime<Utc>>) -> Reason {
         let (Some(source), Some(dest)) = (source, dest) else {
             // One side has no timestamp. Equal sizes is all the evidence
             // available, and inventing a difference would re-copy the file on
             // every run forever.
-            return Reason::SameSizeNoTimestamps;
+            return self.same_size_reason();
         };
 
         let difference = source.timestamp() - dest.timestamp();
@@ -259,6 +300,14 @@ mod tests {
 
     fn fat() -> Capabilities {
         caps(true, 2)
+    }
+
+    /// Reports timestamps, cannot be made to keep them. FTP.
+    fn ftp() -> Capabilities {
+        Capabilities {
+            set_mtime: false,
+            ..caps(true, 1)
+        }
     }
 
     fn entry(size: u64, epoch: Option<i64>) -> Entry {
@@ -384,6 +433,49 @@ mod tests {
         assert_eq!(
             c.compare(&entry(10, Some(1000)), &entry(10, None), None),
             Reason::SameSizeNoTimestamps
+        );
+    }
+
+    /// The same degradation for a destination that *reports* timestamps but
+    /// cannot be made to keep them.
+    ///
+    /// This is FTP, and it is not a hypothetical: the file it receives carries
+    /// the time it was uploaded, which never matches the source's. Comparing
+    /// those two would mark every file changed on every run, for ever. Caught
+    /// by `tests/ftp.rs` against a real server; a mock that stores whatever
+    /// mtime it is handed makes the comparison pass and hides it.
+    #[test]
+    fn size_mtime_degrades_when_the_destination_cannot_preserve_times() {
+        let c = Comparator::new(&config(CompareMethod::SizeMtime, 2), local(), ftp());
+
+        assert_eq!(c.method(), Method::SizeOnly);
+        assert!(!c.has_timestamps());
+
+        // Years apart, and still equal -- because the timestamps carry no
+        // information about whether the contents match.
+        let reason = c.compare(&entry(10, Some(1_700_000_000)), &entry(10, Some(1)), None);
+        assert!(
+            !reason.differs(),
+            "an unpreservable timestamp is not evidence of change: {reason:?}"
+        );
+        assert_eq!(
+            reason,
+            Reason::SameSizeTimesNotPreserved,
+            "and the window must not claim there are no timestamps while showing two"
+        );
+    }
+
+    /// The source being unable to set times is irrelevant: nothing is written
+    /// there. Only the destination's limitation matters, and conflating the two
+    /// would needlessly drop pulls *from* FTP down to a size comparison.
+    #[test]
+    fn a_source_that_cannot_set_times_still_compares_by_time() {
+        let c = Comparator::new(&config(CompareMethod::SizeMtime, 2), ftp(), local());
+
+        assert_eq!(c.method(), Method::SizeMtime);
+        assert_eq!(
+            c.compare(&entry(10, Some(2000)), &entry(10, Some(1000)), None),
+            Reason::SourceNewer
         );
     }
 

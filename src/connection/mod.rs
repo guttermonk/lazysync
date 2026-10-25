@@ -72,8 +72,14 @@ impl Protocol {
     pub const fn default_port(self) -> u16 {
         match self {
             Self::Sftp | Self::Scp => 22,
-            Self::Ftp => 21,
-            Self::Ftps => 990,
+            // 21 for FTPS too, not 990. 990 is *implicit* FTPS, where TLS
+            // starts before a byte of FTP is spoken; what lazysync does is
+            // *explicit* FTPS -- connect in the clear on the ordinary port and
+            // send `AUTH TLS` -- which is what RFC 4217 specifies and what
+            // `suppaftp`'s `into_secure` performs. Defaulting to 990 would
+            // make `ftps://host` open a plaintext connection to a port that is
+            // waiting for a TLS handshake, and hang.
+            Self::Ftp | Self::Ftps => 21,
             Self::S3 | Self::Webdav => 443,
             Self::Smb => 445,
         }
@@ -85,14 +91,123 @@ impl Protocol {
     /// written for a later version still loads; the connect path refuses the
     /// unimplemented ones by name instead of failing obscurely.
     pub const fn is_implemented(self) -> bool {
-        matches!(self, Self::Sftp | Self::Scp)
+        matches!(self, Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps)
     }
 
     /// Which phase brings the rest, for the message shown when you pick one.
     pub const fn arrives_in_phase(self) -> u8 {
         match self {
             Self::Sftp | Self::Scp => 2,
-            _ => 5,
+            Self::Ftp | Self::Ftps => 5,
+            // Each of these needs something lazysync does not have yet, and
+            // none of them is a small addition:
+            //
+            // - WebDAV: `remotefs-webdav`'s blocking client needs a
+            //   `tokio::runtime::Handle`, so supporting it means introducing
+            //   an async runtime to a project that deliberately has none.
+            //   Where that runtime lives is a decision in its own right.
+            // - S3: bucket, region, endpoint and access keys, none of which
+            //   the bookmark schema or the connection form has fields for.
+            // - SMB: a share name, plus `libsmbclient` as a system
+            //   dependency in the Nix build.
+            Self::Webdav | Self::S3 | Self::Smb => 6,
+        }
+    }
+
+    /// What a backend of this protocol can do.
+    ///
+    /// Declared per protocol rather than read off `remotefs`'s own capability
+    /// flags, because those describe streams and seeking while the planner
+    /// asks about timestamps and how precise they are. Getting one wrong is
+    /// how a sync re-copies a tree that has not changed, so each is stated
+    /// deliberately and pessimistically.
+    pub const fn capabilities(self) -> crate::vfs::Capabilities {
+        use crate::vfs::Capabilities;
+
+        match self {
+            // SFTP and SCP: full Unix semantics. The protocol's base attribute
+            // set carries whole-second mtimes; version 4 added nanoseconds and
+            // plenty of servers do not send them, so 1 second is the honest
+            // floor.
+            Self::Sftp | Self::Scp => Capabilities {
+                mtime: true,
+                set_mtime: true,
+                mode: true,
+                symlinks: true,
+                ranged_writes: true,
+                // SFTP's rename refuses an existing target: OpenSSH answers
+                // SSH_FX_PERMISSION_DENIED rather than replacing it.
+                atomic_overwrite_rename: false,
+                mtime_granularity_secs: 1,
+            },
+
+            // FTP: `MDTM` gives whole seconds and `MFMT` can set them, but
+            // neither is required by the protocol and plenty of servers lack
+            // MFMT. Claiming `set_mtime` would mean every sync re-copying the
+            // tree on a server that silently ignores it, so this says no and
+            // the plan carries the caveat.
+            Self::Ftp | Self::Ftps => Capabilities {
+                mtime: true,
+                set_mtime: false,
+                mode: false,
+                symlinks: false,
+                // REST before STOR is widely supported, which is what resuming
+                // an upload needs.
+                ranged_writes: true,
+                atomic_overwrite_rename: false,
+                // A *day*, which is not a typo. Listings come from `LIST`,
+                // whose format is the output of `ls -l`: a recent file shows
+                // `Oct 24 22:52`, losing the seconds, and a file older than
+                // about six months shows `Nov 14  2023` -- losing the time
+                // altogether. Measured against a real server, the error was
+                // 52 seconds on a file from today and **80,017 seconds** on
+                // one from 2023.
+                //
+                // Claiming 1 second here would make a pull from FTP see an
+                // identical tree as entirely changed, since every remote
+                // timestamp sits up to a day below its local counterpart.
+                // `MDTM` would give real seconds but costs a round trip per
+                // file, so finer comparison is a deliberate future choice
+                // rather than something to assume here.
+                mtime_granularity_secs: 86_400,
+            },
+
+            // WebDAV: `getlastmodified` is an HTTP date, so whole seconds, and
+            // there is no standard way to set one. No modes, no symlinks.
+            Self::Webdav => Capabilities {
+                mtime: true,
+                set_mtime: false,
+                mode: false,
+                symlinks: false,
+                ranged_writes: false,
+                atomic_overwrite_rename: true,
+                mtime_granularity_secs: 1,
+            },
+
+            // S3 has no modification time of its own -- the planner falls back
+            // to size, which is why `size_mtime` degrades rather than
+            // reporting every object as changed.
+            Self::S3 => Capabilities {
+                mtime: false,
+                set_mtime: false,
+                mode: false,
+                symlinks: false,
+                ranged_writes: false,
+                atomic_overwrite_rename: true,
+                mtime_granularity_secs: 1,
+            },
+
+            // SMB: timestamps and a rename that replaces, but no Unix modes
+            // over the wire.
+            Self::Smb => Capabilities {
+                mtime: true,
+                set_mtime: true,
+                mode: false,
+                symlinks: false,
+                ranged_writes: true,
+                atomic_overwrite_rename: true,
+                mtime_granularity_secs: 1,
+            },
         }
     }
 
@@ -295,13 +410,46 @@ mod tests {
     }
 
     #[test]
-    fn only_the_ssh_protocols_are_implemented_so_far() {
-        assert!(Protocol::Sftp.is_implemented());
-        assert!(Protocol::Scp.is_implemented());
-        for protocol in [Protocol::Ftp, Protocol::S3, Protocol::Smb, Protocol::Webdav] {
-            assert!(!protocol.is_implemented());
-            assert_eq!(protocol.arrives_in_phase(), 5);
+    fn the_implemented_protocols_are_ssh_and_ftp() {
+        for protocol in [Protocol::Sftp, Protocol::Scp, Protocol::Ftp, Protocol::Ftps] {
+            assert!(protocol.is_implemented(), "{protocol}");
         }
+        for protocol in [Protocol::S3, Protocol::Smb, Protocol::Webdav] {
+            assert!(!protocol.is_implemented(), "{protocol}");
+            assert_eq!(protocol.arrives_in_phase(), 6);
+        }
+    }
+
+    /// Capabilities drive the planner's comparison rules, so every protocol
+    /// has to state them -- and the ones that cannot set a timestamp have to
+    /// say so, or a sync against them re-copies its whole tree every run with
+    /// no explanation on screen.
+    #[test]
+    fn every_protocol_declares_capabilities_and_none_overclaims() {
+        for protocol in Protocol::ALL {
+            let caps = protocol.capabilities();
+            assert!(
+                caps.mtime_granularity_secs >= 1,
+                "{protocol}: claiming sub-second precision no protocol carries is how a sync \
+                 decides every file changed"
+            );
+            assert!(
+                !(caps.set_mtime && !caps.mtime),
+                "{protocol}: setting a timestamp it cannot read makes no sense"
+            );
+        }
+
+        // The specific admissions, pinned.
+        assert!(!Protocol::Ftp.capabilities().set_mtime);
+        assert!(!Protocol::Webdav.capabilities().set_mtime);
+        assert!(
+            !Protocol::S3.capabilities().mtime,
+            "S3 has no modification time of its own; the planner falls back to size"
+        );
+        assert!(
+            !Protocol::Sftp.capabilities().atomic_overwrite_rename,
+            "SFTP's rename refuses an existing target"
+        );
     }
 
     #[test]

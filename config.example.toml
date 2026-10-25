@@ -80,6 +80,16 @@ match = "ancestor"
 #   "size_mtime" -- fast, and right nearly always
 #   "checksum"   -- correct, and reads both files in full
 #   "size_only"  -- for remotes with no usable timestamp at all
+#
+# "size_mtime" falls back to "size_only" by itself where a timestamp
+# comparison could not mean anything: when either side does not report an
+# mtime (S3), or when the destination cannot be made to *keep* the source's
+# (FTP, whose MFMT is not in the base protocol). In that second case every
+# uploaded file carries the time it was uploaded, so comparing timestamps
+# would mark the whole tree changed on every run. The confirmation window
+# always shows the rule it actually used, and such rows read "same size, times
+# not kept" rather than claiming a check that was not made. Set "checksum"
+# when size alone is not enough for you.
 method = "size_mtime"
 
 # Timestamps that differ by less than this are treated as equal. Needed

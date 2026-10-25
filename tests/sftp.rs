@@ -694,7 +694,7 @@ fn a_second_push_over_sftp_finds_nothing_to_do() {
         let mut local = LocalFs::new();
         let config = Config::default();
 
-        let build = |local: &mut LocalFs, remote: &mut lazysync::vfs::SshFs| {
+        let build = |local: &mut LocalFs, remote: &mut lazysync::vfs::RemoteAdapter| {
             diff::plan(
                 diff::Endpoint {
                     fs: local,

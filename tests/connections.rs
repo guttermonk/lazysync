@@ -399,7 +399,7 @@ fn an_unimplemented_protocol_is_refused_with_its_phase() {
     h.enter();
 
     assert!(h.app.status.contains("s3"), "{}", h.app.status);
-    assert!(h.app.status.contains("phase 5"), "{}", h.app.status);
+    assert!(h.app.status.contains("phase 6"), "{}", h.app.status);
 }
 
 // ── zide auto-open ──────────────────────────────────────────────────────────

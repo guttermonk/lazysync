@@ -26,7 +26,7 @@ use crate::{
         transfer::{State as TransferState, Transfer},
     },
     ui::{confirm, form::ConnectionForm},
-    vfs::{hostkey::HostKey, ssh, LocalFs, Vfs},
+    vfs::{ftp, hostkey::HostKey, ssh, LocalFs, Vfs},
 };
 
 /// What is on top of the browser, if anything.
@@ -515,6 +515,26 @@ impl App {
     /// across a dialog, which is exactly what should not happen.
     pub fn begin_open(&mut self, bookmark: &Bookmark) {
         let target = bookmark.target();
+
+        if !target.protocol.is_implemented() {
+            self.status = format!(
+                "{} arrives in phase {} -- see docs/PLAN.md",
+                target.protocol,
+                target.protocol.arrives_in_phase()
+            );
+            return;
+        }
+
+        // Only the SSH family has a host key to check. For the others there is
+        // nothing to establish before collecting a credential -- which is
+        // itself worth knowing: an FTP password goes to whatever answered on
+        // port 21, and FTPS is the only version of that with a server identity
+        // to verify at all.
+        if !target.protocol.is_ssh() {
+            self.collect_secret_and_open(bookmark);
+            return;
+        }
+
         self.status = format!("checking the host key for {}...", bookmark.name);
 
         match ssh::precheck(&target) {
@@ -589,7 +609,14 @@ impl App {
     fn finish_open(&mut self, bookmark: &Bookmark, secret: Option<&Secret>) {
         self.status = format!("connecting to {}...", bookmark.name);
 
-        match ssh::open(&bookmark.target(), secret) {
+        let target = bookmark.target();
+        let opened = if target.protocol.is_ssh() {
+            ssh::open(&target, secret)
+        } else {
+            ftp::open(&target, secret)
+        };
+
+        match opened {
             Ok(fs) => self.open_connection(bookmark, fs, secret),
             Err(e) => {
                 self.connecting = None;
@@ -603,7 +630,7 @@ impl App {
     fn open_connection(
         &mut self,
         bookmark: &Bookmark,
-        mut fs: crate::vfs::SshFs,
+        mut fs: crate::vfs::RemoteAdapter,
         secret: Option<&Secret>,
     ) {
         // Where to start: the bookmark's remote path, then the remote home,

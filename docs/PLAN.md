@@ -5,8 +5,10 @@ local ↔ local, remote ↔ remote) trees. termscp's feature set, vim keys by
 default, every binding remappable, and a confirmation window that shows you
 exactly what is about to be overwritten before anything moves.
 
-Status: **phase 3 of 7 complete**. Browsing, connections and syncing work; see
-the phase table in §10 for what each one actually delivered.
+Status: **phase 5 of 7 complete**. Browsing, connections, syncing and the
+transfer queue work over local, SFTP/SCP and FTP/FTPS; see the phase table in
+§10 for what each one actually delivered, and what it turned out not to have
+anticipated.
 
 ---
 
@@ -294,6 +296,36 @@ Ranked by how much I think they matter.
    SFTP servers 1s), a configurable tolerance window, timezone-correct
    comparison, S3's lack of real mtime (fall back to ETag/metadata), and the
    confirmation window stating *which* comparison it actually used per row.
+
+   Mostly done in phase 3, with one rule added in phase 5 that the original
+   design missed. Comparing by timestamp needs more than both sides *reporting*
+   one: the destination has to be able to **preserve** the source's. FTP
+   reports mtimes but cannot set them (`MFMT` is not in the base protocol), so
+   every file it receives carries the time it was uploaded — which never
+   matches the source. An mtime comparison there marks the whole tree changed
+   on every single run, for ever. `Comparator::new` therefore keys off
+   `dest.set_mtime`, not just `dest.mtime`, and degrades to a size comparison
+   with its own reason (`same size, times not kept`) so the window does not
+   claim there are no timestamps while displaying two. Only the *destination's*
+   limitation counts — a pull *from* FTP still compares by time.
+
+   This is the one bug in the project so far that only a real server could have
+   produced: a mock stores whatever mtime it is handed, so the second-sync
+   comparison passes and the fault stays invisible. It is the argument for
+   `tests/fixtures/` existing.
+
+   Measuring against that server also corrected FTP's declared granularity from
+   1 second to **a day**. `remotefs-ftp` lists with `LIST`, whose format is
+   `ls -l` output: a recent file shows `Oct 24 22:52` and loses the seconds, and
+   one older than about six months shows `Nov 14  2023` and loses the time
+   altogether. Measured error was 52 seconds on a file from today and 80,017
+   seconds on one from 2023. The 1-second claim only looked harmless because
+   FTP destinations now degrade to a size comparison — on a *pull*, where FTP
+   is the source and the local side the destination, timestamps are compared
+   for real, and every remote one would have sat a day outside tolerance.
+   `MDTM` returns true seconds and would allow a much tighter figure, at one
+   round trip per file; that is a deliberate choice for later, not something to
+   assume.
 3. ~~**Filters**~~ — done in phase 4, bar the CLI flag. gitignore syntax per
    profile, applied during the walk so an excluded directory is never
    descended into, and on *both* sides so a mirror does not delete the
@@ -337,10 +369,28 @@ Ranked by how much I think they matter.
     terminal-default, catppuccin, gruvbox and nord presets.
 15. **Home-manager module** (like `tuimon` has) so bookmarks/config/keys are
     declarable; needs a mutable-overlay path since the store is read-only.
-16. **Test fixtures** — a nixos-test or compose fixture with `sshd` + an FTP
-    server + minio so the planner and executors get real integration tests. The
-    diff planner itself gets heavy pure unit-test coverage; that's where
-    correctness bugs will hide.
+16. ~~**Test fixtures**~~ — `sshd` done in phase 2 (`tests/fixtures/sshd.sh`),
+    FTP in phase 5 (`tests/fixtures/ftpd.sh`). Both start a real server on
+    loopback as the invoking user, and both have earned it: the SSH one caught
+    SFTP's non-replacing rename, the FTP one caught the unpreservable-mtime
+    comparison bug. Object storage is still outstanding — the dev shell carries
+    `garage` for it (minio was removed from nixpkgs), waiting on an S3 backend
+    in phase 6.
+
+    One trap worth recording, because it is the failure mode a fixture is
+    most prone to: the FTPS test passed for a while against *nothing
+    listening*. The TLS server was dying on a bad argument, so "an untrusted
+    certificate is refused" was really observing a refused connection. A
+    fixture must not export an endpoint it has not confirmed is up, and a
+    test that accepts any error will happily agree that an absent server
+    rejected a certificate.
+
+    A note on server choice, since it is not obvious: the FTP fixture runs
+    `pyftpdlib`, not `pure-ftpd` or `vsftpd`. Both of those want root for their
+    chroot jail and setuid, which a test does not have — `pure-ftpd` exits 252
+    with nothing on stderr. `pyftpdlib` is a real server built to run as an
+    ordinary user, which is why it is what most FTP *clients* are tested
+    against.
 17. **Dir size on remote** is expensive — make `du`-style sizes lazy/opt-in.
 
 ## 10. Phases
@@ -352,8 +402,8 @@ Ranked by how much I think they matter.
 | 2 | ✅ `Vfs` + Local + SFTP/SCP; connection form; bookmarks + keyring; host-key TOFU; zide auto-open. Two things the underlying crates do not provide had to be written here: host key verification (`remotefs-ssh`'s libssh2 backend consults `known_hosts` nowhere at all), and an explicit `SshKeyStorage`, without which naming an identity file silently did nothing. `lazysync import termscp` slipped to phase 7 — its format carries an encrypted password blob, and an importer written against a format that cannot be tested here would be guesswork presented as a feature. |
 | 3 | ✅ Diff planner + confirmation window + native executor (push/pull, mirror). Three things the design did not anticipate: **SFTP's rename does not replace an existing file** (OpenSSH answers `SSH_FX_PERMISSION_DENIED`), so overwrites go through a three-step swap — see `Capabilities::atomic_overwrite_rename`; a **percentage-only delete guard misfires on small trees**, where removing one of two files reads as 50%, so a floor was added with a separate all-or-nothing check that fires at any size; and the **backup directory had to be excluded from planning**, or the second mirror run deletes the backups the first one made. |
 | 4 | ✅ Transfer queue, progress, resume, filters, sync profiles. (Safety rails landed early, in phase 3.) The queue is a state machine the main loop steps a chunk per frame rather than a worker thread: the panes own the `Vfs` values and an SFTP session cannot be cloned without asking for the password again, so a thread would mean the browser losing its backends for the duration. Stepping gives progress and cancellation with no shared state. Two things worth noting: `Vfs` gained streaming handles, so a 4 GB file no longer costs 4 GB of memory; and the glob matcher had to be memoised after `*a*a*a*a*a*a*b` against forty `a`s took **3.7 seconds** — the patterns come from the user's own config, so that was a filter line able to freeze the planner. |
-| 5 | rsync + rclone executors; `RcloneFs`; remaining native backends (FTP/S3/SMB/WebDAV) |
-| 6 | Bisync + state snapshots + conflict UI |
+| 5 | ✅ One generic `RemoteAdapter` for every `remotefs` backend; FTP + FTPS on top of it. The phase was planned as "all remaining backends plus the rsync/rclone executors" and was cut down deliberately: **WebDAV and S3 cannot go in at all right now** — `remotefs-webdav` and `remotefs-aws-s3` still depend on `remotefs 0.3`, which defines a *different, incompatible* `RemoteFs` trait, so adding either puts two versions of the trait in one binary. SMB needs `libsmbclient` and a share field the connection schema does not have. All three move to phase 6. What landed instead paid for itself twice over: generalising the adapter cut `ssh.rs` from 978 lines to 387, and the real-server fixture caught four bugs. One is a comparison bug affecting **every** destination that cannot set an mtime (see §9.2). The others were FTPS: the default port was 990, the *implicit* FTPS port, while `secure()` performs *explicit* FTPS — a plaintext connect then `AUTH TLS` — so `ftps://host` would have opened a plaintext connection to a port awaiting a TLS handshake; a rejected certificate surfaced as "the server refused the connection", because `remotefs` reports a failed handshake as `ConnectionError` with the cause in the source and `translate` was collapsing that into the payload-free `NotConnected`; and the certificate test itself passed for the wrong reason until the fixture stopped exporting a port before confirming something was listening on it. |
+| 6 | Bisync + state snapshots + conflict UI; S3/SMB/WebDAV once `remotefs 1.0` ports exist; rsync + rclone executors; `RcloneFs` |
 | 7 | Watch mode, headless CLI + audit log, home-manager module, docs + demo cast |
 
 Phases 1–3 are the usable milestone: dual-pane browsing over SFTP with
@@ -361,8 +411,12 @@ sync-browse and a reviewed push.
 
 ## 11. Open questions
 
-1. **Protocol priority** — which do you actually use day to day? SFTP only, or
-   do S3/SMB/WebDAV matter enough to pull into phase 5 vs. later?
+1. **Protocol priority** — which do you actually use day to day? SFTP and FTP
+   are in; S3, SMB and WebDAV are blocked rather than deprioritised (see the
+   phase 5 row), so the question is now whether any of them is worth the work
+   their blockers need. S3 wants new connection fields (bucket, region,
+   credentials) and either a `remotefs 1.0` port or a hand-written backend;
+   SMB wants `libsmbclient` as a system dependency.
 2. **rclone's role** — executor only (sync/bisync/check), or also a *browse*
    backend so bookmarks can point at any rclone remote (gdrive, b2, …)?
 3. **Compare default** — size+mtime (fast, default) vs. always-checksum

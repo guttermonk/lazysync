@@ -47,9 +47,18 @@ confusing every time.
   it can do; code that assumes mtimes exist breaks on S3. When a plan can't
   preserve something, it has to say so in the row rather than silently
   proceeding.
-- **Protocol work needs a real server.** The dev shell has `sshd` and `minio`
-  for this. A planner tested only against a mock agrees with the mock and
-  nothing else.
+- **Protocol work needs a real server.** `tests/fixtures/sshd.sh` and
+  `tests/fixtures/ftpd.sh` each start one on loopback, as you, on a high port,
+  serving a throwaway tree; the dev shell provides `openssh`, `pyftpdlib` and
+  `garage`. The tests *skip* when a fixture cannot run, so check they actually
+  ran before believing a green suite.
+
+  A planner tested only against a mock agrees with the mock and nothing else,
+  and both fixtures have earned their keep by proving it: the SSH one found
+  that SFTP's rename refuses to replace an existing file, and the FTP one
+  found that comparing mtimes against a destination which cannot set them
+  marks every file changed, for ever. Neither is visible against a fake, which
+  stores whatever it is handed and agrees.
 
 ## Commit messages
 

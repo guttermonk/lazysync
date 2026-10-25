@@ -5,17 +5,20 @@ set, vim keys by default with every binding remappable, and a confirmation
 window that shows you both sides of every overwrite — size and timestamp,
 source and destination — before anything moves.
 
-> **Status: phase 4 of 7.** Plan a push, pull or mirror, review every row,
+> **Status: phase 5 of 7.** Plan a push, pull or mirror, review every row,
 > and watch it transfer — with progress, throughput, ETA, pause and cancel,
 > resumable partial files, and gitignore-style exclude rules driven by named
-> sync profiles. Over the local filesystem or SFTP/SCP, with saved
+> sync profiles. Over the local filesystem, SFTP/SCP or FTP/FTPS, with saved
 > connections, host key verification, keyring passwords, zide auto-open,
 > synchronized browsing with ghosting, union view, and vim keys throughout.
 >
 > What does not work yet: no bisync, no watch mode, no inline diffs, and no
 > checksum re-verification from the window. Transfers are sequential — one
-> file at a time. FTP, S3, SMB and WebDAV are refused by name. Each subcommand
-> says which phase it arrives in. See [`docs/PLAN.md`](docs/PLAN.md).
+> file at a time. S3, SMB and WebDAV are refused by name, and are blocked on
+> more than time: the `remotefs` backends for WebDAV and S3 still require an
+> older, incompatible version of the trait every other backend implements.
+> Each subcommand says which phase it arrives in. See
+> [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Why not termscp
 
@@ -157,6 +160,15 @@ Deletions move to `.lazysync-backup/` by default rather than vanishing, and a
 mirror that would empty the destination is refused outright — that is what a
 mirror pointed at the wrong root looks like.
 
+The `compare:` in the header is the rule that was *actually* used, not the one
+configured. Against a destination that cannot be made to keep a modification
+time — FTP, whose `MFMT` is not part of the base protocol — `size+mtime` drops
+to `size`, and rows read `same size, times not kept`. The alternative is worse
+than it sounds: every uploaded file carries the time it was uploaded, so
+comparing timestamps would call the entire tree changed on every single run.
+When size alone is not enough for you, `compare.method = "checksum"` is the
+answer.
+
 ### Transfers
 
 `y` hands the plan to a queue and shows progress; it does not block:
@@ -211,6 +223,14 @@ as a prompt to click through.
 
 `~/.ssh/config` is read, so a bookmark for a host you have already configured
 picks up its `HostName`, `User`, `Port` and `IdentityFile`.
+
+`ftps://` is *explicit* FTPS — a connection on the ordinary FTP port upgraded
+with `AUTH TLS` before authenticating — and its certificate is verified
+against the webpki root store. There is no accept-invalid-certificate option,
+deliberately: a session that trusted anything would be worse than a plaintext
+one, because the scheme on screen would say it was safe. Plain `ftp://` is
+never silently upgraded either, since an `ftp://` that was sometimes encrypted
+and sometimes not would be indistinguishable on screen.
 
 ## Configuration
 

@@ -3,9 +3,13 @@
 //! The trait is **blocking**, deliberately. The `remotefs-*` crates that back
 //! SFTP, FTP, S3, SMB and WebDAV are themselves blocking, so an async trait
 //! would mean wrapping sync calls in `spawn_blocking` and getting async's
-//! complexity without its benefit. Phase 2 keeps responsiveness by running a
-//! backend on its own worker thread and passing results back to the UI
-//! thread, which is also how termscp does it.
+//! complexity without its benefit.
+//!
+//! Responsiveness comes from the transfer queue stepping a chunk at a time on
+//! the main loop, not from a worker thread -- the panes own these values, and
+//! `Vfs` is `Send` but not `Sync`, so handing one to a thread would mean the
+//! browser losing its backend for the duration of every sync. See
+//! `sync::transfer`.
 //!
 //! Every backend is allowed to be missing capabilities -- S3 has no mtime of
 //! its own, FTP has no mode bits -- so [`Capabilities`] is part of the trait
@@ -13,8 +17,10 @@
 //! with `None`, and the confirmation window says which comparison it actually
 //! used.
 
+pub mod ftp;
 pub mod hostkey;
 pub mod local;
+pub mod remote;
 pub mod ssh;
 
 use std::{
@@ -25,7 +31,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 pub use local::LocalFs;
-pub use ssh::SshFs;
+pub use remote::RemoteAdapter;
 
 /// What an entry in a listing is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,9 +146,10 @@ pub struct Capabilities {
 
 /// A read-only view of a filesystem.
 ///
-/// Phase 1 needs listings only. Writes, deletes and transfers join the trait
-/// in the phase that performs them, so that nothing can call a method the
-/// backends do not yet implement.
+/// Methods were added in the phase that first performed them -- listings in
+/// phase 1, writes and deletes in phase 3, streaming handles in phase 4 -- so
+/// that nothing could ever call one the backends did not yet implement. What
+/// is here is what works against every implemented backend.
 pub trait Vfs: Send {
     /// Short name for the status bar: `local`, `sftp`, `s3`.
     fn scheme(&self) -> &str;
