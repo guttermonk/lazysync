@@ -208,7 +208,9 @@ fn walk(
         // The destination's backup directory is lazysync's own bookkeeping,
         // not content. Syncing it would copy old versions back as if they
         // were real files.
-        if super::safety::is_backup_path(policy, &child) {
+        if super::safety::is_backup_path(policy, &child)
+            || super::safety::is_partial_path(&config.transfer.partial_suffix, &child)
+        {
             continue;
         }
 
@@ -396,7 +398,9 @@ fn walk(
             // deletions should be recoverable, and since it lives inside the
             // destination root the next mirror would otherwise see it as
             // extraneous and remove it -- destroying every backup it holds.
-            if super::safety::is_backup_path(policy, &child) {
+            if super::safety::is_backup_path(policy, &child)
+                || super::safety::is_partial_path(&config.transfer.partial_suffix, &child)
+            {
                 continue;
             }
 

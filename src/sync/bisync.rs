@@ -445,7 +445,9 @@ fn walk(
         // lazysync's own backup directory is bookkeeping, not content. Syncing
         // it would copy superseded versions back as though they were edits --
         // and in a two-way sync, back onto the side they were superseded on.
-        if super::safety::is_backup_path(policy, &child) {
+        if super::safety::is_backup_path(policy, &child)
+            || super::safety::is_partial_path(&config.transfer.partial_suffix, &child)
+        {
             continue;
         }
 

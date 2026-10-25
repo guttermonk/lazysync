@@ -214,6 +214,33 @@ pub fn is_backup_path(policy: &DeletePolicy, relative: &std::path::Path) -> bool
     }
 }
 
+/// Whether a path is a half-written file left by an interrupted transfer.
+///
+/// Excluded from planning for the same reason as the backup directory: it is
+/// lazysync's own bookkeeping, not content. Left in, an interrupted transfer's
+/// debris becomes something the *next* sync copies to the other side as though
+/// the user had created it -- and a mirror running the other way would then
+/// either propagate it or delete it, neither of which is what anyone meant.
+///
+/// Found by CI on macOS, where a directory-granular watcher built a plan that
+/// Linux never did and the partial file turned up in it as a file to create.
+/// It was never a watch-mode bug: any sync after a failed one would have done
+/// the same.
+///
+/// **Conflict files are deliberately *not* excluded.** A
+/// `<name>.lazysync-conflict` is the copy a user explicitly chose to keep when
+/// resolving a conflict with "keep both". That is content -- the whole point
+/// of keeping it -- so it syncs like any other file.
+pub fn is_partial_path(partial_suffix: &str, relative: &std::path::Path) -> bool {
+    if partial_suffix.is_empty() {
+        return false;
+    }
+    relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(partial_suffix))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -363,6 +390,39 @@ mod tests {
             "1 of 21 and 2 of 32 are both well under the limit: {:?}",
             plan.refusal
         );
+    }
+
+    /// Debris from an interrupted transfer is excluded from planning; the
+    /// copy a user chose to keep from a conflict is not.
+    #[test]
+    fn partial_files_are_debris_but_kept_conflicts_are_content() {
+        use std::path::Path;
+
+        assert!(is_partial_path(
+            ".lazysync-part",
+            Path::new("a.txt.lazysync-part")
+        ));
+        assert!(is_partial_path(
+            ".lazysync-part",
+            Path::new("nested/deep.txt.lazysync-part")
+        ));
+
+        assert!(!is_partial_path(".lazysync-part", Path::new("a.txt")));
+        assert!(
+            !is_partial_path(".lazysync-part", Path::new("a.txt.lazysync-conflict")),
+            "a kept conflict copy is the file a user deliberately preserved, so it syncs"
+        );
+
+        // A directory merely *named* like a partial is matched on its own
+        // name, which is right: nothing should create one.
+        assert!(is_partial_path(
+            ".lazysync-part",
+            Path::new("x/y.lazysync-part")
+        ));
+
+        // An empty suffix means the feature is off, and must not match
+        // everything -- `ends_with("")` is true for every string.
+        assert!(!is_partial_path("", Path::new("a.txt")));
     }
 
     #[test]

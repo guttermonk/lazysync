@@ -1545,7 +1545,9 @@ fn a_transfers_own_partial_file_does_not_trigger_another_sync() {
         2_000_000,
     );
 
-    for _ in 0..40 {
+    // Long enough for a directory-granular backend to have delivered
+    // whatever it is going to.
+    for _ in 0..150 {
         h.app.step_watch();
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1704,5 +1706,76 @@ fn a_refused_mirror_is_recorded_as_a_refusal() {
     assert!(
         h.app.transfer.is_none(),
         "a refused plan must not start a transfer"
+    );
+}
+
+/// **An interrupted transfer's debris must not become content.**
+///
+/// A failed or cancelled sync leaves `<name>.lazysync-part` behind. Left in
+/// the planner's view, the next sync copies it to the other side as though the
+/// user had created it -- and a mirror running the other way would propagate
+/// or delete it. Neither is what anyone meant.
+///
+/// This has nothing to do with watch mode, which is only how it was found:
+/// macOS's directory-granular watcher built a plan that Linux never did, and
+/// the partial file turned up in it as a file to create.
+#[test]
+fn a_partial_file_left_by_a_failed_transfer_is_not_synced() {
+    let mut h = Harness::new(Config::default());
+
+    write(&h.left().join("real.txt"), "content", 2_000_000);
+    // Exactly what an interrupted transfer leaves.
+    write(&h.left().join("real.txt.lazysync-part"), "half", 2_000_000);
+    write(
+        &h.left().join("nested/deep.txt.lazysync-part"),
+        "half",
+        2_000_000,
+    );
+    h.refresh();
+
+    h.press("sp");
+    let plan = h.app.plan.as_ref().expect("a plan for the real file");
+
+    let paths: Vec<String> = plan
+        .rows
+        .iter()
+        .map(|r| r.path.display().to_string())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p == "real.txt"),
+        "the real file should still be planned: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("lazysync-part")),
+        "a partial file is lazysync's own debris, not content: {paths:?}"
+    );
+
+    h.apply();
+    assert!(h.right().join("real.txt").exists());
+    assert!(
+        !h.right().join("real.txt.lazysync-part").exists(),
+        "and it must certainly never be transferred"
+    );
+}
+
+/// A conflict's kept copy *is* content, and must still sync.
+///
+/// The distinction matters: `.lazysync-part` is debris from a failure, while
+/// `.lazysync-conflict` is the version a user deliberately chose to keep when
+/// resolving with `B`. Excluding both would quietly discard the second.
+#[test]
+fn a_kept_conflict_copy_is_still_synced() {
+    let mut h = Harness::new(Config::default());
+    write(&h.left().join("a.txt.lazysync-conflict"), "kept", 2_000_000);
+    h.refresh();
+
+    h.press("sp");
+    let plan = h.app.plan.as_ref().expect("a plan");
+    assert!(
+        plan.rows
+            .iter()
+            .any(|r| r.path.display().to_string().contains("lazysync-conflict")),
+        "the copy the user chose to keep is content: {:?}",
+        plan.rows.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
 }
