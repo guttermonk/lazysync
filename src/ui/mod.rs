@@ -9,6 +9,8 @@ pub mod confirm;
 pub mod form;
 mod form_view;
 mod help;
+pub mod hint;
+mod keybar;
 pub mod log;
 mod panes;
 mod progress;
@@ -33,10 +35,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Screen::Bookmarks => bookmarks::draw(frame, app, body),
         Screen::Log => log::draw(frame, app, &app.audit_entries, app.log_cursor, body),
         Screen::Browser => {
+            // One row off the panes for the key bar. The browser was the only
+            // screen that never said what you could press, which is a poor
+            // trade for a single line of listing.
+            let [panes_area, keys] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(body);
             let [left, right] =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .areas(body);
+                    .areas(panes_area);
             panes::draw(frame, app, [left, right]);
+            keybar::draw(frame, app, keys);
         }
         Screen::Form => {
             // Cloned because `app` is borrowed mutably by `draw`, and the form

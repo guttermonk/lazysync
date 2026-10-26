@@ -12,8 +12,15 @@ use ratatui::{
     Frame,
 };
 
-use super::form::{ConnectionForm, Value};
-use crate::{app::App, config::Palette};
+use super::{
+    form::{ConnectionForm, Value},
+    hint,
+};
+use crate::{
+    app::App,
+    config::Palette,
+    keys::{Action, Keymap, Mode},
+};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, form: &ConnectionForm, area: Rect) {
     let palette = &app.palette;
@@ -48,7 +55,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, form: &ConnectionForm, area: Rect)
         .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
-    draw_footer(frame, form, palette, footer);
+    draw_footer(frame, form, palette, app.keymaps.get(Mode::Form), footer);
 }
 
 fn row<'a>(
@@ -127,7 +134,13 @@ fn value_text(field: &super::form::Field) -> String {
     }
 }
 
-fn draw_footer(frame: &mut Frame<'_>, form: &ConnectionForm, palette: &Palette, area: Rect) {
+fn draw_footer(
+    frame: &mut Frame<'_>,
+    form: &ConnectionForm,
+    palette: &Palette,
+    keymap: &Keymap,
+    area: Rect,
+) {
     let mut lines = Vec::new();
 
     // The hint for the focused field, which is where the explanation of each
@@ -146,9 +159,17 @@ fn draw_footer(frame: &mut Frame<'_>, form: &ConnectionForm, palette: &Palette, 
         )));
     }
 
+    let hints = hint::line(
+        keymap,
+        &[
+            (Action::MoveDown, "next field"),
+            (Action::NextChoice, "change choice"),
+            (Action::Submit, "save"),
+            (Action::Cancel, "discard"),
+        ],
+    );
     lines.push(Line::from(Span::styled(
-        "  tab/\u{2193} next field \u{b7} \u{2190}\u{2192} change choice \u{b7} \
-         enter save \u{b7} esc discard",
+        format!(" {hints}"),
         Style::default().fg(palette.dim),
     )));
 

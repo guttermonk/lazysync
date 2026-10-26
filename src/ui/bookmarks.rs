@@ -15,11 +15,15 @@ use ratatui::{
     Frame,
 };
 
-use super::shorten_path;
-use crate::app::App;
+use super::{hint, shorten_path};
+use crate::{
+    app::App,
+    keys::{Action, Mode},
+};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let [body, hint] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
+    let [body, hints_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
 
     let palette = &app.palette;
     let visible = app.visible_bookmarks();
@@ -42,11 +46,27 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(block, body);
 
     if visible.is_empty() {
+        let keymap = app.keymaps.get(Mode::Bookmarks);
+        // Both sentences name a key, so both have to ask the keymap for it.
+        // This empty state is the first thing a new user reads, and it was
+        // telling them to press the default key rather than their own.
         let message = if app.store.bookmarks.is_empty() {
-            "  No saved connections yet.\n\n  Press n to add one. Connection details are \
-             entered on that page -- this list only ever shows the name."
+            let press = hint::key_for(keymap, Action::NewItem).map_or_else(
+                || {
+                    "  Nothing is bound to \"new connection\" in your keymap -- see `?`."
+                        .to_string()
+                },
+                |key| format!("  Press {key} to add one."),
+            );
+            format!(
+                "  No saved connections yet.\n\n{press} Connection details are entered on that \
+                 page -- this list only ever shows the name."
+            )
         } else {
-            "  Nothing matches that filter. Press Esc to clear it."
+            hint::key_for(keymap, Action::Cancel).map_or_else(
+                || "  Nothing matches that filter.".to_string(),
+                |key| format!("  Nothing matches that filter. Press {key} to clear it."),
+            )
         };
         frame.render_widget(
             Paragraph::new(message)
@@ -54,7 +74,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .wrap(Wrap { trim: false }),
             inner,
         );
-        draw_hints(frame, app, hint);
+        draw_hints(frame, app, hints_area);
         return;
     }
 
@@ -122,7 +142,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ));
     frame.render_stateful_widget(table, inner, &mut state);
 
-    draw_hints(frame, app, hint);
+    draw_hints(frame, app, hints_area);
 }
 
 /// A line of key hints, plus what opening the selected entry will do.
@@ -133,9 +153,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_hints(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let palette = &app.palette;
 
+    let hints = hint::line(
+        app.keymaps.get(Mode::Bookmarks),
+        &[
+            (Action::OpenItem, "open"),
+            (Action::NewItem, "new"),
+            (Action::EditItem, "edit"),
+            (Action::DeleteItem, "delete"),
+            (Action::Search, "filter"),
+            (Action::Cancel, "local browser"),
+            (Action::Help, "help"),
+        ],
+    );
     let mut lines = vec![Line::from(Span::styled(
-        "  enter open \u{b7} n new \u{b7} e edit \u{b7} dd delete \u{b7} / filter \u{b7} \
-         esc local browser \u{b7} ? help",
+        format!(" {hints}"),
         Style::default().fg(palette.dim),
     ))];
 
@@ -157,4 +188,103 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use crate::{app::App, config::Config};
+
+    /// Render the real screen and read the footer off the cells.
+    ///
+    /// The store is emptied after construction rather than by pointing
+    /// `LAZYSYNC_DEV_CONFIG_DIR` at a temp directory: an env var is process
+    /// global, so two of these running in parallel would fight over it, and
+    /// a test whose result depends on which thread won is the kind of thing
+    /// that only shows up in CI.
+    fn rendered_with(config_toml: &str) -> String {
+        let config: Config = toml::from_str(config_toml).expect("the test config must parse");
+
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let mut app = App::new(config, here.clone(), here).unwrap();
+        app.store = Default::default();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
+        terminal
+            .draw(|frame| super::draw(frame, &app, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The reported bug, end to end: the footer and the empty-state sentence
+    /// both have to name the rebound key.
+    ///
+    /// The unit tests in `super::super::hint` cover the rendering rule; this
+    /// one covers the wiring, which is where the bug actually was. The footer
+    /// logic was correct in the sense that it compiled -- it was a literal
+    /// that nothing connected to the keymap at all.
+    #[test]
+    fn a_rebound_new_connection_key_is_what_the_screen_says() {
+        let screen = rendered_with(
+            r#"
+[keys.bookmarks]
+base = [
+    ["NewItem", "a"],
+    ["OpenItem", "o"],
+    ["Cancel", "esc"],
+]
+"#,
+        );
+
+        assert!(
+            screen.contains("a new"),
+            "the footer must offer the bound key.\n{screen}"
+        );
+        assert!(
+            screen.contains("Press a to add one"),
+            "the empty state must name the bound key -- this is the sentence that was \
+             telling the user to press `n`.\n{screen}"
+        );
+        assert!(
+            !screen.contains("n new"),
+            "`n new` is the literal this replaced, and `n` is not bound here.\n{screen}"
+        );
+        assert!(
+            !screen.contains("Press n to add"),
+            "the old empty-state literal must be gone.\n{screen}"
+        );
+    }
+
+    /// An action nobody bound is not advertised, since the whole point is that
+    /// a footer lists keys that work.
+    #[test]
+    fn an_unbound_action_is_not_advertised() {
+        let screen = rendered_with(
+            r#"
+[keys.bookmarks]
+base = [["NewItem", "a"]]
+"#,
+        );
+
+        assert!(screen.contains("a new"));
+        assert!(
+            !screen.contains("delete"),
+            "DeleteItem is unbound in this map, so the footer must not offer it.\n{screen}"
+        );
+        assert!(
+            !screen.contains("edit"),
+            "EditItem is unbound in this map too.\n{screen}"
+        );
+    }
 }

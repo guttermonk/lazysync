@@ -274,9 +274,40 @@ impl ConnectionForm {
         &mut self.fields[index]
     }
 
+    /// Move to the next *relevant* field, skipping the dimmed ones.
+    ///
+    /// An irrelevant field is shown rather than hidden, so that the rows do
+    /// not jump around as the auth choice changes -- but it cannot be edited
+    /// and nothing you type into it is used, so stopping the cursor there is
+    /// a dead end the user has to press past. Skipping keeps the two
+    /// behaviours consistent: dimmed means inert, for the cursor as well as
+    /// for the value.
+    ///
+    /// If nothing in that direction is relevant the cursor stays put, which
+    /// is what the clamp did before and keeps `Auth` reachable no matter
+    /// which method is selected.
     pub fn move_cursor(&mut self, delta: isize) {
-        let last = self.fields.len() - 1;
-        self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        if delta == 0 || self.fields.is_empty() {
+            return;
+        }
+        let step = delta.signum();
+        let last = (self.fields.len() - 1) as isize;
+
+        // One relevant field per unit of `delta`, so holding a key still moves
+        // at the rate the caller asked for rather than jumping the whole form.
+        let mut cursor = self.cursor as isize;
+        for _ in 0..delta.unsigned_abs() {
+            let mut probe = cursor + step;
+            while (0..=last).contains(&probe) && !self.is_relevant(self.fields[probe as usize].id) {
+                probe += step;
+            }
+            if !(0..=last).contains(&probe) {
+                break;
+            }
+            cursor = probe;
+        }
+
+        self.cursor = cursor as usize;
     }
 
     /// Whether typed characters currently go into the form.
@@ -523,6 +554,106 @@ mod tests {
         assert_eq!(form.focused().value.as_text(), "ww");
     }
 
+    fn at(form: &ConnectionForm, id: FieldId) -> usize {
+        form.fields.iter().position(|f| f.id == id).unwrap()
+    }
+
+    /// Select an auth method by name, leaving the cursor on `Auth`.
+    fn set_auth(form: &mut ConnectionForm, want: &str) {
+        form.cursor = at(form, FieldId::Auth);
+        for _ in 0..AuthMethod::ALL.len() {
+            if form.focused().value.as_text() == want {
+                return;
+            }
+            form.cycle(true);
+        }
+        panic!("no auth method named {want}");
+    }
+
+    /// A dimmed field is inert, so the cursor must not stop on it.
+    ///
+    /// Reported against a password connection, where `Key file` could still
+    /// be selected and typed into even though nothing would read it.
+    #[test]
+    fn moving_down_skips_a_field_the_auth_method_makes_irrelevant() {
+        let mut form = ConnectionForm::new();
+        set_auth(&mut form, "password");
+
+        assert!(
+            !form.is_relevant(FieldId::IdentityFile),
+            "key file is not used by password auth"
+        );
+
+        form.move_cursor(1);
+        assert_eq!(
+            form.focused().id,
+            FieldId::RemotePath,
+            "the cursor must step over `Key file`, not land on it"
+        );
+    }
+
+    #[test]
+    fn moving_up_skips_it_too() {
+        let mut form = ConnectionForm::new();
+        set_auth(&mut form, "password");
+        form.cursor = at(&form, FieldId::RemotePath);
+
+        form.move_cursor(-1);
+        assert_eq!(form.focused().id, FieldId::Auth);
+    }
+
+    /// The mirror case: with key auth it is `remember password` that is inert.
+    #[test]
+    fn the_other_auth_method_skips_the_other_field() {
+        let mut form = ConnectionForm::new();
+        set_auth(&mut form, "key");
+
+        assert!(!form.is_relevant(FieldId::RememberPassword));
+        assert!(form.is_relevant(FieldId::IdentityFile));
+
+        form.move_cursor(1);
+        assert_eq!(
+            form.focused().id,
+            FieldId::IdentityFile,
+            "key file is relevant here, so it is not skipped"
+        );
+
+        // It is also the last field, so moving down off the end holds rather
+        // than wrapping onto something inert.
+        form.cursor = at(&form, FieldId::SyncBrowse);
+        form.move_cursor(1);
+        assert_eq!(form.focused().id, FieldId::SyncBrowse);
+    }
+
+    /// Every field has to stay reachable under both auth methods, or the
+    /// skipping would have made part of the form impossible to fill in.
+    #[test]
+    fn every_relevant_field_is_still_reachable_by_walking_down() {
+        for method in ["password", "key", "agent"] {
+            let mut form = ConnectionForm::new();
+            set_auth(&mut form, method);
+
+            form.cursor = 0;
+            let mut seen = vec![form.focused().id];
+            for _ in 0..form.fields.len() * 2 {
+                form.move_cursor(1);
+                if !seen.contains(&form.focused().id) {
+                    seen.push(form.focused().id);
+                }
+            }
+
+            for field in &form.fields {
+                if form.is_relevant(field.id) {
+                    assert!(
+                        seen.contains(&field.id),
+                        "{:?} is relevant under {method} auth but cannot be reached",
+                        field.id
+                    );
+                }
+            }
+        }
+    }
+
     /// A choice field must not swallow typed characters as text, or typing in
     /// one would silently do nothing.
     #[test]
@@ -576,13 +707,26 @@ mod tests {
         assert_eq!(form.focused().value.as_text(), "no");
     }
 
+    /// The cursor must not run off either end.
+    ///
+    /// The far end is the last *relevant* field rather than the last index:
+    /// with the default auth method `remember password` is dimmed, and the
+    /// cursor no longer stops on a dimmed field.
     #[test]
     fn the_cursor_stops_at_the_ends() {
         let mut form = ConnectionForm::new();
+
         form.move_cursor(-5);
         assert_eq!(form.cursor, 0);
+
         form.move_cursor(999);
-        assert_eq!(form.cursor, form.fields.len() - 1);
+        let last_relevant = form
+            .fields
+            .iter()
+            .rposition(|f| form.is_relevant(f.id))
+            .unwrap();
+        assert_eq!(form.cursor, last_relevant);
+        assert!(form.is_relevant(form.focused().id));
     }
 
     /// Fields that do not apply to the chosen auth method are dimmed rather

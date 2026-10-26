@@ -201,6 +201,18 @@ Behaviour when the counterpart directory doesn't exist (`sync_browse.on_missing`
 | `create` | Create the missing directory (prompt once per session unless `always`). |
 | `ask` | Prompt per occurrence. |
 
+Going **above** a sync root is the same idea pointed the other way. There is
+no relative path to follow, so the follower holds — but the pairing is kept,
+and walking back in re-couples the panes on its own.
+
+It must not re-anchor. The two roots are not required to share a name (`sandbox
+subdomain` paired with `www`), so once the original pair is discarded nothing
+can reconstruct it: descending back into the directory you just left asks the
+follower for a *sibling of its own root*, which does not exist, and the panes
+appear broken with no way back short of reopening the bookmark. Re-pairing is
+available deliberately — toggling sync-browse off and on anchors the two
+directories you are looking at.
+
 Your asymmetric case — local has a handful of the remote's directories:
 
 - Each pane always lists its **own** full contents. Sync-browse couples the

@@ -62,22 +62,42 @@ pub enum Followed {
     Created(PathBuf),
     /// `on_missing = "ask"`: the caller should ask before creating `0`.
     NeedsPermission(PathBuf),
-    /// The leader navigated outside its anchor, so both anchors were reset to
-    /// where the panes now are.
-    Reanchored,
+    /// The leader stepped above its anchor, so there is no relative path to
+    /// follow. The follower holds and **the pairing is kept**, so coming back
+    /// down re-couples the panes.
+    OutsideRoot,
 }
 
 /// Move the follower to match the leader.
 ///
 /// `leader` is the pane that just navigated; `follower` is the other one.
 pub fn follow(leader: &mut Pane, follower: &mut Pane, on_missing: OnMissing) -> Followed {
-    // Leaving the anchor behind means relative paths would be `../..`-shaped
-    // and meaningless. Re-anchor both panes where they stand instead; it is
-    // what the user implied by navigating out.
+    // Above the anchor there is no relative path to follow -- it would be
+    // `../..`-shaped, and the two roots are not required to share a name, so
+    // nothing can reconstruct the correspondence by walking back down.
+    //
+    // **The anchors are therefore left alone.** This used to re-anchor both
+    // panes where they stood, on the reasoning that navigating out implied a
+    // new pairing. It does not, and the cost was severe: one press of the
+    // parent key destroyed the pairing the bookmark had established, and
+    // because the roots usually have *different* names -- `sandbox
+    // subdomain` paired with `www` -- walking back into the directory you
+    // just left pointed the follower at a sibling that does not exist. The
+    // panes looked broken and the only way back was to reopen the bookmark.
+    //
+    // Holding the pairing instead means stepping out is a temporary
+    // excursion: the follower stays put, and the moment the leader is back
+    // inside its root the normal relative follow resumes and the panes
+    // re-couple on their own. That matches what the ghost mechanism already
+    // does when you descend into a directory the other side lacks, which is
+    // the same problem pointed the other way.
+    //
+    // Deliberately re-pairing is still available, and is now something you
+    // ask for rather than something a stray keystroke does: toggling
+    // synchronized browsing off and on calls `anchor_both` and pairs the two
+    // directories you are actually looking at.
     let Some(relative) = leader.relative_to_sync_root() else {
-        leader.reanchor();
-        follower.reanchor();
-        return Followed::Reanchored;
+        return Followed::OutsideRoot;
     };
 
     let target = follower.sync_root.join(&relative);
@@ -364,21 +384,114 @@ mod tests {
         assert!(!left.path().join("docs").exists());
     }
 
-    /// Navigating above the anchor re-anchors both panes rather than
-    /// generating relative paths full of `..`.
+    /// Stepping above the anchor must not destroy the pairing.
     #[test]
-    fn leaving_the_anchor_reanchors_both_panes() {
+    fn leaving_the_anchor_keeps_both_anchors() {
+        let (_dir, mut panes) = trees();
+        anchor_both(&mut panes);
+
+        let [left, right] = &mut panes;
+        let left_anchor = left.sync_root.clone();
+        let right_anchor = right.sync_root.clone();
+        let right_was = right.path().to_path_buf();
+
+        left.parent().unwrap();
+        let result = follow(left, right, OnMissing::Ghost);
+
+        assert_eq!(result, Followed::OutsideRoot);
+        assert_eq!(left.sync_root, left_anchor, "the pairing must survive");
+        assert_eq!(right.sync_root, right_anchor);
+        assert_eq!(right.path(), right_was, "the follower holds its place");
+    }
+
+    /// The reported bug, as a regression test.
+    ///
+    /// Back out of the paired root and walk straight back into it. The two
+    /// roots have *different names* here -- `left` pairs with `right` -- which
+    /// is what made the old re-anchoring behaviour destructive: after it, the
+    /// follower was asked for `right/left`, which does not exist, and the
+    /// panes could not be re-coupled without reopening the bookmark.
+    #[test]
+    fn backing_out_of_the_root_and_returning_recouples() {
+        let (_dir, mut panes) = trees();
+        anchor_both(&mut panes);
+
+        let [left, right] = &mut panes;
+        let root_name = left
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // Out of the paired root...
+        left.parent().unwrap();
+        assert_eq!(follow(left, right, OnMissing::Ghost), Followed::OutsideRoot);
+
+        // ...and back into it.
+        enter(left, &root_name);
+        let result = follow(left, right, OnMissing::Ghost);
+
+        assert!(
+            matches!(result, Followed::Moved(_)),
+            "returning to the root must re-couple, got {result:?}"
+        );
+        assert!(!right.is_ghost(), "the follower must not be stranded");
+        assert!(
+            right.path().ends_with("right"),
+            "the follower belongs at its own root, not at right/{root_name}: {}",
+            right.path().display()
+        );
+        assert!(in_step(&panes));
+    }
+
+    /// And descending again after the excursion still maps correctly, which
+    /// is the part that silently pointed at a sibling before.
+    #[test]
+    fn descending_after_an_excursion_maps_to_the_right_directory() {
+        let (_dir, mut panes) = trees();
+        anchor_both(&mut panes);
+
+        let [left, right] = &mut panes;
+        let root_name = left
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        left.parent().unwrap();
+        follow(left, right, OnMissing::Ghost);
+        enter(left, &root_name);
+        follow(left, right, OnMissing::Ghost);
+
+        enter(left, "src");
+        follow(left, right, OnMissing::Ghost);
+
+        assert!(
+            right.path().ends_with("right/src"),
+            "expected right/src, got {}",
+            right.path().display()
+        );
+        assert_eq!(common_relative(&panes).unwrap(), Path::new("src"));
+    }
+
+    /// Toggling synchronized browsing is how you deliberately re-pair, now
+    /// that a stray parent-key press no longer does it.
+    #[test]
+    fn anchoring_again_is_how_a_new_pairing_is_established() {
         let (_dir, mut panes) = trees();
         anchor_both(&mut panes);
 
         let [left, right] = &mut panes;
         left.parent().unwrap();
+        follow(left, right, OnMissing::Ghost);
 
-        let result = follow(left, right, OnMissing::Ghost);
+        anchor_both(&mut panes);
 
-        assert_eq!(result, Followed::Reanchored);
-        assert_eq!(left.sync_root, left.path());
-        assert_eq!(right.sync_root, right.path());
+        assert_eq!(panes[0].sync_root, panes[0].path());
+        assert_eq!(panes[1].sync_root, panes[1].path());
+        assert!(in_step(&panes));
     }
 
     #[test]

@@ -105,10 +105,23 @@ impl Harness {
             .unwrap_or_else(|| panic!("no field labelled {label:?}"));
 
         // Tab down from the top, so the movement goes through the keymap.
+        //
+        // Tab *until it arrives* rather than `index` times: a tab skips over
+        // fields the chosen auth method makes irrelevant, so a press is no
+        // longer the same thing as an index step.
         self.app.form.as_mut().unwrap().cursor = 0;
-        for _ in 0..index {
+        let limit = self.app.form.as_ref().unwrap().fields.len() * 2;
+        for _ in 0..limit {
+            if self.app.form.as_ref().unwrap().cursor == index {
+                break;
+            }
             self.tab();
         }
+        assert_eq!(
+            self.app.form.as_ref().unwrap().cursor,
+            index,
+            "{label:?} could not be reached by tabbing -- is it dimmed for this auth method?"
+        );
         self.press(text);
     }
 

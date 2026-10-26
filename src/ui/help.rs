@@ -49,13 +49,38 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, scroll: usize) {
                 .title_bottom(Line::from(vec![
                     Span::styled(position, Style::default().fg(app.palette.dim)),
                     Span::styled(
-                        " j/k scroll \u{b7} q close ",
+                        // The help screen listing the wrong keys would be the
+                        // worst instance of all, since it is where somebody
+                        // goes to recover from the others.
+                        format!("{} ", scroll_and_close(app.keymaps.get(Mode::Help))),
                         Style::default().fg(app.palette.dim),
                     ),
                 ])),
         ),
         area,
     );
+}
+
+/// The overlay's own two keys, which are in `Mode::Help` rather than the mode
+/// being documented.
+fn scroll_and_close(keymap: &crate::keys::Keymap) -> String {
+    let scroll = [
+        super::hint::key_for(keymap, Action::MoveDown),
+        super::hint::key_for(keymap, Action::MoveUp),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("/");
+
+    let mut parts = Vec::new();
+    if !scroll.is_empty() {
+        parts.push(format!("{scroll} scroll"));
+    }
+    if let Some(close) = super::hint::key_for(keymap, Action::Cancel) {
+        parts.push(format!("{close} close"));
+    }
+    format!(" {}", parts.join(" \u{b7} "))
 }
 
 /// One line per action, grouped by [`Action::group`].

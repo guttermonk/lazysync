@@ -26,10 +26,13 @@ use ratatui::{
     Frame,
 };
 
-use super::{format_size, shorten_path};
+use super::{format_size, hint, shorten_path};
 use crate::{
     app::App,
     config::Palette,
+    // `Action` is already the plan's action in this file, so the keymap's is
+    // aliased rather than shadowing it.
+    keys::{Action as KeyAction, Mode},
     sync::{
         plan::{Action, Plan, Resolution, Row, Section, Side},
         safety::DeletePolicy,
@@ -538,19 +541,47 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, plan: &Plan, palette: &Palette,
     // The resolution keys are offered only when there is something to
     // resolve. A footer listing four keys that do nothing is a footer nobody
     // reads the useful half of.
+    //
+    // Built from the keymap, which on this screen is not a nicety. The
+    // literal this replaced said `n cancel`, and a user who had rebound
+    // `Cancel` to `esc`/`q` -- leaving `n` as `ParentDir` -- was being told
+    // that the way out of a window about to overwrite their files was a key
+    // that does not take it.
+    let keymap = app.keymaps.get(Mode::Confirm);
     let keys = if totals.conflicts > 0 {
-        " y apply \u{b7} n cancel \u{b7} space include/exclude \u{b7} L keep local \u{b7} \
-         R keep remote \u{b7} B keep both \u{b7} X leave alone \u{b7} ? help"
+        hint::line(
+            keymap,
+            &[
+                (KeyAction::Apply, "apply"),
+                (KeyAction::Cancel, "cancel"),
+                (KeyAction::ToggleRow, "include/exclude"),
+                (KeyAction::ResolveKeepLocal, "keep local"),
+                (KeyAction::ResolveKeepRemote, "keep remote"),
+                (KeyAction::ResolveKeepBoth, "keep both"),
+                (KeyAction::ResolveSkip, "leave alone"),
+                (KeyAction::Help, "help"),
+            ],
+        )
     } else {
-        " y apply \u{b7} n cancel \u{b7} space include/exclude \u{b7} a all \u{b7} i invert \
-         \u{b7} o only \u{b7} zc/zo fold \u{b7} ? help"
+        hint::line(
+            keymap,
+            &[
+                (KeyAction::Apply, "apply"),
+                (KeyAction::Cancel, "cancel"),
+                (KeyAction::ToggleRow, "include/exclude"),
+                (KeyAction::AllRows, "all"),
+                (KeyAction::InvertRows, "invert"),
+                (KeyAction::OnlyRow, "only"),
+                (KeyAction::FoldSection, "fold"),
+                (KeyAction::UnfoldSection, "unfold"),
+                (KeyAction::Help, "help"),
+            ],
+        )
     };
     lines.push(Line::from(Span::styled(
         keys,
         Style::default().fg(palette.dim),
     )));
-
-    let _ = app;
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 

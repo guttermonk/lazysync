@@ -164,6 +164,11 @@ lazysync sync deploy ~/proj /mnt/backup --yes      # headless, for cron
 lazysync import termscp               # import termscp bookmarks
 ```
 
+These are the **default** bindings. Every one of them is remappable (see
+below), and `lazysync keys` prints what yours actually resolve to — which is
+also what the on-screen hints are generated from, so the footers follow your
+config rather than this page.
+
 In the connection list: `enter` opens, `n` adds, `e` edits, `dd` deletes, `/`
 filters, `esc` drops to the local browser.
 
@@ -417,8 +422,24 @@ extra = [
 ]
 ```
 
-`lazysync keys` prints what a config actually resolves to, and the in-app help
-overlay (`?`) is generated from the live keymap rather than a hardcoded list.
+**Prefer `extra` unless you mean to start from nothing.** `base` replaces the
+mode's defaults *wholesale*, so any action you leave out of it ends up with no
+key at all — and the symptom is a key that silently does nothing, which reads
+like a bug rather than a gap in the config. A `base` for `[keys.browser]` that
+rebinds the motions and forgets the `s`-prefixed sync chords leaves lazysync
+unable to start a sync. Reach for `base` when you want a layout built from
+scratch; use `extra` to change a few keys.
+
+Either way, check it:
+
+```console
+$ lazysync keys --mode browser    # what your config actually resolves to
+```
+
+`lazysync keys` prints the resolved keymap, the in-app help overlay (`?`) is
+generated from it, and so is every on-screen key hint — so nothing in the UI
+can claim a binding you do not have. If the footer does not offer an action,
+nothing is bound to it.
 
 ## zide integration
 

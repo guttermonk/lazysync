@@ -16,7 +16,13 @@ use ratatui::{
     Frame,
 };
 
-use crate::{app::App, config::Palette, sync::audit::Entry};
+use super::hint;
+use crate::{
+    app::App,
+    config::Palette,
+    keys::{Action, Keymap, Mode},
+    sync::audit::Entry,
+};
 
 /// Draw the log over the whole area.
 pub fn draw(frame: &mut Frame<'_>, app: &App, entries: &[Entry], cursor: usize, area: Rect) {
@@ -59,7 +65,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, entries: &[Entry], cursor: usize, 
             .wrap(Wrap { trim: false }),
             body,
         );
-        draw_footer(frame, palette, footer);
+        draw_footer(frame, palette, app.keymaps.get(Mode::Log), footer);
         return;
     }
 
@@ -89,7 +95,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, entries: &[Entry], cursor: usize, 
     frame.render_stateful_widget(list, body, &mut state);
 
     draw_detail(frame, entries.get(cursor), palette, detail);
-    draw_footer(frame, palette, footer);
+    draw_footer(frame, palette, app.keymaps.get(Mode::Log), footer);
 }
 
 /// The selected run's files.
@@ -144,10 +150,32 @@ fn draw_detail(frame: &mut Frame<'_>, entry: Option<&Entry>, palette: &Palette, 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn draw_footer(frame: &mut Frame<'_>, palette: &Palette, area: Rect) {
+fn draw_footer(frame: &mut Frame<'_>, palette: &Palette, keymap: &Keymap, area: Rect) {
+    // `MoveDown`/`MoveUp` are two actions presented as one hint, because
+    // "move" is one idea to the reader. Both are named so a split binding --
+    // down on one key, up on another that is not its pair -- still reads
+    // correctly.
+    let movement = [
+        hint::key_for(keymap, Action::MoveDown),
+        hint::key_for(keymap, Action::MoveUp),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("/");
+
+    let mut parts = Vec::new();
+    if !movement.is_empty() {
+        parts.push(format!("{movement} move"));
+    }
+    let rest = hint::line(keymap, &[(Action::Cancel, "back"), (Action::Help, "help")]);
+    if !rest.is_empty() {
+        parts.push(rest.trim_start().to_string());
+    }
+
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " j/k move \u{b7} esc back \u{b7} ? help",
+            format!(" {}", parts.join(" \u{b7} ")),
             Style::default().fg(palette.dim),
         ))),
         area,
@@ -162,7 +190,8 @@ mod tests {
     use crate::sync::{
         audit,
         executor::{Applied, Outcome, Report},
-        plan::Action,
+        // `Action` is the keymap's in this module now, so the plan's is aliased.
+        plan::Action as PlanAction,
     };
 
     fn entry_with_failure() -> Entry {
@@ -170,12 +199,12 @@ mod tests {
             applied: vec![
                 Applied {
                     path: "ok.txt".into(),
-                    action: Action::Create,
+                    action: PlanAction::Create,
                     outcome: Outcome::Transferred { bytes: 5 },
                 },
                 Applied {
                     path: "bad.txt".into(),
-                    action: Action::Overwrite,
+                    action: PlanAction::Overwrite,
                     outcome: Outcome::Failed {
                         why: "permission denied".into(),
                     },

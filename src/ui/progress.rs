@@ -16,10 +16,11 @@ use ratatui::{
     Frame,
 };
 
-use super::{format_size, shorten_path};
+use super::{format_size, hint, shorten_path};
 use crate::{
     app::App,
     config::Palette,
+    keys::{Action, Keymap, Mode},
     sync::{
         executor::Outcome,
         transfer::{format_duration, State, Transfer},
@@ -43,7 +44,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, transfer: &Transfer, area: Rect) {
     draw_header(frame, transfer, palette, header);
     draw_bars(frame, transfer, palette, bars);
     draw_log(frame, transfer, palette, log);
-    draw_footer(frame, transfer, palette, footer);
+    draw_footer(
+        frame,
+        transfer,
+        palette,
+        app.keymaps.get(Mode::Queue),
+        footer,
+    );
 }
 
 fn draw_header(frame: &mut Frame<'_>, transfer: &Transfer, palette: &Palette, area: Rect) {
@@ -224,7 +231,13 @@ fn draw_log(frame: &mut Frame<'_>, transfer: &Transfer, palette: &Palette, area:
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn draw_footer(frame: &mut Frame<'_>, transfer: &Transfer, palette: &Palette, area: Rect) {
+fn draw_footer(
+    frame: &mut Frame<'_>,
+    transfer: &Transfer,
+    palette: &Palette,
+    keymap: &Keymap,
+    area: Rect,
+) {
     let report = transfer.report();
     let failures = report.failures().count();
 
@@ -242,8 +255,18 @@ fn draw_footer(frame: &mut Frame<'_>, transfer: &Transfer, palette: &Palette, ar
     lines.push(Line::from(Span::styled(
         match transfer.state() {
             State::Finished => " any key to return to the browser ".to_string(),
-            State::Paused => " p resume \u{b7} esc cancel ".to_string(),
-            _ => " p pause \u{b7} esc cancel ".to_string(),
+            // `TogglePause` is one action with two labels, since what it does
+            // next depends on the state -- and it is omitted entirely when
+            // nothing is bound to it, rather than offering a `p` that a
+            // replaced `base` map never defined.
+            State::Paused => hint::line(
+                keymap,
+                &[(Action::TogglePause, "resume"), (Action::Cancel, "cancel")],
+            ),
+            _ => hint::line(
+                keymap,
+                &[(Action::TogglePause, "pause"), (Action::Cancel, "cancel")],
+            ),
         },
         Style::default().fg(palette.dim),
     )));

@@ -2137,7 +2137,15 @@ impl App {
         self.desynced = matches!(outcome, Followed::Desynced);
 
         match outcome {
-            Followed::Moved(_) | Followed::Reanchored => self.status.clear(),
+            Followed::Moved(_) => self.status.clear(),
+            // Said plainly, because the panes are deliberately not moving
+            // together and that would otherwise look like the feature had
+            // broken. The second half is the part that matters: it tells you
+            // the pairing is still there and you do not have to reopen the
+            // connection to get it back.
+            Followed::OutsideRoot => {
+                self.status = "above the paired root -- go back in to re-couple".into();
+            }
             // No path in these two: the status bar already shows the shared
             // relative path, and an absolute temp path would push everything
             // else off the line.
