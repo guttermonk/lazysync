@@ -14,9 +14,34 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, Screen},
+    app::{App, Screen, StatusKind},
     browser::sync_browse,
+    config::Palette,
 };
+
+/// How a message is drawn, given what kind it is.
+///
+/// The whole reason this exists: a message rendered in `palette.fg` sits at
+/// the end of a line of mode badges, paths and counters that are also
+/// `palette.fg`. Pressing a sync key and getting "nothing to push" was
+/// reported as the key doing nothing, while the sentence was on screen --
+/// it simply did not read as a reply to anything.
+///
+/// An answer is therefore highlighted and bold, and a refusal is coloured
+/// like the other things that stop a transfer. Ambient notes keep the old
+/// styling, because making everything loud is the same as making nothing
+/// loud.
+fn message_style(kind: StatusKind, palette: &Palette) -> Style {
+    match kind {
+        StatusKind::Note => Style::default().fg(palette.fg),
+        StatusKind::Answer => Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
+        StatusKind::Problem => Style::default()
+            .fg(palette.warn)
+            .add_modifier(Modifier::BOLD),
+    }
+}
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let palette = &app.palette;
@@ -42,7 +67,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         if !app.status.is_empty() {
             spans.push(Span::styled(
                 format!(" {} ", app.status),
-                Style::default().fg(palette.fg),
+                message_style(app.status_kind, palette),
             ));
         }
 

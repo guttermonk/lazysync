@@ -364,6 +364,16 @@ pub struct Plan {
     pub method: Method,
     pub tolerance_secs: i64,
 
+    /// How many top-level names the plan was limited to, when it was built
+    /// from the source pane's marks rather than from the whole directory.
+    ///
+    /// The window has to say so. A plan that covers four marked files looks
+    /// exactly like a plan for a directory that happens to contain four
+    /// changed files, and the difference matters: in the first, everything
+    /// else was never examined, so "nothing else to do" is not something the
+    /// window would be entitled to imply.
+    pub scoped_to: Option<usize>,
+
     /// Directories that could not be read, with why.
     ///
     /// Kept rather than aborting: a plan covering the readable 95% of a tree

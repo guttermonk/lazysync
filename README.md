@@ -189,6 +189,19 @@ synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
 own sync profile, `sw` watches the tree, `sL` shows the audit log. All of it
 remappable — see below.
 
+### Marks scope the sync
+
+`space` marks a row. With anything marked in the pane files are being sent
+*from*, a sync plans only those names — the rest of the directory is not
+examined at all. Mark a directory and you get the whole directory.
+
+A mirror obeys the same scope, including its deletions: marking one file and
+pressing `sm` will not plan the removal of everything else on the other side.
+The confirmation window says `3 marked items only` so a narrow plan can never
+be mistaken for a complete one.
+
+With nothing marked, a sync covers the whole directory as before.
+
 ### The confirmation window
 
 `sp` does not transfer anything. It builds a plan and shows it:

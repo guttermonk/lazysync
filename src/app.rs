@@ -108,6 +108,8 @@ pub enum Pending {
     TrustHostKey,
     /// Apply the plan under review, after a second confirmation.
     ApplyPlan,
+    /// Close the open connection and return to the connection list.
+    LeaveConnection,
     /// Nothing. The answer was "no" and no has no side effect.
     Nothing,
 }
@@ -154,6 +156,15 @@ pub struct App {
     pub overlay: Overlay,
     /// The status line message, cleared by the next action that sets one.
     pub status: String,
+
+    /// How loudly to say it.
+    ///
+    /// Reset to [`StatusKind::Note`] at the top of every action, so a
+    /// handler opts into prominence for the message it is about to set and
+    /// cannot leave a stale colour behind for the next one. That is why this
+    /// is a second field rather than part of the message: eighty-odd places
+    /// assign a plain status, and all of them stay correct by doing nothing.
+    pub status_kind: StatusKind,
     pub should_quit: bool,
 
     // ── Screens ──────────────────────────────────────────────────────────
@@ -252,6 +263,7 @@ impl App {
             desynced: false,
             overlay: Overlay::None,
             status: String::new(),
+            status_kind: StatusKind::Note,
             should_quit: false,
             screen: Screen::Browser,
             store,
@@ -357,6 +369,11 @@ impl App {
 
     /// Apply an action in the current mode.
     pub fn handle(&mut self, action: Action) {
+        // Every action starts from "ambient". A handler that wants its
+        // message to stand out says so while setting it; one that does not
+        // cannot inherit the last action's emphasis.
+        self.status_kind = StatusKind::Note;
+
         match self.mode() {
             Mode::Bookmarks => self.handle_bookmarks(action),
             Mode::Browser => self.handle_browser(action),
@@ -475,6 +492,7 @@ impl App {
             Action::EditItem => match self.selected_bookmark() {
                 Some(bookmark) if bookmark.builtin => {
                     self.status = format!("{} is built in -- nothing to configure", bookmark.name);
+                    self.status_kind = StatusKind::Problem;
                 }
                 Some(bookmark) => {
                     self.form = Some(ConnectionForm::edit(bookmark));
@@ -486,6 +504,7 @@ impl App {
             Action::DeleteItem => match self.selected_bookmark() {
                 Some(bookmark) if bookmark.builtin => {
                     self.status = format!("{} is built in and cannot be deleted", bookmark.name);
+                    self.status_kind = StatusKind::Problem;
                 }
                 Some(bookmark) => {
                     let name = bookmark.name.clone();
@@ -754,6 +773,44 @@ impl App {
         }
     }
 
+    /// Where the open connection points, or `None` when both panes are local.
+    ///
+    /// Taken from the pane rather than from a remembered bookmark name,
+    /// because the pane is what is actually open: a bookmark opened and then
+    /// navigated elsewhere, or a connection opened from a URL, both have a
+    /// live endpoint and no name worth quoting back.
+    fn open_connection_label(&self) -> Option<String> {
+        self.panes
+            .iter()
+            .find(|pane| pane.vfs.scheme() != "local")
+            .map(|pane| pane.vfs.display_path(pane.path()))
+    }
+
+    /// Drop any open connection and go back to the connection list.
+    ///
+    /// The remote pane is genuinely replaced rather than just hidden behind
+    /// another screen. "Close the connection" has to be true when it is what
+    /// the user was asked -- and leaving a live session attached to a screen
+    /// nothing can navigate back to is a socket held open for no reason.
+    fn close_connection(&mut self) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        for index in 0..self.panes.len() {
+            if self.panes[index].vfs.scheme() != "local" {
+                self.panes[index] = Pane::new(Box::new(LocalFs::new()), home.clone(), &self.config);
+            }
+        }
+
+        // Synchronized browsing paired two specific roots; one of them no
+        // longer exists. Leaving it on would couple a surviving pane to a
+        // freshly-made one at home, which is a pairing nobody asked for.
+        self.sync_browse = false;
+        self.desynced = false;
+        self.active_profile = None;
+
+        self.screen = Screen::Bookmarks;
+        self.status.clear();
+    }
+
     /// Open the built-in local entry: two panes, both on this machine.
     ///
     /// Shares nothing with `finish_open` deliberately. That function's job is
@@ -938,10 +995,23 @@ impl App {
             Action::ToggleWatch => self.toggle_watch(),
             Action::ShowLog => self.open_log(),
 
-            Action::ShowConnections => {
-                self.screen = Screen::Bookmarks;
-                self.status.clear();
-            }
+            // Leaving the browser with a connection open ends that session:
+            // the connection list cannot navigate back to a live browser, so
+            // the only route back is to open a bookmark again, which
+            // reconnects. Asking first is the difference between a keystroke
+            // that changes screens and one that drops a session -- and `c`
+            // sits next to nothing destructive, so it is easy to hit.
+            Action::ShowConnections => match self.open_connection_label() {
+                Some(where_to) => {
+                    self.overlay = Overlay::Question(Question {
+                        text: format!("Close the connection to {where_to}?"),
+                        on_yes: Pending::LeaveConnection,
+                        on_no: Pending::Nothing,
+                    });
+                }
+                // Two local panes: nothing to close, so nothing to ask.
+                None => self.close_connection(),
+            },
 
             Action::ToggleDirSizes => {
                 // Needs a recursive walk per directory, which over a network
@@ -1103,6 +1173,7 @@ impl App {
         if self.panes[source_index].is_ghost() || self.panes[dest_index].is_ghost() {
             self.status =
                 "one pane is standing on a directory that does not exist; nothing to sync".into();
+            self.status_kind = StatusKind::Problem;
             return;
         }
 
@@ -1121,6 +1192,25 @@ impl App {
         };
 
         self.status = format!("planning {}...", mode.label());
+
+        // Marks on the *source* pane narrow the plan to what was marked.
+        //
+        // The source side, not the focused one: "push these" has to mean the
+        // files you marked in the pane they are being sent from, or marking
+        // in the destination would silently scope a transfer by names that
+        // have nothing to do with it.
+        //
+        // Cloned because the panes are borrowed mutably just below, and a
+        // handful of file names is not worth restructuring the borrow for.
+        let scope: Option<diff::Scope> = {
+            let marks = self.panes[source_index].marks();
+            (!marks.is_empty()).then(|| marks.clone())
+        };
+        let scoped_names: Vec<String> = {
+            let mut names: Vec<String> = scope.iter().flatten().cloned().collect();
+            names.sort();
+            names
+        };
 
         // Split the array so both panes can be borrowed mutably at once.
         let (first, second) = self.panes.split_at_mut(1);
@@ -1144,12 +1234,14 @@ impl App {
             direction,
             &self.config,
             &filters,
+            scope.as_ref(),
         );
 
         safety::check(&mut plan, &self.config.safety);
 
         if plan.is_empty() && plan.unreadable.is_empty() {
-            self.status = format!("nothing to {} -- the trees already match", mode.label());
+            self.status = nothing_to_do(mode, &scoped_names, plan.method, &self.config);
+            self.status_kind = StatusKind::Answer;
             return;
         }
 
@@ -1177,6 +1269,7 @@ impl App {
         if self.panes[0].is_ghost() || self.panes[1].is_ghost() {
             self.status =
                 "one pane is standing on a directory that does not exist; nothing to sync".into();
+            self.status_kind = StatusKind::Problem;
             return;
         }
 
@@ -1223,6 +1316,7 @@ impl App {
             // stay a first run for ever, never able to propagate a deletion.
             self.store_snapshot(&local_root, &remote_key, &plan);
             self.status = "nothing to bisync -- the trees already match".into();
+            self.status_kind = StatusKind::Answer;
             return;
         }
 
@@ -2048,6 +2142,8 @@ impl App {
 
             Pending::ApplyPlan => self.apply_plan(),
 
+            Pending::LeaveConnection => self.close_connection(),
+
             Pending::Nothing => {
                 self.connecting = None;
                 self.host_key = None;
@@ -2308,11 +2404,170 @@ impl App {
     }
 }
 
+/// How loudly the status line should say something.
+///
+/// It exists because a key press that produces only a message looked exactly
+/// like the furniture beside it. Pressing sync and getting "nothing to push"
+/// was reported as *nothing happening*, with the message on screen at the
+/// time: it rendered in the ordinary foreground colour, immediately after
+/// the mode badge, the path and the counters, all of which are also ordinary
+/// foreground. An answer that is indistinguishable from a label is not an
+/// answer anybody reads.
+///
+/// So the line now distinguishes what it is doing. Three levels is enough --
+/// finer grades would be a palette nobody can learn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusKind {
+    /// Ambient: where you are, what mode is on. True whether or not you did
+    /// anything, and safe to ignore.
+    #[default]
+    Note,
+    /// The direct answer to the key just pressed. Highlighted, because this
+    /// is the case where silence reads as a broken binding.
+    Answer,
+    /// Something was refused or failed, and nothing happened as a result.
+    Problem,
+}
+
+/// What to say when a plan came back empty.
+///
+/// Three things have to be in it, and the old message had none of them.
+///
+/// **What was examined.** "The trees already match" is a claim about the
+/// whole directory, and when marks scoped the plan it is simply untrue --
+/// nothing outside the marks was looked at. A message that overstates its
+/// own coverage is how somebody concludes a file is up to date when it was
+/// never compared.
+///
+/// **How many.** One marked file reads differently from nine, and the
+/// singular is the common case: you mark the thing you just edited.
+///
+/// **What "match" actually meant.** This is the one that prompted the
+/// change. Over FTP the comparison degrades to size alone -- the protocol
+/// reports timestamps but cannot set them, so comparing them would mark
+/// every uploaded file as changed on the next run. An edit that leaves the
+/// byte count the same is therefore invisible, and being told "already in
+/// sync" with no mention of that is the application sounding certain about
+/// something it did not check. So the rule that was actually applied is
+/// named whenever it is not the one the config asked for.
+fn nothing_to_do(
+    mode: SyncMode,
+    scoped_names: &[String],
+    method: crate::sync::compare::Method,
+    config: &Config,
+) -> String {
+    let what = match scoped_names {
+        [] => format!("nothing to {} -- the trees already match", mode.label()),
+        [one] => format!("{one} is already in sync"),
+        many => format!("all {} marked items are already in sync", many.len()),
+    };
+
+    // Only when the rule differs from the one requested. Announcing
+    // "compared by size+mtime" on every no-op would be noise, and noise is
+    // what stops the one that matters from being read.
+    use crate::{config::CompareMethod, sync::compare::Method};
+    let requested = match config.compare.method {
+        CompareMethod::SizeMtime => Method::SizeMtime,
+        CompareMethod::SizeOnly => Method::SizeOnly,
+        CompareMethod::Checksum => Method::Checksum,
+    };
+    if method == requested {
+        return what;
+    }
+    format!("{what} -- compared by {} only", method.describe())
+}
+
 /// Which side a pane index refers to, for titles.
 pub const fn side_label(index: usize) -> &'static str {
     if index == PaneSide::Local.index() {
         "local"
     } else {
         "remote"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::CompareMethod, sync::compare::Method};
+
+    fn config_with(method: CompareMethod) -> Config {
+        let mut config = Config::default();
+        config.compare.method = method;
+        config
+    }
+
+    /// One marked file names itself. This is the common case -- you mark the
+    /// thing you just edited -- and "the trees already match" was both
+    /// plural and a claim about files that were never examined.
+    #[test]
+    fn one_marked_item_is_named() {
+        let message = nothing_to_do(
+            SyncMode::Push,
+            &["about-us.php".to_string()],
+            Method::SizeMtime,
+            &config_with(CompareMethod::SizeMtime),
+        );
+        assert_eq!(message, "about-us.php is already in sync");
+    }
+
+    #[test]
+    fn several_marked_items_are_counted() {
+        let names = [
+            "a.php".to_string(),
+            "b.php".to_string(),
+            "c.php".to_string(),
+        ];
+        let message = nothing_to_do(
+            SyncMode::Push,
+            &names,
+            Method::SizeMtime,
+            &config_with(CompareMethod::SizeMtime),
+        );
+        assert_eq!(message, "all 3 marked items are already in sync");
+    }
+
+    /// Nothing marked is a statement about the whole directory, and may say
+    /// so.
+    #[test]
+    fn an_unscoped_plan_still_talks_about_the_trees() {
+        let message = nothing_to_do(
+            SyncMode::Push,
+            &[],
+            Method::SizeMtime,
+            &config_with(CompareMethod::SizeMtime),
+        );
+        assert_eq!(message, "nothing to push -- the trees already match");
+    }
+
+    /// The case that prompted all of this. Over FTP the comparison degrades
+    /// to size alone, so an edit that leaves the byte count unchanged is
+    /// invisible -- and saying "already in sync" without mentioning that is
+    /// the application sounding certain about something it did not check.
+    #[test]
+    fn a_degraded_comparison_says_what_it_actually_compared() {
+        let message = nothing_to_do(
+            SyncMode::Push,
+            &["about-us.php".to_string()],
+            Method::SizeOnly,
+            &config_with(CompareMethod::SizeMtime),
+        );
+        assert_eq!(
+            message,
+            "about-us.php is already in sync -- compared by size only"
+        );
+    }
+
+    /// But a comparison that did what was asked does not editorialise. A
+    /// caveat printed every time is a caveat nobody reads.
+    #[test]
+    fn an_undegraded_comparison_adds_no_caveat() {
+        let message = nothing_to_do(
+            SyncMode::Push,
+            &["x".to_string()],
+            Method::SizeOnly,
+            &config_with(CompareMethod::SizeOnly),
+        );
+        assert_eq!(message, "x is already in sync");
     }
 }

@@ -694,3 +694,62 @@ fn an_unreachable_host_fails_rather_than_hanging() {
         started.elapsed()
     );
 }
+
+/// Leaving the browser with a live connection must ask first.
+///
+/// `c` goes back to the connection list, and the list cannot navigate back
+/// to a live browser -- so the only route back is to open a bookmark again,
+/// which reconnects. That makes `c` a session-ending key sitting next to
+/// nothing destructive, which is exactly the shape of a keystroke worth
+/// confirming.
+///
+/// Driven against a real server rather than a stub, because the branch turns
+/// on a pane holding something that is genuinely not the local filesystem.
+#[test]
+fn closing_a_live_connection_asks_first() {
+    use lazysync::{
+        app::{App, Overlay, Pending, Screen},
+        browser::Pane,
+        config::Config,
+        keys::Action,
+    };
+
+    let server = server!();
+    let config = Config::default();
+
+    let here = server.work.clone();
+    let mut app = App::new(config.clone(), here.clone(), here).expect("build an app");
+    app.panes[1] = Pane::new(Box::new(server.open()), server.remote(""), &config);
+    app.screen = Screen::Browser;
+
+    assert_eq!(app.panes[1].vfs.scheme(), "ftp", "the fixture is connected");
+
+    app.handle(Action::ShowConnections);
+
+    match &app.overlay {
+        Overlay::Question(question) => {
+            assert!(
+                question.text.contains("Close the connection"),
+                "unexpected question: {:?}",
+                question.text
+            );
+            assert!(matches!(question.on_yes, Pending::LeaveConnection));
+        }
+        other => panic!("expected a confirmation, got {other:?}"),
+    }
+    assert_eq!(
+        app.screen,
+        Screen::Browser,
+        "asking must not already have left"
+    );
+
+    // Answering yes ends the session: the remote pane is replaced, not just
+    // covered by another screen.
+    app.handle(Action::Apply);
+    assert_eq!(app.screen, Screen::Bookmarks);
+    assert_eq!(
+        app.panes[1].vfs.scheme(),
+        "local",
+        "the connection must actually be closed, since that is what was asked"
+    );
+}

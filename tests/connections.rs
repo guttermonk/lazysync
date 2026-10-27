@@ -482,6 +482,55 @@ fn the_browser_can_get_back_to_the_connection_list() {
     );
 }
 
+/// A refusal has to look different from a label.
+///
+/// "Nothing happened" was the report for several messages that were on
+/// screen at the time: they rendered in the ordinary foreground colour at
+/// the end of a line of badges and counters that are also ordinary
+/// foreground, so they read as furniture rather than as a reply.
+#[test]
+fn a_refusal_is_marked_as_one_and_does_not_linger() {
+    use lazysync::app::StatusKind;
+
+    let mut h = Harness::new(&[sftp("www", "box")]);
+
+    h.press("G"); // the built-in entry, which cannot be deleted
+    h.press("dd");
+    assert_eq!(
+        h.app.status_kind,
+        StatusKind::Problem,
+        "a refusal must not be styled like a label: {:?}",
+        h.app.status
+    );
+
+    // The next action starts from ambient, so the colour cannot be inherited
+    // by a message that is merely descriptive.
+    h.press("gg");
+    assert_eq!(
+        h.app.status_kind,
+        StatusKind::Note,
+        "emphasis must not survive into the next action"
+    );
+}
+
+/// With two local panes there is no session to end, so `c` must not invent
+/// a question about one.
+#[test]
+fn leaving_a_local_browser_asks_nothing() {
+    let mut h = Harness::new(&[]);
+
+    h.press("G"); // the built-in local entry
+    h.enter();
+    assert_eq!(h.app.screen, Screen::Browser);
+
+    h.press("c");
+    assert!(
+        matches!(h.app.overlay, Overlay::None),
+        "nothing is connected, so there is nothing to confirm closing"
+    );
+    assert_eq!(h.app.screen, Screen::Bookmarks);
+}
+
 #[test]
 fn an_empty_store_says_what_to_do() {
     let mut h = Harness::new(&[]);

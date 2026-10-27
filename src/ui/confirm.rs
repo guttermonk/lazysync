@@ -228,6 +228,21 @@ fn draw_header(
                 ),
                 Style::default().fg(palette.dim),
             ),
+            // A scoped plan has to say so. Four rows from four marked files
+            // look identical to four rows from a directory of four changed
+            // files, and only one of those licenses the conclusion that
+            // everything else is up to date -- in the other, nothing else
+            // was compared at all.
+            Span::styled(
+                match plan.scoped_to {
+                    Some(1) => " 1 marked item only  ".to_string(),
+                    Some(n) => format!(" {n} marked items only  "),
+                    None => String::new(),
+                },
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
             // Said out loud, because agreeing to "delete" when it means
             // "moved aside" and when it means "gone" are different decisions.
             Span::styled(

@@ -67,16 +67,25 @@ pub fn plan(
     direction: Direction,
     config: &Config,
 ) -> Plan {
-    plan_with_filters(source, dest, direction, config, &Filters::default())
+    plan_with_filters(source, dest, direction, config, &Filters::default(), None)
 }
 
-/// As [`plan`], with exclude rules applied.
+/// Top-level names a plan is limited to, from the source pane's marks.
+///
+/// Only the top level: marking a directory means the whole directory, so the
+/// restriction applies at depth 0 and nowhere below it. Applying it at every
+/// level would turn "sync this folder" into "sync the one file inside it
+/// whose name happens to match", which is not what marking a folder means.
+pub type Scope = std::collections::HashSet<String>;
+
+/// As [`plan`], with exclude rules and an optional [`Scope`] applied.
 pub fn plan_with_filters(
     source: Endpoint<'_>,
     dest: Endpoint<'_>,
     direction: Direction,
     config: &Config,
     filters: &Filters,
+    scope: Option<&Scope>,
 ) -> Plan {
     let Endpoint {
         fs: source,
@@ -99,6 +108,7 @@ pub fn plan_with_filters(
         dest_label,
         method: comparator.method(),
         tolerance_secs: comparator.tolerance_secs(),
+        scoped_to: scope.map(std::collections::HashSet::len),
         ..Plan::default()
     };
 
@@ -126,6 +136,7 @@ pub fn plan_with_filters(
         mode_caveat,
         &policy,
         filters,
+        scope,
         &mut built,
     );
 
@@ -150,6 +161,7 @@ fn walk(
     mode_caveat: Option<&'static str>,
     policy: &super::safety::DeletePolicy,
     filters: &Filters,
+    scope: Option<&Scope>,
     built: &mut Plan,
 ) {
     if depth > MAX_DEPTH {
@@ -200,6 +212,11 @@ fn walk(
 
     for entry in &source_entries {
         if skip_hidden(entry, config) {
+            continue;
+        }
+
+        // Marks, at the top level only. See [`Scope`].
+        if depth == 0 && scope.is_some_and(|names| !names.contains(&entry.name)) {
             continue;
         }
 
@@ -267,6 +284,7 @@ fn walk(
                     mode_caveat,
                     policy,
                     filters,
+                    scope,
                     built,
                 );
             }
@@ -294,6 +312,7 @@ fn walk(
                     mode_caveat,
                     policy,
                     filters,
+                    scope,
                     built,
                 );
             }
@@ -389,6 +408,15 @@ fn walk(
                 continue;
             }
             if source_entries.iter().any(|s| s.name == entry.name) {
+                continue;
+            }
+
+            // A scoped mirror deletes only within what was marked. Without
+            // this, marking one file and pressing mirror would plan the
+            // deletion of everything else on the destination -- the marks
+            // would narrow what is *copied* while leaving what is *removed*
+            // at full width, which is the worst possible reading of them.
+            if depth == 0 && scope.is_some_and(|names| !names.contains(&entry.name)) {
                 continue;
             }
 
@@ -961,6 +989,125 @@ mod tests {
         assert!(!plan.rows.iter().any(|r| r.path.starts_with("backups")));
     }
 
+    fn scoped(t: &Trees, delete_extraneous: bool, names: &[&str]) -> Plan {
+        let scope: Scope = names.iter().map(|s| (*s).to_string()).collect();
+        let mut source = LocalFs::new();
+        let mut dest = LocalFs::new();
+        plan_with_filters(
+            Endpoint {
+                fs: &mut source,
+                root: &t.left,
+                label: "local".into(),
+            },
+            Endpoint {
+                fs: &mut dest,
+                root: &t.right,
+                label: "remote".into(),
+            },
+            Direction {
+                source: 0,
+                delete_extraneous,
+            },
+            &Config::default(),
+            &Filters::default(),
+            Some(&scope),
+        )
+    }
+
+    /// Marking a file and pressing push has to plan that file and nothing
+    /// else. Before this existed the marks were read by the status line and
+    /// by nothing else, so a mark narrowed the count on screen and not the
+    /// transfer.
+    #[test]
+    fn a_scope_plans_only_what_was_marked() {
+        let t = trees();
+        write(&t.left.join("wanted.php"), "new", 2000);
+        write(&t.left.join("ignored.php"), "new", 2000);
+        write(&t.left.join("also-ignored.php"), "new", 2000);
+
+        let plan = scoped(&t, false, &["wanted.php"]);
+
+        assert_eq!(plan.rows.len(), 1, "{:?}", plan.rows);
+        assert_eq!(plan.rows[0].path, Path::new("wanted.php"));
+        assert_eq!(plan.scoped_to, Some(1));
+    }
+
+    /// Marking a directory means the directory, not "the one file inside it
+    /// whose name matches".
+    #[test]
+    fn a_marked_directory_carries_its_whole_contents() {
+        let t = trees();
+        write(&t.left.join("site/index.php"), "a", 2000);
+        write(&t.left.join("site/deep/style.css"), "b", 2000);
+        write(&t.left.join("elsewhere/other.php"), "c", 2000);
+
+        let plan = scoped(&t, false, &["site"]);
+
+        let paths: Vec<_> = plan.rows.iter().map(|r| r.path.clone()).collect();
+        assert!(
+            paths.contains(&PathBuf::from("site/index.php")),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("site/deep/style.css")),
+            "nested contents of a marked directory are included: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("elsewhere")),
+            "{paths:?}"
+        );
+    }
+
+    /// The dangerous half. A scoped mirror must not plan the deletion of
+    /// everything that was not marked -- that would read the marks as
+    /// narrowing what is copied while leaving what is *removed* at full
+    /// width, which is the worst possible interpretation of them.
+    #[test]
+    fn a_scoped_mirror_only_deletes_inside_the_scope() {
+        let t = trees();
+        write(&t.left.join("kept.php"), "a", 2000);
+        write(&t.right.join("kept.php"), "a", 2000);
+        // Extraneous on the destination, and not marked.
+        write(&t.right.join("precious.php"), "do not delete", 2000);
+        write(&t.right.join("also-precious.php"), "nor this", 2000);
+
+        let plan = scoped(&t, true, &["kept.php"]);
+
+        assert_eq!(
+            plan.count(Section::Delete),
+            0,
+            "an unmarked destination file must not be deleted: {:?}",
+            plan.rows
+        );
+    }
+
+    /// And the same mirror still deletes what *was* marked, or the scope
+    /// would have quietly disabled the feature rather than narrowed it.
+    #[test]
+    fn a_scoped_mirror_still_deletes_what_was_marked() {
+        let t = trees();
+        write(&t.right.join("gone.php"), "extraneous", 2000);
+        write(&t.right.join("untouched.php"), "extraneous", 2000);
+
+        let plan = scoped(&t, true, &["gone.php"]);
+
+        assert_eq!(plan.count(Section::Delete), 1, "{:?}", plan.rows);
+        assert_eq!(plan.rows[0].path, Path::new("gone.php"));
+    }
+
+    /// No marks means no scope: the whole directory, as before.
+    #[test]
+    fn no_scope_plans_everything() {
+        let t = trees();
+        write(&t.left.join("one.php"), "a", 2000);
+        write(&t.left.join("two.php"), "b", 2000);
+
+        let plan = run(&t, false, &Config::default());
+
+        assert_eq!(plan.rows.len(), 2);
+        assert_eq!(plan.scoped_to, None);
+    }
+
     /// Filters are what make "advanced syncing" mean more than pushing
     /// `target/` to a web server every time.
     #[test]
@@ -990,6 +1137,7 @@ mod tests {
             },
             &Config::default(),
             &filters,
+            None,
         );
 
         let planned: Vec<String> = plan
@@ -1037,6 +1185,7 @@ mod tests {
             },
             &Config::default(),
             &filters,
+            None,
         );
 
         assert_eq!(
