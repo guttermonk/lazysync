@@ -9,7 +9,7 @@ use lazysync::{
     cli::{self, Cli, Command},
     config::{self, Config},
     connection,
-    keys::Mode,
+    keys::{defaults, Mode},
     tui,
 };
 
@@ -79,6 +79,27 @@ fn run_query(cli: &Cli) -> Result<()> {
                         .map(ToString::to_string)
                         .collect();
                     println!("  {:<20} {}", action.name(), combos.join(", "));
+                }
+
+                // What the mode *cannot* do. An action with no key is silent
+                // at runtime -- you press something, nothing happens, and
+                // there is no way to tell a missing binding from a broken
+                // feature. Every way of editing a keymap can produce one: a
+                // `base` table that omits an action, a `set` or `extra` that
+                // takes a key another action was using, an `unbind` aimed at
+                // a chord prefix. So it is reported here rather than left to
+                // be discovered.
+                let bound = keymap.actions();
+                let missing: Vec<_> = defaults::for_mode(mode)
+                    .actions()
+                    .into_iter()
+                    .filter(|action| !bound.contains(action))
+                    .collect();
+                if !missing.is_empty() {
+                    println!("  # unbound in this mode, but bound by default:");
+                    for action in missing {
+                        println!("  # {:<18} {}", action.name(), action.describe());
+                    }
                 }
                 println!();
             }

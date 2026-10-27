@@ -208,9 +208,27 @@ preset = "terminal"
 # Each mode has its own keymap, because `d` is delete in the browser and a
 # literal `d` in a text field.
 #
-# `base` replaces that mode's defaults entirely; `extra` layers on top and
-# wins any collision with a base binding sharing its prefix. Run
-# `lazysync keys` to see what a config actually resolves to.
+# Four tables per mode, applied in this order:
+#
+#     base     start from nothing but this -- replaces the defaults entirely
+#     set      these ACTIONS get exactly these keys, losing the ones they had
+#     extra    these KEYS get these actions, on top of whatever is there
+#     unbind   these keys do nothing; applied last, so nothing reinstates them
+#
+# `set` vs `extra` is the distinction that matters:
+#
+#     set   = [["MoveDown", "e"]]   -- "move down is on e now"; j stops working
+#     extra = [["MoveDown", "e"]]   -- "e also moves down";     j still works
+#
+# `set` replaces an action's other keys, so list every one you want to keep --
+# except the arrows, which it never retires. Use `unbind = ["down"]` if you
+# really want an arrow gone. `unbind` is prefix-based: unbinding "s"
+# also removes the "sp"/"sl" chords, or "s" would still be swallowed while
+# lazysync waited for the rest of a chord.
+#
+# Run `lazysync keys` to see what a config resolves to. It also names any
+# action that ended up with no key at all -- which `base`, `set`, `extra` and
+# `unbind` can all cause, and which is otherwise silent.
 #
 # A key combo is a single key, a key with modifiers, or an array of either
 # for a chord:
@@ -231,6 +249,21 @@ preset = "terminal"
 # ]
 
 [keys.browser]
+# Move a few actions onto your own keys, retiring the defaults for them and
+# leaving every other binding untouched:
+# set = [
+#     ["MoveDown",   "e"],
+#     ["MoveUp",     "i"],
+#     ["ParentDir",  "n"],
+#     ["EnterDir",   "o"],
+#     ["EnterDir",   "enter"],   # a SECOND entry, not ["o","enter"] --
+#                                # an array means a CHORD: o then Enter
+# ]
+#
+# Free a key for a terminal multiplexer -- zellij or tmux closing a popup on
+# Esc only gets Esc if lazysync is not sitting on it:
+# unbind = ["esc"]
+#
 # extra = [
 #     ["ToggleSyncBrowse", "S"],
 #     ["ToggleUnionView",  "u"],

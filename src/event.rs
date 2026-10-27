@@ -225,7 +225,7 @@ mod tests {
                 (Action::Cancel, KeyCombo::single(key('d'))),
                 (Action::DiffRow, KeyCombo::chord([key('d'), key('d')])),
             ])),
-            extra: None,
+            ..Default::default()
         };
         let maps = Keymaps::resolve(&BTreeMap::from([(Mode::Browser, section)]));
 

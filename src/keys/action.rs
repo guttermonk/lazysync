@@ -166,6 +166,12 @@ pub enum Action {
     ToggleWatch,
     /// Open the audit log: what previous runs actually did.
     ShowLog,
+    /// Go back to the connection list.
+    ///
+    /// Esc on the connection list drops to the browser, and before this
+    /// existed that door only opened one way: there was no binding anywhere
+    /// that returned to the list, so the only way back was to quit.
+    ShowConnections,
 
     // ── Bookmarks and forms ──────────────────────────────────────────────
     /// Open the selected bookmark.
@@ -250,6 +256,7 @@ impl Action {
             Self::TogglePause => "Pause or resume the transfer",
             Self::ToggleWatch => "Watch this tree and sync changes",
             Self::ShowLog => "Show the audit log",
+            Self::ShowConnections => "Back to the connection list",
 
             Self::OpenItem => "Open the selected connection",
             Self::NewItem => "Add a new connection",
@@ -317,7 +324,8 @@ impl Action {
             | Self::ToggleWatch
             | Self::ShowLog => "Sync",
 
-            Self::OpenItem
+            Self::ShowConnections
+            | Self::OpenItem
             | Self::NewItem
             | Self::EditItem
             | Self::DeleteItem

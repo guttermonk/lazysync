@@ -171,7 +171,12 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ))];
 
     if let Some(bookmark) = app.selected_bookmark() {
-        let what = if !bookmark.protocol.is_implemented() {
+        // The built-in entry has no auth to describe, so it says what it is
+        // for instead -- which is the question somebody looking at a row
+        // called "Local transfer" in a list of servers is actually asking.
+        let what = if bookmark.builtin {
+            "two directories on this machine -- no connection needed".to_string()
+        } else if !bookmark.protocol.is_implemented() {
             format!("{} is not supported yet", bookmark.protocol)
         } else if bookmark.needs_password_prompt() {
             "will ask for a password".to_string()

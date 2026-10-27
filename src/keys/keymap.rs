@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     action::{Action, Mode},
-    combo::{KeyCombo, ModifiedKey},
+    combo::{Key, KeyCombo, ModifiedKey, Mods},
     defaults,
 };
 
@@ -95,13 +95,38 @@ impl Keymap {
 }
 
 /// One mode's `[keys.<mode>]` table.
+///
+/// Four tables, applied in the order they are listed here. They exist
+/// because "change one key" and "change every key" are different jobs, and
+/// so is "change which key does X" versus "change what X's key does":
+///
+/// - `base` — start from nothing but this.
+/// - `set` — these actions get exactly these keys, and lose the ones they
+///   had. The common case, and the one `extra` cannot express.
+/// - `extra` — these keys get these actions, on top of whatever is there.
+/// - `unbind` — these keys do nothing at all. Applied last, so it is a veto.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeymapSection {
     /// Replaces the built-in defaults for this mode entirely.
     pub base: Option<Keymap>,
-    /// Layered on top of `base` (or the defaults), winning any collision.
+    /// Rebinds whole actions: every listed action loses its existing keys and
+    /// gets the listed ones instead. Bare arrow keys are kept -- see
+    /// [`apply_set`].
+    ///
+    /// This is the difference from `extra`. `extra` resolves collisions by
+    /// *key* -- it drops whatever else was on the key you took -- so
+    /// rebinding `MoveDown` to `e` with `extra` leaves `j` moving down too.
+    /// `set` resolves by *action*, which is what "I moved this to `e`"
+    /// actually means.
+    pub set: Option<Keymap>,
+    /// Layered on top, winning any collision.
     pub extra: Option<Keymap>,
+    /// Keys that must do nothing in this mode.
+    ///
+    /// For keys something else needs to see: a multiplexer that closes its
+    /// popup on Esc only gets Esc if lazysync is not sitting on it.
+    pub unbind: Option<Vec<KeyCombo>>,
 }
 
 /// The resolved keymap for every mode.
@@ -122,8 +147,13 @@ impl Default for Keymaps {
 impl Keymaps {
     /// Merge user config over the defaults.
     ///
-    /// Per mode: `base` replaces the defaults if given, then each `extra`
-    /// binding is applied on top.
+    /// Per mode: `base` replaces the defaults if given, then `set`, then
+    /// `extra`, then `unbind`.
+    ///
+    /// `unbind` is last on purpose. It is the only one of the four that
+    /// subtracts, and a veto that another table could reinstate would be no
+    /// veto at all -- the whole reason to reach for it is to guarantee a key
+    /// reaches the terminal instead of lazysync.
     pub fn resolve(sections: &BTreeMap<Mode, KeymapSection>) -> Self {
         let mut maps = BTreeMap::new();
 
@@ -133,8 +163,14 @@ impl Keymaps {
                 .and_then(|s| s.base.clone())
                 .unwrap_or_else(|| defaults::for_mode(mode));
 
+            if let Some(set) = section.and_then(|s| s.set.as_ref()) {
+                apply_set(&mut map, set);
+            }
             if let Some(extra) = section.and_then(|s| s.extra.as_ref()) {
                 apply_extra(&mut map, extra);
+            }
+            if let Some(unbind) = section.and_then(|s| s.unbind.as_ref()) {
+                apply_unbind(&mut map, unbind);
             }
 
             maps.insert(mode, map);
@@ -152,6 +188,87 @@ impl Keymaps {
 
     pub fn iter(&self) -> impl Iterator<Item = (Mode, &Keymap)> {
         self.0.iter().map(|(mode, map)| (*mode, map))
+    }
+}
+
+/// A bare arrow key, which `set` does not retire.
+///
+/// Modified arrows are not included: `ctrl+down` is somebody's deliberate
+/// binding rather than the key everyone reaches for, so it is replaced like
+/// any other.
+fn is_bare_arrow(combo: &KeyCombo) -> bool {
+    matches!(
+        combo.0.as_slice(),
+        [ModifiedKey {
+            key: Key::Up | Key::Down | Key::Left | Key::Right,
+            mods: Mods::NONE,
+        }]
+    )
+}
+
+/// Move whole actions onto new keys.
+///
+/// Two things are dropped before the new bindings go on: every existing
+/// binding **of a listed action**, which is the point, and every binding
+/// whose combo the new keys make unreachable, which is the same prefix rule
+/// `apply_extra` needs and for the same reason.
+///
+/// The order matters and is not interchangeable. Actions are cleared first,
+/// so `set = [["MoveDown", "j"]]` -- rebinding an action to a key it already
+/// had -- ends with one binding rather than zero.
+///
+/// **Arrow keys survive.** `set = [["MoveDown", "e"]]` means "move down is on
+/// `e` now", and nobody means by that "and the Down arrow should stop
+/// working". The arrows are not part of the layout being chosen -- they are
+/// the keys that work when you have not learned the layout yet, including for
+/// whoever else sits at the keyboard -- so a statement about `j` and `e` is
+/// not a statement about them. Requiring every `set` to restate `down`,
+/// `up`, `left` and `right` would mean the cost of forgetting is a key that
+/// silently stops working, which is the failure this whole area keeps
+/// producing.
+///
+/// Retiring an arrow is still possible and is now something you say rather
+/// than something you cause: `unbind = ["down"]` runs after `set` and removes
+/// it.
+fn apply_set(map: &mut Keymap, set: &Keymap) {
+    let rebound: Vec<Action> = set.iter().map(|(action, _)| *action).collect();
+    map.0.retain(|(action, combo)| {
+        let replaced = rebound.contains(action) && !is_bare_arrow(combo);
+        if replaced {
+            tracing::debug!("binding {combo} -> {action} dropped: the action was `set` elsewhere");
+        }
+        !replaced
+    });
+
+    for (_, new_combo) in set.iter() {
+        map.0.retain(|(action, combo)| {
+            let shadowed = combo.starts_with(&new_combo.0);
+            if shadowed {
+                tracing::debug!("binding {combo} -> {action} dropped in favour of {new_combo}");
+            }
+            !shadowed
+        });
+    }
+
+    map.0.extend(set.0.iter().cloned());
+}
+
+/// Remove every binding a listed combo would reach.
+///
+/// Prefix-based, like the shadowing in `apply_extra`: `unbind = ["s"]` has to
+/// take the `sp`/`sl`/`sm` chords with it, or pressing `s` would still be
+/// swallowed as the start of a chord and the key would not actually be free.
+/// Unbinding a key that is already unbound is not an error -- the state asked
+/// for is the state you get.
+fn apply_unbind(map: &mut Keymap, combos: &[KeyCombo]) {
+    for dead in combos {
+        map.0.retain(|(action, combo)| {
+            let unreachable = combo.starts_with(&dead.0);
+            if unreachable {
+                tracing::debug!("binding {combo} -> {action} removed: {dead} is unbound");
+            }
+            !unreachable
+        });
     }
 }
 
@@ -182,17 +299,20 @@ fn apply_extra(base: &mut Keymap, extra: &Keymap) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::combo::{Key, Mods};
 
     fn key(c: char) -> ModifiedKey {
         ModifiedKey::plain(Key::Char(c))
+    }
+
+    fn combo(keys: &[char]) -> KeyCombo {
+        KeyCombo(keys.iter().copied().map(key).collect())
     }
 
     fn map(bindings: &[(Action, &[char])]) -> Keymap {
         Keymap(
             bindings
                 .iter()
-                .map(|(action, keys)| (*action, KeyCombo(keys.iter().copied().map(key).collect())))
+                .map(|(action, keys)| (*action, combo(keys)))
                 .collect(),
         )
     }
@@ -243,6 +363,301 @@ mod tests {
             m.resolve(&[key('d'), key('d')]),
             Resolution::Exact(Action::DiffRow)
         );
+    }
+
+    /// The gap `set` exists to fill.
+    ///
+    /// `extra` resolves collisions by key, so it can only ever *add* a key to
+    /// an action. Moving `MoveDown` to `e` with `extra` leaves `j` moving
+    /// down as well, which is not what "I moved it" means to anybody.
+    #[test]
+    fn extra_cannot_retire_the_key_it_replaces_but_set_can() {
+        let mut with_extra = map(&[(Action::MoveDown, &['j'])]);
+        apply_extra(&mut with_extra, &map(&[(Action::MoveDown, &['e'])]));
+        assert_eq!(
+            with_extra.resolve(&[key('j')]),
+            Resolution::Exact(Action::MoveDown),
+            "this is the shortcoming: `j` still works"
+        );
+
+        let mut with_set = map(&[(Action::MoveDown, &['j'])]);
+        apply_set(&mut with_set, &map(&[(Action::MoveDown, &['e'])]));
+        assert_eq!(
+            with_set.resolve(&[key('e')]),
+            Resolution::Exact(Action::MoveDown)
+        );
+        assert_eq!(
+            with_set.resolve(&[key('j')]),
+            Resolution::None,
+            "`set` retires the old key"
+        );
+    }
+
+    /// `set` is a statement about the layout, not about the arrows.
+    #[test]
+    fn set_keeps_the_arrow_key_it_did_not_mention() {
+        let mut m = map(&[(Action::MoveDown, &['j'])]);
+        m.0.push((
+            Action::MoveDown,
+            KeyCombo::single(ModifiedKey::plain(Key::Down)),
+        ));
+
+        apply_set(&mut m, &map(&[(Action::MoveDown, &['e'])]));
+
+        assert_eq!(m.resolve(&[key('e')]), Resolution::Exact(Action::MoveDown));
+        assert_eq!(m.resolve(&[key('j')]), Resolution::None, "j was replaced");
+        assert_eq!(
+            m.resolve(&[ModifiedKey::plain(Key::Down)]),
+            Resolution::Exact(Action::MoveDown),
+            "the Down arrow is not part of choosing between j and e"
+        );
+    }
+
+    /// All four arrows, and only bare ones.
+    #[test]
+    fn only_unmodified_arrows_are_spared() {
+        for arrow in [Key::Up, Key::Down, Key::Left, Key::Right] {
+            let mut m = Keymap(vec![(
+                Action::MoveDown,
+                KeyCombo::single(ModifiedKey::plain(arrow)),
+            )]);
+            apply_set(&mut m, &map(&[(Action::MoveDown, &['e'])]));
+            assert_eq!(
+                m.resolve(&[ModifiedKey::plain(arrow)]),
+                Resolution::Exact(Action::MoveDown),
+                "{arrow:?} should have survived"
+            );
+        }
+
+        // A modified arrow is a deliberate binding, so it is replaced.
+        let mut m = Keymap(vec![(
+            Action::MoveDown,
+            KeyCombo::single(ModifiedKey::new(Key::Down, Mods::ctrl())),
+        )]);
+        apply_set(&mut m, &map(&[(Action::MoveDown, &['e'])]));
+        assert_eq!(
+            m.resolve(&[ModifiedKey::new(Key::Down, Mods::ctrl())]),
+            Resolution::None,
+            "ctrl+down is somebody's own binding, not the universal arrow"
+        );
+    }
+
+    /// Sparing the arrows must not resurrect one for an action that is being
+    /// moved off it onto a different arrow.
+    #[test]
+    fn setting_an_action_onto_an_arrow_does_not_duplicate_it() {
+        let mut m = Keymap(vec![(
+            Action::MoveDown,
+            KeyCombo::single(ModifiedKey::plain(Key::Down)),
+        )]);
+        let replacement = Keymap(vec![(
+            Action::MoveDown,
+            KeyCombo::single(ModifiedKey::plain(Key::Down)),
+        )]);
+        apply_set(&mut m, &replacement);
+
+        assert_eq!(m.0.len(), 1, "one binding, not two: {:?}", m.0);
+        assert_eq!(
+            m.resolve(&[ModifiedKey::plain(Key::Down)]),
+            Resolution::Exact(Action::MoveDown)
+        );
+    }
+
+    /// Taking an arrow for a different action still displaces the old owner,
+    /// or sparing arrows would mean two actions on one key.
+    #[test]
+    fn an_arrow_claimed_by_another_action_changes_hands() {
+        let mut m = Keymap(vec![(
+            Action::MoveDown,
+            KeyCombo::single(ModifiedKey::plain(Key::Down)),
+        )]);
+        let replacement = Keymap(vec![(
+            Action::MoveUp,
+            KeyCombo::single(ModifiedKey::plain(Key::Down)),
+        )]);
+        apply_set(&mut m, &replacement);
+
+        assert_eq!(
+            m.resolve(&[ModifiedKey::plain(Key::Down)]),
+            Resolution::Exact(Action::MoveUp),
+            "an explicit claim on the arrow wins"
+        );
+        assert_eq!(m.0.len(), 1);
+    }
+
+    /// The escape hatch: `unbind` still retires an arrow, and runs after
+    /// `set`, so the sparing rule is a default rather than a trap.
+    #[test]
+    fn unbind_can_still_retire_an_arrow_that_set_spared() {
+        let mut base = map(&[(Action::MoveDown, &['j'])]);
+        base.0.push((
+            Action::MoveDown,
+            KeyCombo::single(ModifiedKey::plain(Key::Down)),
+        ));
+
+        let sections = BTreeMap::from([(
+            Mode::Browser,
+            KeymapSection {
+                base: Some(base),
+                set: Some(map(&[(Action::MoveDown, &['e'])])),
+                extra: None,
+                unbind: Some(vec![KeyCombo::single(ModifiedKey::plain(Key::Down))]),
+            },
+        )]);
+
+        let resolved = Keymaps::resolve(&sections);
+        let m = resolved.get(Mode::Browser);
+
+        assert_eq!(m.resolve(&[key('e')]), Resolution::Exact(Action::MoveDown));
+        assert_eq!(
+            m.resolve(&[ModifiedKey::plain(Key::Down)]),
+            Resolution::None,
+            "saying so explicitly still works"
+        );
+    }
+
+    /// Only the listed actions are touched; everything else keeps its keys.
+    /// That is the difference from `base`.
+    #[test]
+    fn set_leaves_every_other_action_alone() {
+        let mut m = map(&[
+            (Action::MoveDown, &['j']),
+            (Action::MoveUp, &['k']),
+            (Action::Quit, &['q']),
+        ]);
+        apply_set(&mut m, &map(&[(Action::MoveDown, &['e'])]));
+
+        assert_eq!(m.resolve(&[key('k')]), Resolution::Exact(Action::MoveUp));
+        assert_eq!(m.resolve(&[key('q')]), Resolution::Exact(Action::Quit));
+    }
+
+    /// Giving an action several keys at once replaces all of its old ones.
+    #[test]
+    fn set_can_give_one_action_several_keys() {
+        let mut m = map(&[(Action::MoveDown, &['j'])]);
+        let mut replacement = map(&[(Action::MoveDown, &['e'])]);
+        replacement.0.push((Action::MoveDown, combo(&['n'])));
+        apply_set(&mut m, &replacement);
+
+        assert_eq!(m.resolve(&[key('e')]), Resolution::Exact(Action::MoveDown));
+        assert_eq!(m.resolve(&[key('n')]), Resolution::Exact(Action::MoveDown));
+        assert_eq!(m.resolve(&[key('j')]), Resolution::None);
+    }
+
+    /// Rebinding an action to a key it already had must not cancel itself
+    /// out. This is why actions are cleared before the new ones are added.
+    #[test]
+    fn set_to_the_same_key_is_not_a_removal() {
+        let mut m = map(&[(Action::MoveDown, &['j'])]);
+        apply_set(&mut m, &map(&[(Action::MoveDown, &['j'])]));
+
+        assert_eq!(m.resolve(&[key('j')]), Resolution::Exact(Action::MoveDown));
+        assert_eq!(m.0.len(), 1, "and not duplicated either");
+    }
+
+    /// Taking a key that belonged to something else frees it, same as `extra`.
+    #[test]
+    fn set_displaces_whatever_held_the_new_key() {
+        let mut m = map(&[(Action::MoveDown, &['j']), (Action::MoveUp, &['e'])]);
+        apply_set(&mut m, &map(&[(Action::MoveDown, &['e'])]));
+
+        assert_eq!(m.resolve(&[key('e')]), Resolution::Exact(Action::MoveDown));
+        assert_eq!(
+            m.resolve(&[key('j')]),
+            Resolution::None,
+            "MoveDown moved off j"
+        );
+        assert!(
+            m.combos_for(Action::MoveUp).is_empty(),
+            "MoveUp lost the key it was on, and is not silently somewhere else"
+        );
+    }
+
+    /// `unbind` makes a key do nothing, which is the point when something
+    /// outside lazysync needs to see it.
+    #[test]
+    fn unbind_frees_a_key_entirely() {
+        let mut m = map(&[(Action::Cancel, &['\u{1b}']), (Action::Quit, &['q'])]);
+        m.0[0].1 = KeyCombo::single(ModifiedKey::plain(Key::Esc));
+
+        apply_unbind(&mut m, &[KeyCombo::single(ModifiedKey::plain(Key::Esc))]);
+
+        assert_eq!(
+            m.resolve(&[ModifiedKey::plain(Key::Esc)]),
+            Resolution::None,
+            "Esc must reach the terminal, not lazysync"
+        );
+        assert_eq!(m.resolve(&[key('q')]), Resolution::Exact(Action::Quit));
+    }
+
+    /// Unbinding a chord prefix takes the whole family, or the key would
+    /// still be swallowed while lazysync waited for the second press.
+    #[test]
+    fn unbind_takes_the_chords_a_key_starts() {
+        let mut m = map(&[(Action::SyncPush, &['s', 'p']), (Action::Quit, &['q'])]);
+        apply_unbind(&mut m, &[combo(&['s'])]);
+
+        assert_eq!(
+            m.resolve(&[key('s')]),
+            Resolution::None,
+            "`s` must not sit pending on a chord that no longer exists"
+        );
+        assert_eq!(m.resolve(&[key('q')]), Resolution::Exact(Action::Quit));
+    }
+
+    #[test]
+    fn unbinding_something_already_unbound_is_not_an_error() {
+        let mut m = map(&[(Action::Quit, &['q'])]);
+        apply_unbind(&mut m, &[combo(&['z'])]);
+        assert_eq!(m.resolve(&[key('q')]), Resolution::Exact(Action::Quit));
+    }
+
+    /// `unbind` is applied after `extra`, so it cannot be reinstated by a
+    /// table the user also wrote. A veto that loses is not a veto.
+    #[test]
+    fn unbind_wins_over_extra() {
+        let sections = BTreeMap::from([(
+            Mode::Browser,
+            KeymapSection {
+                base: Some(map(&[(Action::Quit, &['q'])])),
+                set: None,
+                extra: Some(map(&[(Action::Cancel, &['x'])])),
+                unbind: Some(vec![combo(&['x'])]),
+            },
+        )]);
+
+        let resolved = Keymaps::resolve(&sections);
+        assert_eq!(
+            resolved.get(Mode::Browser).resolve(&[key('x')]),
+            Resolution::None
+        );
+    }
+
+    /// All four tables in one section, in the documented order.
+    #[test]
+    fn the_four_tables_compose() {
+        let sections = BTreeMap::from([(
+            Mode::Browser,
+            KeymapSection {
+                base: Some(map(&[
+                    (Action::MoveDown, &['j']),
+                    (Action::MoveUp, &['k']),
+                    (Action::Quit, &['q']),
+                ])),
+                set: Some(map(&[(Action::MoveDown, &['e'])])),
+                extra: Some(map(&[(Action::Help, &['?'])])),
+                unbind: Some(vec![combo(&['q'])]),
+            },
+        )]);
+
+        let m = Keymaps::resolve(&sections);
+        let m = m.get(Mode::Browser);
+
+        assert_eq!(m.resolve(&[key('e')]), Resolution::Exact(Action::MoveDown));
+        assert_eq!(m.resolve(&[key('j')]), Resolution::None, "set retired it");
+        assert_eq!(m.resolve(&[key('k')]), Resolution::Exact(Action::MoveUp));
+        assert_eq!(m.resolve(&[key('?')]), Resolution::Exact(Action::Help));
+        assert_eq!(m.resolve(&[key('q')]), Resolution::None, "unbound");
     }
 
     #[test]
@@ -303,7 +718,7 @@ mod tests {
             Mode::Browser,
             KeymapSection {
                 base: Some(map(&[(Action::Quit, &['x'])])),
-                extra: None,
+                ..Default::default()
             },
         )]);
 

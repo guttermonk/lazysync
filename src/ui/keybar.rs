@@ -63,6 +63,7 @@ fn items(app: &App) -> Vec<(Action, &'static str)> {
         (Action::SyncProfile, "profile"),
     ];
     let browse = [
+        (Action::ShowConnections, "connections"),
         (Action::ToggleSyncBrowse, "sync-browse"),
         (Action::ToggleMark, "mark"),
         (Action::NextPane, "pane"),

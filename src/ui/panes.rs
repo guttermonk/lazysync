@@ -10,7 +10,7 @@ use ratatui::{
 
 use super::{format_size, shorten_path};
 use crate::{
-    app::{side_label, App},
+    app::App,
     browser::{Pane, PaneState},
     config::Palette,
     vfs::{Entry, EntryKind},
@@ -153,6 +153,22 @@ fn draw_union(frame: &mut Frame<'_>, app: &mut App, areas: [Rect; 2]) {
     }
 }
 
+/// What a pane is, taken from the pane rather than from which side it is on.
+///
+/// The right-hand pane used to be labelled `remote` unconditionally. With no
+/// connection open it is a second local pane -- which is a useful thing to
+/// have, it is how you sync two directories on one machine -- and calling it
+/// `remote` while it listed `~` was the application asserting something
+/// false about where those files were. On a tool whose entire job is copying
+/// files between two places, a mislabelled side is not a cosmetic problem.
+///
+/// So the label is the backend's own name: `local`, `sftp`, `ftp`, `rclone`.
+/// That is strictly more informative than `remote` as well -- the scheme was
+/// not shown anywhere in the title before.
+fn pane_label(pane: &crate::browser::pane::Pane) -> &str {
+    pane.vfs.scheme()
+}
+
 fn pane_block<'a>(app: &App, index: usize, focused: bool, width: u16) -> Block<'a> {
     let pane = &app.panes[index];
     let palette = &app.palette;
@@ -165,7 +181,7 @@ fn pane_block<'a>(app: &App, index: usize, focused: bool, width: u16) -> Block<'
 
     // Budget for the title: the box corners, the side label, and the
     // `[absent]` badge all take columns the path cannot have.
-    let label = side_label(index);
+    let label = pane_label(pane);
     let reserved = 4 + label.len() + if pane.is_ghost() { 10 } else { 1 };
     let room = (width as usize).saturating_sub(reserved);
 
@@ -295,4 +311,55 @@ fn entry_cells<'a>(entry: &Entry, marked: bool, palette: &Palette) -> Vec<Cell<'
             Style::default().fg(palette.dim),
         ))),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use ratatui::layout::Constraint;
+
+    use crate::{app::App, config::Config};
+
+    /// With no connection open, the right-hand pane is a second *local* pane.
+    /// Labelling it `remote` while it lists your home directory is the
+    /// application asserting something false about where those files are.
+    #[test]
+    fn an_unconnected_pane_is_not_labelled_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        let mut app = App::new(Config::default(), here.clone(), here).unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let [left, right] = ratatui::layout::Layout::horizontal([
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(50),
+                ])
+                .areas(frame.area());
+                super::draw(frame, &mut app, [left, right]);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !screen.contains("remote"),
+            "nothing here is remote, so nothing may say so:\n{screen}"
+        );
+        assert_eq!(
+            screen.matches("local").count(),
+            2,
+            "both panes are local and both should say so:\n{screen}"
+        );
+    }
 }

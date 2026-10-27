@@ -236,10 +236,13 @@ impl App {
         // A broken bookmarks file should not stop lazysync from starting: it
         // is still a usable local file manager, and refusing to launch would
         // leave no way to fix the file from here.
-        let store = BookmarkStore::load_default().unwrap_or_else(|e| {
+        let mut store = BookmarkStore::load_default().unwrap_or_else(|e| {
             tracing::warn!("ignoring unreadable bookmarks: {e}");
             BookmarkStore::default()
         });
+        // After the load, and after the failure path above, so the connection
+        // list is never empty even when the file is missing or unreadable.
+        store.add_builtins();
 
         let mut app = Self {
             focus: config.default_pane.index(),
@@ -466,7 +469,13 @@ impl App {
                 self.screen = Screen::Form;
                 self.status = "new connection".into();
             }
+            // The built-in entry has nothing to edit and cannot be removed.
+            // Both say so rather than opening a form over fields that mean
+            // nothing, or asking a question whose yes would do nothing.
             Action::EditItem => match self.selected_bookmark() {
+                Some(bookmark) if bookmark.builtin => {
+                    self.status = format!("{} is built in -- nothing to configure", bookmark.name);
+                }
                 Some(bookmark) => {
                     self.form = Some(ConnectionForm::edit(bookmark));
                     self.screen = Screen::Form;
@@ -475,6 +484,9 @@ impl App {
                 None => self.status = "nothing to edit".into(),
             },
             Action::DeleteItem => match self.selected_bookmark() {
+                Some(bookmark) if bookmark.builtin => {
+                    self.status = format!("{} is built in and cannot be deleted", bookmark.name);
+                }
                 Some(bookmark) => {
                     let name = bookmark.name.clone();
                     self.overlay = Overlay::Question(Question {
@@ -504,12 +516,16 @@ impl App {
 
             Action::Help => self.overlay = Overlay::Help { scroll: 0 },
             Action::Cancel => {
+                // Clears the filter, and otherwise does nothing: this is the
+                // first screen, so there is nothing behind it.
+                //
+                // It used to drop to the two-pane browser, which is how you
+                // reached a local-to-local sync. That is now the "Local
+                // transfer" entry in this very list -- a row you can read
+                // before you open it, rather than a screen you arrive at by
+                // pressing Escape and have to deduce.
                 if self.bookmark_filter.is_empty() {
-                    // Nothing to back out of. Leaving the list with no filter
-                    // set means going to the local browser, which is still a
-                    // useful thing to do with no connections at all.
-                    self.screen = Screen::Browser;
-                    self.status = "local browser".into();
+                    self.status.clear();
                 } else {
                     self.bookmark_filter.clear();
                     self.clamp_bookmark_cursor();
@@ -550,6 +566,14 @@ impl App {
     /// across a dialog, which is exactly what should not happen.
     pub fn begin_open(&mut self, bookmark: &Bookmark) {
         let target = bookmark.target();
+
+        // Local needs no handshake, no credential and no connection. It is
+        // handled first so none of the machinery below has to carry a
+        // "unless it is local" clause.
+        if matches!(target.protocol, crate::connection::Protocol::Local) {
+            self.open_local_transfer(bookmark);
+            return;
+        }
 
         if !target.protocol.is_implemented() {
             self.status = format!(
@@ -730,6 +754,42 @@ impl App {
         }
     }
 
+    /// Open the built-in local entry: two panes, both on this machine.
+    ///
+    /// Shares nothing with `finish_open` deliberately. That function's job is
+    /// the aftermath of a *connection* -- storing a password that worked,
+    /// clearing the host key, turning a "connecting..." status into a
+    /// "connected" one -- and none of it applies. Threading a `None` through
+    /// all of it would leave five conditionals to say "except when there is
+    /// no server", which is how the local case ends up quietly wrong.
+    fn open_local_transfer(&mut self, bookmark: &Bookmark) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let left = bookmark.local_path.clone().unwrap_or_else(|| home.clone());
+        let right = bookmark.remote_path.clone().unwrap_or(home);
+
+        self.panes[0] = Pane::new(Box::new(LocalFs::new()), left, &self.config);
+        self.panes[1] = Pane::new(Box::new(LocalFs::new()), right, &self.config);
+
+        self.active_profile = bookmark.sync_profile.clone();
+        // Not `|| config.sync_browse.enabled`, unlike a real connection. Two
+        // panes that both start at home are already in step, so coupling them
+        // means every move happens twice and the second pane becomes a mirror
+        // you cannot steer -- the opposite of what you opened a two-pane
+        // browser for. Turn it on with the key once the panes are where you
+        // want them.
+        self.sync_browse = bookmark.sync_browse;
+        if self.sync_browse {
+            sync_browse::anchor_both(&mut self.panes);
+        }
+        self.desynced = false;
+        self.focus = self.config.default_pane.index();
+
+        self.connecting = None;
+        self.host_key = None;
+        self.screen = Screen::Browser;
+        self.status = "both panes are local -- pick a directory on each side".into();
+    }
+
     // ── Connection form ──────────────────────────────────────────────────
 
     fn handle_form(&mut self, action: Action) {
@@ -877,6 +937,11 @@ impl App {
             Action::SyncBisync => self.begin_sync(SyncMode::Bisync),
             Action::ToggleWatch => self.toggle_watch(),
             Action::ShowLog => self.open_log(),
+
+            Action::ShowConnections => {
+                self.screen = Screen::Bookmarks;
+                self.status.clear();
+            }
 
             Action::ToggleDirSizes => {
                 // Needs a recursive walk per directory, which over a network

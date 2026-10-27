@@ -44,6 +44,20 @@ pub enum Protocol {
     /// B2, Google Drive and some seventy others are reachable without a
     /// `remotefs` backend for each -- see [`crate::vfs::rclone`].
     Rclone,
+    /// Both sides are this machine.
+    ///
+    /// Not a connection in any real sense, which is the point: syncing
+    /// `~/photos` to a mounted backup drive or a NAS share is a first-class
+    /// use of a two-pane sync tool, and it needs no host, no credential and
+    /// no network. Giving it a protocol lets that be a *named entry in the
+    /// connection list* rather than a mode you fall into by pressing Esc --
+    /// see [`crate::bookmarks::Bookmark::local_transfer`].
+    ///
+    /// Deliberately absent from [`Protocol::ALL`]: that list is the set a
+    /// user picks between when adding a connection, and "local" is not
+    /// something you add. For the same reason there is no `local://` URL --
+    /// a bare path already means exactly that.
+    Local,
 }
 
 impl Protocol {
@@ -69,6 +83,7 @@ impl Protocol {
             Self::Smb => "smb",
             Self::Webdav => "webdav",
             Self::Rclone => "rclone",
+            Self::Local => "local",
         }
     }
 
@@ -92,8 +107,9 @@ impl Protocol {
             Self::S3 | Self::Webdav => 443,
             Self::Smb => 445,
             // No port: rclone runs as a subprocess and the remote's own
-            // config says how to reach wherever it points.
-            Self::Rclone => 0,
+            // config says how to reach wherever it points. Local has none for
+            // the more obvious reason.
+            Self::Rclone | Self::Local => 0,
         }
     }
 
@@ -105,7 +121,7 @@ impl Protocol {
     pub const fn is_implemented(self) -> bool {
         matches!(
             self,
-            Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps | Self::Rclone
+            Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps | Self::Rclone | Self::Local
         )
     }
 
@@ -118,7 +134,7 @@ impl Protocol {
     /// whoever picked the protocol and incapable of going stale.
     pub const fn unavailable_because(self) -> Option<&'static str> {
         match self {
-            Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps | Self::Rclone => None,
+            Self::Sftp | Self::Scp | Self::Ftp | Self::Ftps | Self::Rclone | Self::Local => None,
 
             // `remotefs-webdav` also still wants `remotefs 0.3`, whose
             // `RemoteFs` is a different and incompatible trait -- so it cannot
@@ -146,7 +162,7 @@ impl Protocol {
     /// would be asking for something lazysync has nowhere to put -- and the
     /// keyring entry it created would never be read.
     pub const fn needs_credentials(self) -> bool {
-        !matches!(self, Self::Rclone)
+        !matches!(self, Self::Rclone | Self::Local)
     }
 
     /// What a backend of this protocol can do.
@@ -160,6 +176,21 @@ impl Protocol {
         use crate::vfs::Capabilities;
 
         match self {
+            // Local: whatever the filesystem does, which is everything. Kept
+            // in step with `LocalFs::capabilities` by the test below, since
+            // two declarations of one backend's abilities is exactly the kind
+            // of pair that drifts.
+            Self::Local => Capabilities {
+                mtime: true,
+                set_mtime: true,
+                mode: cfg!(unix),
+                symlinks: true,
+                ranged_writes: true,
+                // POSIX rename(2) replaces the target atomically.
+                atomic_overwrite_rename: true,
+                mtime_granularity_secs: 1,
+            },
+
             // SFTP and SCP: full Unix semantics. The protocol's base attribute
             // set carries whole-second mtimes; version 4 added nanoseconds and
             // plenty of servers do not send them, so 1 second is the honest
@@ -480,6 +511,31 @@ mod tests {
                 "{protocol} works, so it must not claim an obstacle"
             );
         }
+    }
+
+    /// `Protocol::Local` and `LocalFs` describe the same backend, in two
+    /// places, and the planner reads whichever it is handed. If they drift,
+    /// a local-to-local sync compares by one rule and reports another.
+    #[test]
+    fn the_local_protocol_matches_the_local_filesystem() {
+        use crate::vfs::{LocalFs, Vfs};
+
+        assert_eq!(
+            Protocol::Local.capabilities(),
+            LocalFs::new().capabilities(),
+            "the two declarations of the local backend's abilities have drifted"
+        );
+    }
+
+    /// Local is reachable only as the built-in entry, never by URL: a bare
+    /// path already means "on this machine", and a second spelling would be
+    /// a second thing to keep working.
+    #[test]
+    fn local_is_not_url_addressable() {
+        assert_eq!(Protocol::from_scheme("local"), None);
+        assert!(!Protocol::ALL.contains(&Protocol::Local));
+        // It still has a name, because the connection list shows one.
+        assert_eq!(Protocol::Local.scheme(), "local");
     }
 
     /// Capabilities drive the planner's comparison rules, so every protocol

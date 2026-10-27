@@ -67,9 +67,67 @@ pub struct Bookmark {
     /// should make per host, not a side effect of saving a bookmark.
     #[serde(default)]
     pub remember_password: bool,
+
+    /// Supplied by lazysync rather than by the user, and never written to
+    /// disk.
+    ///
+    /// `skip` rather than `skip_serializing_if`: it must not round-trip at
+    /// all. If it were ever read back from `bookmarks.toml`, deleting the
+    /// built-in entry would become possible by hand-editing a flag, and the
+    /// file would carry an entry that the next version might define
+    /// differently.
+    #[serde(skip)]
+    pub builtin: bool,
 }
 
 impl Bookmark {
+    /// The name of the built-in local entry.
+    ///
+    /// A constant because three places need to agree on it: the entry itself,
+    /// the check that stops a user's bookmark colliding with it, and the
+    /// refusal to delete it.
+    pub const LOCAL_TRANSFER: &'static str = "Local transfer";
+
+    /// The built-in entry for syncing two directories on this machine.
+    ///
+    /// Esc on the connection list used to drop straight into a two-pane
+    /// browser. That browser was useful -- `~/photos` to a mounted backup
+    /// drive is a real sync, and needs no server -- but arriving there was
+    /// not: nothing had been chosen, nothing said what the screen was, and
+    /// the right-hand pane was captioned `remote` while listing local files.
+    ///
+    /// Making it an entry in the list fixes the category error. It is a thing
+    /// you *open*, like every other row, so it can be read before it is used,
+    /// it inherits the whole screen's conventions, and the way back out is
+    /// the way back out of any connection.
+    ///
+    /// It is not written to `bookmarks.toml` and cannot be deleted, because
+    /// "my machine" is not a connection someone configured -- it is always
+    /// there, and an empty connection list should still be able to do
+    /// something.
+    pub fn local_transfer() -> Self {
+        Self {
+            name: Self::LOCAL_TRANSFER.to_string(),
+            protocol: Protocol::Local,
+            host: String::new(),
+            port: None,
+            username: None,
+            auth: AuthMethod::default(),
+            identity_file: None,
+            // Both sides start at home. Not the invocation directory: this
+            // entry is reached from the connection list, where the directory
+            // lazysync happened to be launched in is not what you are asking
+            // for -- and a sync tool opening somewhere arbitrary on both
+            // sides is how the wrong pair of trees gets compared.
+            remote_path: None,
+            local_path: None,
+            sync_profile: None,
+            sync_browse: false,
+            remember_password: false,
+            builtin: true,
+        }
+    }
+
     /// A new bookmark for `target`.
     pub fn from_target(name: impl Into<String>, target: &Target) -> Self {
         let mut bookmark = Self {
@@ -85,6 +143,7 @@ impl Bookmark {
             sync_profile: None,
             sync_browse: false,
             remember_password: false,
+            builtin: false,
         };
         bookmark.set_target(target);
         bookmark
@@ -216,7 +275,19 @@ impl BookmarkStore {
             );
         }
 
-        let rendered = toml::to_string_pretty(self).context("rendering bookmarks as TOML")?;
+        // Built-in entries are lazysync's, not the user's. Writing one out
+        // would put an entry in their file that a later version might define
+        // differently, and that they would then be unable to get rid of.
+        let persisted = Self {
+            bookmarks: self
+                .bookmarks
+                .iter()
+                .filter(|b| !b.builtin)
+                .cloned()
+                .collect(),
+            recents: self.recents.clone(),
+        };
+        let rendered = toml::to_string_pretty(&persisted).context("rendering bookmarks as TOML")?;
 
         // The temporary file goes beside the *target*, because a rename cannot
         // cross filesystems and the target may be somewhere else entirely.
@@ -253,9 +324,33 @@ impl BookmarkStore {
     }
 
     /// Remove a bookmark, returning it.
+    ///
+    /// Built-in entries are not removable, and this is the single place that
+    /// enforces it rather than a check at the one call site that exists
+    /// today: a store that can be emptied of the local entry by any future
+    /// caller is a store where the invariant is a convention.
     pub fn remove(&mut self, name: &str) -> Option<Bookmark> {
-        let index = self.bookmarks.iter().position(|b| b.name == name)?;
+        let index = self
+            .bookmarks
+            .iter()
+            .position(|b| b.name == name && !b.builtin)?;
         Some(self.bookmarks.remove(index))
+    }
+
+    /// Put the built-in entries in place.
+    ///
+    /// Last, not first. The cursor opens on row 0, and the entry you least
+    /// often want should not be the one sitting under it every launch --
+    /// nor should adding a built-in row push everybody's real connections
+    /// down by one.
+    ///
+    /// Called after loading, so a `bookmarks.toml` that happens to contain a
+    /// connection named "Local transfer" -- written by hand, or by an older
+    /// version -- cannot shadow or duplicate this one.
+    pub fn add_builtins(&mut self) {
+        self.bookmarks
+            .retain(|b| b.name != Bookmark::LOCAL_TRANSFER);
+        self.bookmarks.push(Bookmark::local_transfer());
     }
 
     /// Record a connection that was opened without being saved.

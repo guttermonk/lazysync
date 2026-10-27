@@ -170,7 +170,17 @@ also what the on-screen hints are generated from, so the footers follow your
 config rather than this page.
 
 In the connection list: `enter` opens, `n` adds, `e` edits, `dd` deletes, `/`
-filters, `esc` drops to the local browser.
+filters, `esc` clears the filter.
+
+The list always ends with a built-in entry, **Local transfer**, which opens
+two local panes. Syncing `~/photos` to a mounted backup drive or a NAS share
+is a real sync that needs no server, so it is a row you open like any other
+rather than a mode you reach by pressing Escape. It cannot be deleted and is
+never written to your `bookmarks.toml`.
+
+From the browser, `c` goes back to the connection list. Each pane is
+labelled with the backend it is actually showing — `local`, `sftp`, `ftp`,
+`rclone` — so a pane never claims to be somewhere it isn't.
 
 In the browser: `h`/`j`/`k`/`l` navigate, `tab` switches panes, `S` toggles
 synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
@@ -409,32 +419,100 @@ would eat the comments.
 ### Keybindings
 
 Keymaps are per UI mode — `d` is delete in the browser and a literal `d` in a
-text field. Within a mode, `base` replaces the defaults entirely and `extra`
-layers on top, winning any collision:
+text field. Within a mode there are four tables, applied in this order:
+
+| Table | Means | Resolves collisions by |
+| --- | --- | --- |
+| `base` | start from nothing but this | — (it *is* everything) |
+| `set` | these actions get exactly these keys | **action** |
+| `extra` | these keys get these actions | **key** |
+| `unbind` | these keys do nothing | — (it only removes) |
+
+`set` and `extra` are the pair worth understanding, because the difference is
+not obvious and picking the wrong one is quiet rather than loud:
 
 ```toml
 [keys.browser]
-extra = [
-    ["ToggleSyncBrowse", "S"],
-    ["SyncPush",         ["s", "p"]],
-    ["Delete",           ["d", "d"]],
-    ["Copy",             { key = "c", mod = ["Ctrl"] }],
+# "move down is on e now" -- j stops moving down.
+set = [["MoveDown", "e"]]
+
+# "e also moves down" -- j still does too. Use this to ADD a key.
+extra = [["MoveDown", "e"]]
+```
+
+`set` replaces the action's other keys, so list every one you want to keep —
+**except the arrows, which are never retired**. Choosing between `j` and `e`
+is a statement about a layout, and the arrows are not part of any layout:
+they are what works for someone who has not learned yours. If you do want rid
+of one, say so — `unbind = ["down"]` runs after `set`.
+
+Giving one action several keys means several entries. An array is a *chord*,
+not a list of alternatives:
+
+```toml
+set = [
+    ["EnterDir", "o"],
+    ["EnterDir", "enter"],      # o, or Enter
+    ["SyncPush", ["s", "p"]],   # s THEN p
 ]
 ```
 
-**Prefer `extra` unless you mean to start from nothing.** `base` replaces the
-mode's defaults *wholesale*, so any action you leave out of it ends up with no
-key at all — and the symptom is a key that silently does nothing, which reads
-like a bug rather than a gap in the config. A `base` for `[keys.browser]` that
-rebinds the motions and forgets the `s`-prefixed sync chords leaves lazysync
-unable to start a sync. Reach for `base` when you want a layout built from
-scratch; use `extra` to change a few keys.
+`unbind` is for keys something else needs to see, and is applied last so
+nothing can reinstate them:
 
-Either way, check it:
+```toml
+[keys.browser]
+unbind = ["esc"]    # let zellij or tmux close its popup
+```
+
+It is prefix-based: `unbind = ["s"]` also removes the `sp`/`sl`/`sm` chords,
+because otherwise `s` would still be swallowed while lazysync waited to see
+whether a chord was coming.
+
+A fuller example:
+
+```toml
+[keys.browser]
+set = [
+    ["ToggleSyncBrowse", "S"],
+    ["SyncPush",         ["s", "p"]],
+]
+extra = [
+    ["Refresh", { key = "r", mod = ["Ctrl"] }],
+]
+unbind = ["esc"]
+```
+
+**Esc is never the only way out.** Every mode binds `ctrl+c` to cancel as
+well, because a terminal multiplexer can take Esc before lazysync sees it —
+binding it to close a floating pane is a normal thing to do in zellij or
+tmux. If you do that, `ctrl+c` is what still works; lazysync quits on `q` or
+`ZZ`, so nothing here treats `ctrl+c` as "exit". A `base` table replaces that
+second key along with everything else, so keep an escape hatch in yours.
+
+**Reach for `base` only if you really mean "start from nothing".** It replaces
+the mode's defaults *wholesale*, so any action you leave out ends up with no
+key at all — and the symptom is a key that silently does nothing, which reads
+like a bug rather than a gap in your config. A `base` for `[keys.browser]`
+that rebinds the motions and forgets the `s`-prefixed sync chords leaves
+lazysync unable to start a sync. If what you want is "my own keys for a
+handful of actions", that is `set`, which leaves everything else alone.
+
+Whichever you use, check it — `lazysync keys` lists what your config resolves
+to, and then names any action that ended up with no key:
 
 ```console
-$ lazysync keys --mode browser    # what your config actually resolves to
+$ lazysync keys --mode browser
+[keys.browser]
+  MoveDown             e
+  ...
+  # unbound in this mode, but bound by default:
+  # CycleSort          Next sort key
 ```
+
+Actions go missing from more than just `base`: a `set` or `extra` that takes a
+key another action was using leaves that action stranded, and so does an
+`unbind` aimed at a chord prefix. The report catches all of them.
 
 `lazysync keys` prints the resolved keymap, the in-app help overlay (`?`) is
 generated from it, and so is every on-screen key hint — so nothing in the UI

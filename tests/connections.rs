@@ -149,7 +149,16 @@ fn with_password(name: &str, host: &str) -> Bookmark {
 fn lazysync_can_open_on_the_bookmark_list() {
     let h = Harness::new(&[sftp("www", "box")]);
     assert_eq!(h.app.screen, Screen::Bookmarks);
-    assert_eq!(h.app.visible_bookmarks().len(), 1);
+    assert_eq!(
+        h.app.visible_bookmarks().len(),
+        2,
+        "the saved connection, plus the built-in local entry"
+    );
+    assert_eq!(
+        h.app.selected_bookmark().unwrap().name,
+        "www",
+        "the cursor opens on a real connection, not on the built-in"
+    );
 }
 
 #[test]
@@ -158,10 +167,72 @@ fn the_list_navigates_with_vim_keys() {
 
     h.press("j");
     assert_eq!(h.app.selected_bookmark().unwrap().name, "b");
-    h.press("G");
-    assert_eq!(h.app.selected_bookmark().unwrap().name, "c");
     h.press("gg");
     assert_eq!(h.app.selected_bookmark().unwrap().name, "a");
+
+    // The built-in sits at the end, after the user's own connections.
+    h.press("G");
+    assert_eq!(
+        h.app.selected_bookmark().unwrap().name,
+        Bookmark::LOCAL_TRANSFER
+    );
+}
+
+/// The built-in entry is lazysync's, not the user's: it is never written to
+/// their file, and it cannot be deleted out of the list.
+#[test]
+fn the_local_entry_is_built_in_and_permanent() {
+    let mut h = Harness::new(&[sftp("www", "box")]);
+
+    h.press("G");
+    let selected = h.app.selected_bookmark().unwrap();
+    assert!(selected.builtin);
+    assert_eq!(selected.name, Bookmark::LOCAL_TRANSFER);
+
+    // `dd` does not even ask, because there is no answer that would work.
+    h.press("dd");
+    assert!(
+        matches!(h.app.overlay, Overlay::None),
+        "deleting it must not open a confirmation it cannot honour"
+    );
+    assert_eq!(
+        h.app.selected_bookmark().unwrap().name,
+        Bookmark::LOCAL_TRANSFER,
+        "still there"
+    );
+
+    // And it never reaches bookmarks.toml.
+    assert!(
+        !h.saved()
+            .bookmarks
+            .iter()
+            .any(|b| b.name == Bookmark::LOCAL_TRANSFER),
+        "a built-in entry must not be written into the user's file"
+    );
+}
+
+/// Opening it is how you get a two-local-pane browser -- the thing Esc used
+/// to drop into without saying so.
+#[test]
+fn opening_the_local_entry_gives_two_local_panes() {
+    let mut h = Harness::new(&[]);
+
+    h.press("G");
+    h.enter();
+
+    assert_eq!(h.app.screen, Screen::Browser);
+    for pane in &h.app.panes {
+        assert_eq!(
+            pane.vfs.scheme(),
+            "local",
+            "both sides of a local transfer are local"
+        );
+    }
+    assert!(
+        !h.app.sync_browse,
+        "two panes that start in the same place must not be coupled, or the \
+         second pane is a mirror you cannot steer"
+    );
 }
 
 #[test]
@@ -345,7 +416,11 @@ fn slash_filters_the_list() {
 
     // Esc with a filter set clears it rather than leaving the screen.
     h.esc();
-    assert_eq!(h.app.visible_bookmarks().len(), 2);
+    assert_eq!(
+        h.app.visible_bookmarks().len(),
+        3,
+        "both connections, plus the built-in local entry"
+    );
     assert_eq!(h.app.screen, Screen::Bookmarks);
 }
 
@@ -361,15 +436,49 @@ fn the_filter_also_matches_the_host() {
     assert_eq!(h.app.selected_bookmark().unwrap().name, "one");
 }
 
+/// Esc on the first screen has nothing to back out to.
+///
+/// It used to drop into the two-pane browser, which was the only way to
+/// reach a local-to-local sync -- an undiscoverable route to a screen that
+/// then mislabelled itself. That capability is now the "Local transfer" row
+/// in this list, so Esc has no hidden job left to do.
 #[test]
-fn esc_on_an_unfiltered_list_goes_to_the_local_browser() {
+fn esc_on_an_unfiltered_list_stays_put() {
     let mut h = Harness::new(&[sftp("www", "box")]);
 
     h.esc();
     assert_eq!(
         h.app.screen,
-        Screen::Browser,
-        "with no connections usable, a local file manager is still useful"
+        Screen::Bookmarks,
+        "this is the first screen; there is nothing behind it"
+    );
+}
+
+/// Esc out of the connection list has to be a door, not a trapdoor.
+///
+/// It dropped to the browser and nothing anywhere returned: no binding in
+/// any mode set `Screen::Bookmarks` except the form and startup, so the only
+/// way back to your connections was to quit and relaunch.
+#[test]
+fn the_browser_can_get_back_to_the_connection_list() {
+    let mut h = Harness::new(&[sftp("www", "box")]);
+
+    h.press("G"); // the built-in local entry
+    h.enter();
+    assert_eq!(h.app.screen, Screen::Browser);
+
+    h.press("c");
+    assert_eq!(
+        h.app.screen,
+        Screen::Bookmarks,
+        "there must be a way back to the connections"
+    );
+    assert!(
+        h.app
+            .visible_bookmarks()
+            .iter()
+            .any(|(_, b)| b.name == "www"),
+        "and the list still has the saved connections"
     );
 }
 

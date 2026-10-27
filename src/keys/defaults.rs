@@ -129,9 +129,14 @@ fn browser() -> Keymap {
         // The audit log. Under `s` with the rest of the sync commands,
         // because what it shows is which syncs ran.
         (Action::ShowLog, chord("sL")),
+        // Back to the connection list, which Esc drops out of. `c` for
+        // connections: free in this mode, and not under the `s` prefix
+        // because this is navigation, not a sync command.
+        (Action::ShowConnections, c('c')),
         // General.
         (Action::Help, c('?')),
         (Action::Cancel, n(Key::Esc)),
+        (Action::Cancel, ctrl('c')),
         (Action::Quit, c('q')),
         (Action::Quit, chord("ZZ")),
     ]);
@@ -148,6 +153,7 @@ fn confirm() -> Keymap {
         (Action::Apply, n(Key::Enter)),
         (Action::Cancel, c('n')),
         (Action::Cancel, n(Key::Esc)),
+        (Action::Cancel, ctrl('c')),
         (Action::Cancel, c('q')),
         // Per-row inclusion.
         (Action::ToggleRow, n(Key::Space)),
@@ -198,6 +204,7 @@ fn bookmarks() -> Keymap {
         (Action::Search, c('/')),
         (Action::Help, c('?')),
         (Action::Cancel, n(Key::Esc)),
+        (Action::Cancel, ctrl('c')),
         (Action::Quit, c('q')),
         (Action::Quit, chord("ZZ")),
     ]);
@@ -240,6 +247,7 @@ fn help() -> Keymap {
         // should obviously do.
         (Action::Cancel, c('?')),
         (Action::Cancel, n(Key::Esc)),
+        (Action::Cancel, ctrl('c')),
         (Action::Cancel, c('q')),
         (Action::Quit, chord("ZZ")),
     ]);
@@ -254,6 +262,7 @@ fn queue() -> Keymap {
         // mid-transfer should not be one keystroke away from pausing it.
         (Action::TogglePause, c('p')),
         (Action::Cancel, n(Key::Esc)),
+        (Action::Cancel, ctrl('c')),
         (Action::Help, c('?')),
     ]);
     Keymap(bindings)
@@ -263,6 +272,7 @@ fn log() -> Keymap {
     let mut bindings = motions();
     bindings.extend([
         (Action::Cancel, n(Key::Esc)),
+        (Action::Cancel, ctrl('c')),
         (Action::Cancel, c('q')),
         (Action::Search, c('/')),
         (Action::SearchNext, c('n')),
@@ -276,6 +286,36 @@ fn log() -> Keymap {
 mod tests {
     use super::*;
     use crate::keys::{combo::Mods, keymap::Resolution};
+
+    /// Esc must never be the only way out of a mode.
+    ///
+    /// A terminal multiplexer can take Esc before lazysync ever sees it --
+    /// binding it to close a floating pane is a normal thing to do, and
+    /// zellij and tmux both intercept at that level. When that happens, a
+    /// mode whose only Cancel is Esc has no way out at all: on the bookmark
+    /// list you could not reach the local browser, in the queue you could
+    /// not cancel a running transfer.
+    ///
+    /// So every mode carries a second Cancel key. `ctrl+c` rather than
+    /// something mnemonic, because it has to be free in all eight modes and
+    /// it already meant cancel in the form and the prompt.
+    #[test]
+    fn esc_is_never_the_only_way_to_cancel() {
+        for mode in Mode::ALL {
+            let map = for_mode(mode);
+            let escapes: Vec<_> = map
+                .combos_for(Action::Cancel)
+                .into_iter()
+                .filter(|combo| **combo != n(Key::Esc))
+                .collect();
+
+            assert!(
+                !escapes.is_empty(),
+                "{mode} can only be cancelled with Esc, so a multiplexer that eats Esc \
+                 leaves it with no way out"
+            );
+        }
+    }
 
     /// A duplicated combo within one mode means the second binding is dead
     /// code the user cannot reach, which is a mistake in this file rather than
