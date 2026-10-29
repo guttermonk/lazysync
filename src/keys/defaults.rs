@@ -139,6 +139,11 @@ fn browser() -> Keymap {
         (Action::NewDir, c('A')),
         (Action::Rename, c('r')),
         (Action::Chmod, c('p')),
+        // `e` for edit, matching the connection list's own `e`. The two act
+        // on different things -- a file here, a saved host there -- but both
+        // mean "open this for editing", which is the association worth
+        // keeping across modes.
+        (Action::EditFile, c('e')),
         // A chord for the destructive one, matching `[keys.bookmarks]`: a
         // single `d` next to `a` is how you delete the file you meant to
         // create beside it.

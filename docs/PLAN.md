@@ -1,15 +1,22 @@
 # lazysync — design & implementation plan
 
-A dual-pane terminal file manager and sync tool for local ↔ remote (and
-local ↔ local, remote ↔ remote) trees. termscp's feature set, vim keys by
-default, every binding remappable, and a confirmation window that shows you
-exactly what is about to be overwritten before anything moves.
+A dual-pane terminal file manager and sync tool for local ↔ remote and
+local ↔ local trees (remote ↔ remote is still intended; see §9.10). termscp's
+feature set, vim keys by default, every binding remappable, and a
+confirmation window that shows you exactly what is about to be overwritten
+before anything moves.
 
-Status: **phase 7 of 7 complete**. All four sync modes, the transfer queue,
-watch mode and the audit log work over local, SFTP/SCP, FTP/FTPS and any
-`rclone` remote — which is also how S3, WebDAV, B2 and Google Drive are
-reachable. See the phase table in §10 for what each phase delivered, and what
-it turned out not to have anticipated.
+Status: **phase 7 of 7 complete**, plus the post-phase work in §10a. All four
+sync modes, the transfer queue, watch mode and the audit log work over local,
+SFTP/SCP, FTP/FTPS and any `rclone` remote — which is also how S3, WebDAV, B2
+and Google Drive are reachable. The browser can now also create, rename,
+delete and chmod, and an idle session is kept alive and reopened if it drops.
+See the phase table in §10 for what each phase delivered, and what it turned
+out not to have anticipated.
+
+Sections below describe **what is built** unless they say otherwise. Anything
+still outstanding is marked *(not built)* at the point it is described, rather
+than left for a reader to discover by pressing the key.
 
 ---
 
@@ -141,10 +148,16 @@ src/
     delegate.rs      running rsync/rclone as a transport
     watch.rs         notify + debouncing
     audit.rs         the append-only run log
+    progress.rs      where a tree walk reports to while it is running
 
   ui/
     mod.rs  panes.rs  confirm.rs  progress.rs  status.rs  help.rs
     bookmarks.rs  form.rs  form_view.rs  log.rs
+    hint.rs          every on-screen key hint, from the resolved keymap
+    keybar.rs        the browser's hint bar, and the which-key chord list
+    hit.rs           what the last frame drew where, so a click can land
+    question.rs      the two-button yes/no dialog
+    prompt.rs        the password window
 
   integrations/
     zide.rs          cwd -> bookmark resolution
@@ -153,34 +166,53 @@ src/
 ## 4. Keybindings
 
 Directly borrowed from `inlyne/src/keybindings/`: an `Action` enum paired with
-`KeyCombo(Vec<ModifiedKey>)`, `base` fully replaces the defaults, `extra`
-layers on top and wins any collision with a `base` binding that shares its
-prefix.
+`KeyCombo(Vec<ModifiedKey>)`.
 
 Extension inlyne doesn't need: **per-mode keymaps**, because `d` means delete in
 the browser and a literal `d` in a text field.
 
+**Four tables per mode, not two.** `base` and `extra` could not express the
+ordinary case — change a handful of keys and have the ones they replaced stop
+working — because `extra` resolves collisions by *key* and so can add a
+binding but never move one. Applied in this order:
+
+| Table | Means | Resolves collisions by |
+| --- | --- | --- |
+| `base` | start from nothing but this | — (it *is* everything) |
+| `set` | these actions get exactly these keys | **action** |
+| `extra` | these keys get these actions | **key** |
+| `unbind` | these keys do nothing, prefix-wise | — (it only removes) |
+
 ```toml
 [keys.browser]
-extra = [
+set = [
   ["ToggleSyncBrowse", "S"],
   ["SyncPush",         ["s", "p"]],
-  ["Delete",           ["d", "d"]],
+  ["DeleteFile",       ["d", "d"]],
 ]
+unbind = ["esc"]        # let a multiplexer have it
 
-[keys.confirm]
-extra = [["Apply", "y"], ["Cancel", "n"]]
-
-# modes: browser, confirm, form, prompt, help, queue, log
+# modes: bookmarks, browser, confirm, question, form, prompt, help, queue, log
 ```
 
-Vim defaults: `h j k l`, `gg G`, `ctrl-d/u`, `0 $`, `/ n N`, `:`, `dd yy p`,
-`v` visual select, `space` mark, `tab` switch pane, `S` sync-browse,
-`u` union view, `q`/`ZZ` quit, `?` help.
+Vim-shaped defaults, as actually bound: `h j k l`, `gg G`, `ctrl+d/u`,
+`ctrl+f/b`, `/ n N`, `space` mark with `ma`/`mc`/`mi`, `tab` switch pane,
+`S` sync-browse, `u` union view, `o`/`O` sort, `.` dotfiles, `c`
+connections, `a`/`A`/`r`/`dd`/`p` file operations, `s`-prefixed sync chords,
+`q`/`ZZ` quit, `?` help. There is no visual-select mode, no `:` command line,
+and no `yy`/`p` yank-and-put — marks do the work a visual selection would.
 
-- `lazysync keys [--mode browser]` prints the resolved keymap.
-- The `?` overlay is generated from the live keymap, never a hardcoded string.
-- Chord resolution has a configurable timeout (`chord_timeout_ms`, default 500).
+- `lazysync keys [--mode browser]` prints the resolved keymap, **and names
+  any action that ended up with no key**. Every editing table can strand one:
+  `set` and `extra` by taking a key something else was using, `unbind` by
+  aiming at a chord prefix. At runtime that is indistinguishable from a
+  broken feature, so it is reported rather than left to be found.
+- The `?` overlay is generated from the live keymap, never a hardcoded
+  string, and so is every footer and hint — see `ui/hint.rs`.
+- `chord_timeout_ms` (default 500) is **not** a clock on typing a chord. It
+  only applies where a chord has a shorter binding to fall back on, like `d`
+  alongside `dd`; none of the defaults has one, so with a stock keymap a
+  chord waits as long as you do and your cancel key is the way out.
 
 ## 5. Synchronized browsing
 
@@ -226,9 +258,22 @@ Your asymmetric case — local has a handful of the remote's directories:
 - `leader = "focused" | "local" | "remote"` (default `focused`) decides which
   pane's navigation drives the other.
 
-Edge cases to handle explicitly: symlinks (follow vs show), case-insensitive
-remotes, `\` vs `/` separators, permission-denied on one side only, and roots
-that are themselves symlinks.
+Edge cases, and where each stands:
+
+- **Permission-denied on one side** — handled. The subtree is recorded in the
+  plan's `unreadable` list, prefixed with which side refused, rather than
+  silently reading as empty.
+- **A counterpart that is a file, not a directory** — handled. The follower
+  stats rather than merely checking existence, so it does not show an empty
+  listing with no explanation.
+- *(not handled)* **Symlinks** — not transferred at all, so the follow-vs-show
+  question has not had to be answered yet. This is also why
+  `safety.confirm_outside_root` is parsed and not honoured: nothing can
+  currently escape the root this way.
+- *(not handled)* **Case-insensitive remotes** — two names differing only in
+  case would be two entries here and one on the server.
+- *(not handled)* **`\` vs `/` separators**, and **roots that are themselves
+  symlinks**.
 
 ## 6. Confirmation window
 
@@ -261,11 +306,19 @@ the dry run; applying is a separate step.
   source, yellow when the file shrinks.
 - `space` excludes a row, `i` inverts, `o` only-this, `a` all; excluded rows
   grey out and the footer totals recompute live.
-- `enter` on a directory op drills into its file-level ops.
-- `D` on a text file shows an inline unified diff before you decide.
-- `c` re-compares the selected (or all ambiguous) rows by checksum rather than
-  size+mtime.
-- `w` writes the plan to JSON/Markdown — useful for auditing `--yes` cron runs.
+- `zc`/`zo` fold and unfold a section. The heading of a folded one names the
+  unfold key from the live keymap rather than as a literal.
+- Conflicts are settled in place: `L` keep local, `R` keep remote, `B` keep
+  both, `X` defer. An undecided conflict blocks the whole plan.
+
+Still outstanding, and each says so when pressed rather than doing nothing:
+
+- *(not built)* `dd` — an inline unified diff of the row before deciding.
+- *(not built)* `c` — re-compare the selected rows by checksum rather than
+  size+mtime. Blocked on there being any hashing at all; see §2.
+- *(not built)* `enter` on a directory op, to drill into its file-level ops.
+- *(not built)* writing the plan to JSON/Markdown for auditing `--yes` runs.
+  The audit log covers most of what this was for.
 
 ## 7. Bookmarks & connections
 
@@ -284,6 +337,7 @@ identity_file = "~/.ssh/id_ed25519"
 remote_path   = "/srv/www/proj"
 local_path    = "/home/greg/proj"    # termscp drops this; we keep it
 sync_profile  = "deploy"
+default_sync  = "push"               # what Enter on a file runs; unset = off
 sync_browse   = true
 remember_password = false            # true → keyring entry "lazysync:www-prod"
 ```
@@ -295,7 +349,11 @@ remember_password = false            # true → keyring entry "lazysync:www-prod
   exists. Host, port, username, paths are never shown here.
 - **Connection details live only in the add/edit screen** (`n` new, `e` edit).
 - Separate **recents** list (like termscp), with local paths retained.
-- `lazysync import termscp` pulls existing termscp bookmarks over.
+- A built-in **Local transfer** row, last in the list, opening two local
+  panes. It cannot be deleted and is never written to `bookmarks.toml`.
+- *(not built)* `lazysync import termscp`. Its format carries an encrypted
+  password blob, and an importer written against a format that cannot be
+  tested here would be guesswork presented as a feature.
 
 ## 8. zide integration
 
@@ -315,19 +373,33 @@ On startup, when `[zide] auto_open_bookmark = true` (default):
 Config: `match = "exact" | "ancestor" | "off"`. CLI overrides:
 `--auto-open` / `--no-auto-open`, `--open <bookmark>`.
 
-Ship `layouts/default_lazysync.kdl` etc. mirroring zide's lazygit pane, plus a
-`zide-sync` launcher in the README:
+**Getting out of the way without dropping the connection.** Quitting closes
+the session, which makes "I want my terminal back for a minute" cost a
+reconnect. `Hide` runs `[zide] hide_command` and keeps running behind it, so
+the connection, the marks, the cursor and a transfer in flight are all still
+there when the pane comes back.
 
-```kdl
-pane_template name="lazysync" start_suspended=true {
-    command "lazysync"
-    x "10%"; y "5%"; width "80%"; height "80%"
-}
+```toml
+[zide]
+hide_command = ["zellij", "action", "hide-floating-panes"]
 ```
 
-Last-used bookmark and pane paths persist to
-`$XDG_STATE_HOME/lazysync/session.toml`, so re-popping the popup resumes where
-you left off.
+Empty by default and unbound by default, and both halves matter: lazysync
+cannot know what is hosting it, so nothing is detected or guessed — and a key
+bound to a no-op reads as a broken feature where an unbound one sends you to
+`?`. Bringing the pane back is the host's job (`ToggleFloatingPanes`, `Alt+f`
+in zellij); a keybind that *runs* lazysync starts a second one beside the
+hidden pane.
+
+Two things from the original sketch that were **not built**:
+
+- *(not built)* a shipped `layouts/default_lazysync.kdl`. There is no
+  `layouts/` directory; the README documents the pane template instead, which
+  is one copy of the information rather than two that can disagree.
+- *(not built)* `$XDG_STATE_HOME/lazysync/session.toml` for last-used
+  bookmark and pane paths. zide auto-open already resolves the working
+  directory to a bookmark, which covers the case this was for without a
+  second source of truth about where you were.
 
 ## 9. Additions beyond what you listed
 
@@ -416,18 +488,37 @@ Ranked by how much I think they matter.
    handshake that reads the key and stops, *before* any password is collected —
    so you are never asked to type a secret for an unverified server. A changed
    key is refused outright rather than offered as a prompt.
-9. **Permission/ownership preservation** where the protocol supports it, and an
-   honest "cannot preserve: <reason>" note where it doesn't.
+9. **Permission/ownership preservation** — mode is preserved where the
+   protocol has it, and the window says `the destination has no permission
+   bits` where it does not. Ownership is not touched at all: setting a uid on
+   a server you are not root on fails, and a sync that reports preserving
+   something it did not is worse than one that never claimed to.
+   `preserve_mtime` and `preserve_mode` are both always on; the flags that
+   would turn them *off* are parsed and not honoured.
 10. **Local↔local and remote↔remote** syncs, not just local↔remote.
-11. **Headless CLI** — `lazysync sync <profile> --dry-run|--yes` with no TUI,
-    for cron/systemd timers; plus an append-only audit log of applied syncs.
-12. **File ops parity with termscp** — open in `$EDITOR`, view, chmod, mkdir,
-    rename, multi-select, `:!cmd` remote exec.
-13. **Session keepalive + auto-reconnect** preserving pane state.
-14. **Theme file** in inlyne's style plus a bluetui-ish `[colors]` section, with
-    terminal-default, catppuccin, gruvbox and nord presets.
-15. **Home-manager module** (like `tuimon` has) so bookmarks/config/keys are
-    declarable; needs a mutable-overlay path since the store is read-only.
+    Local↔local is done, as the built-in `Local transfer` entry.
+    Remote↔remote is **not**: pane 0 is always the local filesystem, and a
+    connection opens into pane 1, so there is nowhere to put the second
+    session. It needs the pane array to stop encoding which side is which.
+11. ~~**Headless CLI**~~ — done in phase 7. `lazysync sync <profile>
+    --dry-run|--yes` with no TUI, plus the append-only audit log. A bisync
+    profile is refused rather than resolved unattended.
+12. **File ops parity with termscp** — chmod, mkdir, rename, delete, create,
+    multi-select and `$EDITOR` are all done; see §10a. What is left is a
+    built-in *viewer* (a pager for a file you do not want to risk editing)
+    and `:!cmd` remote exec, which needs a command line lazysync does not
+    have — there is no `:` mode, by the same reasoning that left out visual
+    select.
+13. ~~**Session keepalive + auto-reconnect**~~ — done; see §10a.
+14. ~~**Theme file**~~ — done. `[theme] preset` with terminal-default,
+    catppuccin-mocha, gruvbox-dark and nord, plus per-slot `[theme.colors]`
+    overrides across nineteen slots. The `terminal` preset is `Color::Reset`
+    plus the sixteen ANSI colours, so a transparent terminal stays
+    transparent — which an overlay's dimming had to be written to preserve.
+15. ~~**Home-manager module**~~ — done in phase 7. `settings` owns
+    `config.toml`, which lazysync only reads. `bookmarks` is offered and off
+    by default, because lazysync *writes* that file from the UI and the store
+    is read-only; see the phase 7 row for the symlink bug this exposed.
 16. ~~**Test fixtures**~~ — `sshd` done in phase 2 (`tests/fixtures/sshd.sh`),
     FTP in phase 5 (`tests/fixtures/ftpd.sh`). Both start a real server on
     loopback as the invoking user, and both have earned it: the SSH one caught
@@ -450,7 +541,10 @@ Ranked by how much I think they matter.
     with nothing on stderr. `pyftpdlib` is a real server built to run as an
     ordinary user, which is why it is what most FTP *clients* are tested
     against.
-17. **Dir size on remote** is expensive — make `du`-style sizes lazy/opt-in.
+17. ~~**Dir size on remote**~~ — done. `dir_sizes` is off by default and `z`
+    toggles it, because it costs one listing per subdirectory and over SFTP
+    that is slow enough to feel. Directories show `-` when it is off, which
+    is the honest rendering of a number nobody has measured.
 
 ## 10. Phases
 
@@ -469,6 +563,109 @@ Ranked by how much I think they matter.
 
 Phases 1–3 are the usable milestone: dual-pane browsing over SFTP with
 sync-browse and a reviewed push.
+
+## 10a. After phase 7
+
+Not a phase. Everything here came from using the thing — mostly from running
+it in a zellij popup against a real host — and is recorded because the
+reasons are not recoverable from the diff.
+
+**The UI was describing itself from memory.** Every footer was a string
+literal listing the *default* keys, so a rebinding made lazysync confidently
+name keys that did nothing — worst of all in the confirmation window, whose
+footer said `n cancel` while `n` was bound to `ParentDir`. `ui/hint.rs`
+renders every hint from the same `Keymap` the dispatcher resolves against,
+which makes the two unable to disagree, and `lazysync keys` now reports any
+action left with no key at all.
+
+**A chord gave no evidence it had landed.** `s` is bound to nothing on its
+own, so pressing it looked exactly like a key the terminal had swallowed.
+The key bar now becomes the list of what the chord can still become, the
+partial chord is echoed bottom-right the way vim's `showcmd` is, and the
+cancel key backs out of one. `chord_timeout_ms` turned out to be actively
+harmful: with no shorter binding to fall back on it could only ever *discard*
+a chord mid-typing, which is what it had been doing.
+
+**Planning froze the terminal.** `sync/progress.rs` is a `Progress` trait the
+walk reports to, with a `Flow::Cancel` it can be stopped by; the TUI animates
+a spinner with running counts and watches for the cancel key, and everything
+headless uses `Silent`. A cancelled walk discards its plan rather than
+offering a subset nobody chose. **This is a stopgap and should be read as
+one:** the walk still owns the thread, so the browser underneath is frozen
+rather than merely busy. The real fix is a planner that yields the way
+`sync::transfer` already does.
+
+**The mouse.** `ui/hit.rs` collects the rectangles each widget just drew,
+rebuilt every frame, so a click is answered by the frame in front of the
+user. One click selects and a double click runs the *same action the keyboard
+binding does* — so the mouse can never do something the keyboard cannot, and
+a stray click cannot exclude a row from a sync. Reporting is `?1000`+`?1006`
+written out rather than crossterm's `EnableMouseCapture`, which also enables
+motion reporting and would wake the loop for every cell the pointer crosses.
+
+**Two screens were lying about their keys.** The yes/no dialog shared
+`[keys.confirm]`, and the two disagree about `n` — a motion in a remapped
+keymap, the answer "no" in a dialog — so `Mode::Question` is its own mode
+with its own map. It is two buttons rather than two letters, and **opens on
+"no"**, because every question lazysync asks guards something it cannot take
+back and Enter is the key people press without reading.
+
+**The password prompt was furniture.** Collected on the status line, in the
+same row and colour as the mode badge and the cursor counter. It is now a
+centred window in lazygit's shape — titled, bordered, `*`-masked, naming the
+connection. Search and the bookmark filter stay on the status line, because
+a box in the middle of the screen covers the listing you are searching.
+Overlays also dim what is behind them and keep clear of the panes' bottom
+border row, after a report that the help overlay's border and the pane
+borders read as one shape with a seam in it.
+
+**File operations**, the subject of §9.12: `a` new file, `A` new directory,
+`r` rename, `dd` delete, `p` chmod, on either pane. The `Vfs` primitives had
+existed since phase 3 and run on every sync; only the UI was missing.
+`set_mode` is new, and is separate from `set_times` because that one is gated
+on `set_mtime` — a backend that can chmod and cannot set timestamps was
+unable to do the thing it *can* do. An existing name is refused for rename as
+well as create, since POSIX `rename(2)` replaces silently and SFTP's refuses,
+and leaving that to the backend makes the behaviour protocol-dependent.
+Delete asks first, takes the marks over the cursor, and is a **real** delete:
+the `.lazysync-backup/` path exists because a *plan* removes files nobody
+looked at individually, which is not what the row under your cursor is.
+
+**Keepalive and reconnect**, the subject of §9.13. `Vfs::has_session` decides
+whether to schedule anything, so two local panes still block on input and
+never wake. The ping is a `stat` — `remotefs` has no NOOP, and a stat proves
+the session can still *do* something — and a missing path is explicitly not a
+dead connection. A reconnect swaps the backend underneath the pane so the
+directory, cursor and marks survive. It is only ever silent where the
+credential can be had again without asking: agent auth, key auth, or a
+password in the keyring. A password typed once and deliberately not stored
+cannot be replayed, and a password box appearing from a timer is worse than a
+message.
+
+**`$EDITOR` integration**, the rest of §9.12. `e` opens the selected file;
+a remote one is fetched to a scratch directory, edited, and written back.
+The split is the interesting part: `App` cannot run the editor, because the
+editor is a terminal program and lazysync is holding the terminal — so `App`
+does the halves it can (resolve the command, fetch the file) and leaves an
+`EditRequest` behind for `tui` to run, the same division as
+`announce_work`/`act`. Everything that can fail happens *before* the terminal
+is handed over, since discovering there is nothing to edit after the screen
+has gone leaves the user looking at their shell.
+
+Three rules it inherits from the rest of the program. Nothing is uploaded
+unless the editor actually wrote, or an unchanged file would come back with
+a new mtime and the next sync would call it changed. The destination is
+re-checked immediately before the write, which is what the native executor
+does and what a delegated transfer gives up. And the scratch directory is
+removed however the edit ends, including when the upload is refused —
+`tempfile` moved from a dev-dependency to a real one for this, because
+`fs::create_dir` would leave a world-readable directory holding a file
+fetched from somebody's server.
+
+**Enter on a file** runs the connection's `default_sync` on that file, or on
+the marked ones. Off until set, because Enter is the key people press without
+having decided to. A `bisync` default is refused for a selection rather than
+widened to the whole tree.
 
 ## 11. Open questions
 
@@ -518,8 +715,18 @@ sync-browse and a reviewed push.
    filters would silently start syncing their own bookkeeping.
 6. **Single instance** — should a second zide popup reattach to the running
    instance over a socket, or just start fresh?
-7. **Deletes in mirror mode** — default to `backup_dir` (recoverable) or real
-   deletion with a `max_delete` guard?
+7. ~~**Deletes in mirror mode**~~ — decided in phase 3: **both, in that
+   order**. `backup_dir = ".lazysync-backup"` is the default, so a planned
+   deletion is recoverable; setting it to `""` gives real deletion and asks a
+   second time. The `max_delete` guards apply either way, since a backup
+   directory does not make deleting four hundred files what you meant. The
+   backup directory is excluded from planning, or the next mirror deletes the
+   backups the last one made.
+
+   A *manual* delete (`dd` in the browser) deliberately does not use it. The
+   backup exists because a plan removes files nobody looked at individually;
+   the row under your cursor is not that, and a safety net implied and not
+   provided is worse than none.
 8. **Crate name** — `lazysync` on crates.io is unverified (crates.io blocked my
    automated check); worth confirming before the first publish. The GitHub name
    `guttermonk/lazysync` is free.

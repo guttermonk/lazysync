@@ -990,3 +990,170 @@ fn the_file_operations_are_all_bound_in_the_browser() {
         );
     }
 }
+
+// ── Editing ──────────────────────────────────────────────────────────────
+
+/// A local file is edited where it lies, not copied to scratch and back —
+/// copying would turn an edit into a replace, and anything watching the
+/// file would see something that did not happen.
+#[test]
+fn e_opens_a_local_file_in_place() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["true"]
+            "#,
+        )
+        .unwrap()
+    });
+
+    h.select("README.md");
+    h.press("e");
+
+    let request = h.app.edit_request.as_ref().expect("an editor request");
+    assert_eq!(
+        request.local,
+        dir.path().join("left/README.md"),
+        "the editor should get the real path, not a copy"
+    );
+    assert!(request.origin.is_none(), "nothing to upload afterwards");
+    assert_eq!(
+        request.command,
+        vec!["true", request.local.to_str().unwrap()]
+    );
+}
+
+/// A directory is not a file, and the refusal happens before the terminal
+/// is handed over rather than after.
+#[test]
+fn e_on_a_directory_is_refused() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.select("src");
+    h.press("e");
+
+    assert!(h.app.edit_request.is_none(), "nothing should be launched");
+    assert!(h.app.status.contains("is a directory"), "{}", h.app.status);
+}
+
+/// With no editor anywhere, say which three places one can come from.
+#[test]
+fn e_without_an_editor_says_where_to_set_one() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    // The harness inherits the developer's environment, so this only
+    // asserts the message when there genuinely is no editor set.
+    if std::env::var_os("VISUAL").is_some() || std::env::var_os("EDITOR").is_some() {
+        return;
+    }
+
+    h.select("README.md");
+    h.press("e");
+
+    assert!(h.app.edit_request.is_none());
+    assert!(h.app.status.contains("$EDITOR"), "{}", h.app.status);
+}
+
+/// The size guard fires before any transfer, because the point of it is to
+/// not spend the transfer.
+#[test]
+fn a_file_over_the_editor_limit_is_refused() {
+    let dir = trees();
+    fs::write(dir.path().join("left/big.bin"), vec![0u8; 4096]).unwrap();
+
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["true"]
+            max_bytes = 1024
+            "#,
+        )
+        .unwrap()
+    });
+    h.app.focused_mut().reload();
+
+    h.select("big.bin");
+    h.press("e");
+
+    assert!(h.app.edit_request.is_none());
+    assert!(h.app.status.contains("max_bytes"), "{}", h.app.status);
+}
+
+/// An editor that wrote nothing causes no upload and no new mtime. This is
+/// the local case, where "no upload" means the pane simply reloads.
+#[test]
+fn an_editor_that_changed_nothing_says_so() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["true"]
+            "#,
+        )
+        .unwrap()
+    });
+
+    h.select("README.md");
+    h.press("e");
+    let request = h.app.edit_request.take().expect("a request");
+
+    // Stand in for the event loop: the editor ran and exited.
+    h.app.finish_edit(request);
+
+    assert_eq!(h.app.status, "unchanged", "{}", h.app.status);
+}
+
+/// And one that did write is reported as a save.
+#[test]
+fn an_editor_that_wrote_is_reported_as_a_save() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["true"]
+            "#,
+        )
+        .unwrap()
+    });
+
+    h.select("README.md");
+    h.press("e");
+    let request = h.app.edit_request.take().expect("a request");
+
+    // What the editor would have done.
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(dir.path().join("left/README.md"), b"edited").unwrap();
+
+    h.app.finish_edit(request);
+    assert!(h.app.status.starts_with("saved"), "{}", h.app.status);
+}
+
+/// `[editor] command` beats the environment, which is what it is for.
+#[test]
+fn the_configured_editor_wins_over_the_environment() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["my-editor", "--wait"]
+            "#,
+        )
+        .unwrap()
+    });
+
+    h.select("README.md");
+    h.press("e");
+
+    let request = h.app.edit_request.as_ref().expect("a request");
+    assert_eq!(request.command[0], "my-editor");
+    assert_eq!(request.command[1], "--wait");
+    assert_eq!(request.command.len(), 3, "the path is appended last");
+}

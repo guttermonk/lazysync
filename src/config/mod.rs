@@ -59,6 +59,7 @@ pub struct Config {
 
     pub sync_browse: SyncBrowse,
     pub connection: Connection,
+    pub editor: Editor,
     pub zide: Zide,
     pub compare: Compare,
     pub transfer: Transfer,
@@ -85,6 +86,7 @@ impl Default for Config {
             mouse: true,
             sync_browse: SyncBrowse::default(),
             connection: Connection::default(),
+            editor: Editor::default(),
             zide: Zide::default(),
             compare: Compare::default(),
             transfer: Transfer::default(),
@@ -278,6 +280,41 @@ pub enum OnMissing {
     Create,
     /// Ask each time.
     Ask,
+}
+
+/// `[editor]`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Editor {
+    /// What to run, overriding `$VISUAL` and `$EDITOR`.
+    ///
+    /// A list rather than a string, for the reason `[zide] hide_command` is:
+    /// splitting one into a program and its arguments takes a shell, and
+    /// lazysync has none to offer. Empty by default, which means the
+    /// environment decides -- `$VISUAL`, then `$EDITOR`, each split on
+    /// whitespace because that is the convention those variables already
+    /// follow (`code -w`, `nvim -u NONE`). An editor whose *path* contains a
+    /// space is what this list is for.
+    pub command: Vec<String>,
+
+    /// Refuse to open anything larger than this, in bytes. 0 disables.
+    ///
+    /// Editing a remote file downloads it first. Without a ceiling, `e` on a
+    /// 4 GB database dump is a long silent wait ending in an editor that
+    /// cannot open it either -- so the refusal happens before the transfer
+    /// rather than after.
+    pub max_bytes: u64,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            // Ten megabytes: far past any source file, far short of the
+            // archives and dumps that share a directory with them.
+            max_bytes: 10 * 1024 * 1024,
+        }
+    }
 }
 
 /// `[connection]`

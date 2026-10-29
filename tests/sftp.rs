@@ -1021,3 +1021,168 @@ fn a_dropped_session_is_reconnected_and_the_pane_keeps_its_place() {
         );
     });
 }
+
+// ── Editing a remote file ────────────────────────────────────────────────
+
+/// The round trip: fetch to scratch, edit, upload. Driven without a real
+/// editor by standing in for the event loop -- writing to the scratch copy
+/// is exactly what an editor does.
+#[test]
+fn editing_a_remote_file_fetches_it_and_writes_it_back() {
+    use lazysync::{
+        app::{App, Screen},
+        bookmarks::Bookmark,
+        config::Config,
+        keys::Action,
+    };
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::write(server.served.join("notes.md"), b"before\n").unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let config: Config = toml::from_str(
+            r#"
+[editor]
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let mut app = App::new(config, here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        assert_eq!(app.screen, Screen::Browser, "{}", app.status);
+
+        app.focus = 1;
+        app.panes[1].select_name("notes.md");
+        app.handle(Action::EditFile);
+
+        let request = app.edit_request.take().expect("an editor request");
+        let origin = request.origin.as_ref().expect("a remote origin");
+
+        // The scratch copy keeps the original's name, so the editor shows
+        // the right thing in its title bar and highlights by extension.
+        assert_eq!(request.local.file_name().unwrap(), "notes.md");
+        assert_eq!(
+            std::fs::read_to_string(&request.local).unwrap(),
+            "before\n",
+            "the copy should be what the server has"
+        );
+        let scratch = origin.scratch.clone();
+
+        // What the editor would do.
+        std::fs::write(&request.local, b"after\n").unwrap();
+        app.finish_edit(request);
+
+        assert_eq!(
+            std::fs::read_to_string(server.served.join("notes.md")).unwrap(),
+            "after\n",
+            "the edit should have reached the server: {}",
+            app.status
+        );
+        assert!(
+            !scratch.exists(),
+            "the scratch directory must not outlive the edit"
+        );
+    });
+}
+
+/// An editor opened and closed without saving sends nothing. Re-uploading
+/// an identical file would give it a new mtime and make the next sync think
+/// it had changed.
+#[test]
+fn closing_the_editor_without_saving_uploads_nothing() {
+    use lazysync::{app::App, bookmarks::Bookmark, config::Config, keys::Action};
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::write(server.served.join("untouched.md"), b"same\n").unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let config: Config = toml::from_str("[editor]\ncommand = [\"true\"]\n").unwrap();
+        let mut app = App::new(config, here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        app.focus = 1;
+        app.panes[1].select_name("untouched.md");
+        app.handle(Action::EditFile);
+
+        let request = app.edit_request.take().expect("a request");
+        let before = std::fs::metadata(server.served.join("untouched.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        app.finish_edit(request);
+
+        assert!(app.status.contains("unchanged"), "{}", app.status);
+        assert_eq!(
+            std::fs::metadata(server.served.join("untouched.md"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before,
+            "an unchanged file must not be re-uploaded with a new mtime"
+        );
+    });
+}
+
+/// The destination is re-checked immediately before it is written, the same
+/// discipline the native executor follows: a file somebody else wrote while
+/// you had the editor open must not be replaced by a copy made before
+/// theirs.
+#[test]
+fn a_remote_file_changed_under_the_editor_is_not_clobbered() {
+    use lazysync::{app::App, bookmarks::Bookmark, config::Config, keys::Action};
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::write(server.served.join("contended.md"), b"mine\n").unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let config: Config = toml::from_str("[editor]\ncommand = [\"true\"]\n").unwrap();
+        let mut app = App::new(config, here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        app.focus = 1;
+        app.panes[1].select_name("contended.md");
+        app.handle(Action::EditFile);
+
+        let request = app.edit_request.take().expect("a request");
+
+        // You edited your copy...
+        std::fs::write(&request.local, b"my version\n").unwrap();
+        // ...and somebody else wrote the real one while you had it open.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            server.served.join("contended.md"),
+            b"somebody else's much longer version\n",
+        )
+        .unwrap();
+
+        app.finish_edit(request);
+
+        assert_eq!(
+            std::fs::read_to_string(server.served.join("contended.md")).unwrap(),
+            "somebody else's much longer version\n",
+            "their write must survive"
+        );
+        assert!(
+            app.status.contains("changed on the server"),
+            "and it must say so: {}",
+            app.status
+        );
+    });
+}

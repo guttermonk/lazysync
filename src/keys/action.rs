@@ -200,6 +200,13 @@ pub enum Action {
     DeleteFile,
     /// Change the Unix permission bits of the selected entry.
     Chmod,
+    /// Open the selected file in `$EDITOR`, and write it back if it changed.
+    ///
+    /// Unlike [`Self::OpenExternal`], which hands a file to the desktop and
+    /// forgets it, this one owns the terminal for the duration and is a
+    /// round trip: a remote file is fetched, edited locally, and uploaded
+    /// again only if the editor actually changed it.
+    EditFile,
 
     // ── Bookmarks and forms ──────────────────────────────────────────────
     /// Open the selected bookmark.
@@ -316,6 +323,7 @@ impl Action {
             Self::Rename => "Rename the selected entry",
             Self::DeleteFile => "Delete the marked entries, or the selected one",
             Self::Chmod => "Change permissions on the selected entry",
+            Self::EditFile => "Edit the selected file in $EDITOR",
 
             Self::OpenItem => "Open the selected connection",
             Self::NewItem => "Add a new connection",
@@ -405,6 +413,7 @@ impl Action {
             Self::Rename => "rename",
             Self::DeleteFile => "delete",
             Self::Chmod => "permissions",
+            Self::EditFile => "edit",
 
             Self::OpenItem => "open",
             Self::NewItem => "new",
@@ -474,7 +483,12 @@ impl Action {
             | Self::ToggleWatch
             | Self::ShowLog => "Sync",
 
-            Self::NewFile | Self::NewDir | Self::Rename | Self::DeleteFile | Self::Chmod => "Files",
+            Self::NewFile
+            | Self::NewDir
+            | Self::Rename
+            | Self::DeleteFile
+            | Self::Chmod
+            | Self::EditFile => "Files",
 
             Self::ShowConnections
             | Self::OpenItem

@@ -8,9 +8,12 @@
 
 use std::{
     collections::HashSet,
+    fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+use chrono::{DateTime, Utc};
 
 use crate::{
     bookmarks::{secrets, Bookmark, BookmarkStore},
@@ -156,6 +159,44 @@ impl PromptKind {
     pub const fn is_secret(&self) -> bool {
         matches!(self, Self::Password { .. })
     }
+}
+
+/// An editor the event loop has been asked to run.
+///
+/// `App` cannot run it itself. The editor is a terminal program and lazysync
+/// is holding the terminal -- raw mode, alternate screen -- so somebody has
+/// to give it back first, and that somebody is `tui`, which is the only
+/// module that knows what a terminal is. So `App` does the halves it can
+/// (work out the command, fetch the file) and leaves this behind; the loop
+/// runs it and calls [`App::finish_edit`].
+///
+/// The same split as `announce_work`/`act`, for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditRequest {
+    /// Program and arguments, with the path already appended.
+    pub command: Vec<String>,
+    /// The file the editor will open. A local file is edited where it lies;
+    /// for a remote one this is a temporary copy.
+    pub local: PathBuf,
+    /// Where it came from, when that is not [`Self::local`].
+    pub origin: Option<EditOrigin>,
+    /// Size and mtime as fetched, so an editor that changed nothing causes
+    /// no upload and no new mtime on the server.
+    pub before: (u64, Option<DateTime<Utc>>),
+}
+
+/// The remote half of an [`EditRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditOrigin {
+    pub pane: usize,
+    pub path: PathBuf,
+    pub name: String,
+    /// What the remote file looked like when it was fetched, so the upload
+    /// can refuse if somebody else has written to it since.
+    pub remote_before: (u64, Option<DateTime<Utc>>),
+    /// The directory holding the temporary copy, removed when the edit ends
+    /// however it ends.
+    pub scratch: PathBuf,
 }
 
 /// A yes/no question, and what each answer does.
@@ -353,6 +394,10 @@ pub struct App {
     /// and is cleared the moment one succeeds or fails.
     connection: Option<Bookmark>,
 
+    /// An editor the event loop should run, once it has given the terminal
+    /// back. Taken by the loop, never left set across a frame.
+    pub edit_request: Option<EditRequest>,
+
     /// When the keepalive last ran, or `None` if nothing has a session.
     ///
     /// The schedule is "this long after the last ping", not a fixed wall
@@ -452,6 +497,7 @@ impl App {
             active_profile: None,
             default_sync: None,
             connection: None,
+            edit_request: None,
             keepalive_at: None,
             hits: HitMap::default(),
             progress: Box::new(progress::Silent),
@@ -1451,6 +1497,7 @@ impl App {
             Action::Rename => self.begin_rename(),
             Action::Chmod => self.begin_chmod(),
             Action::DeleteFile => self.begin_delete(),
+            Action::EditFile => self.begin_edit(),
 
             // Leaving the browser with a connection open ends that session:
             // the connection list cannot navigate back to a live browser, so
@@ -3343,6 +3390,191 @@ impl App {
         }
     }
 
+    // ── Editing ──────────────────────────────────────────────────────────
+
+    /// Prepare to open the selected file in an editor.
+    ///
+    /// Everything that can fail happens here, before the terminal is given
+    /// away: no editor configured, a directory selected, a file too large,
+    /// a download that failed. Handing the screen to a child process and
+    /// *then* discovering there is nothing to edit would leave the user
+    /// looking at their shell wondering what happened.
+    fn begin_edit(&mut self) {
+        match self.prepare_edit() {
+            Ok(request) => {
+                self.status = format!("editing {}...", request.local.display());
+                self.edit_request = Some(request);
+            }
+            Err(why) => {
+                self.status = why;
+                self.status_kind = StatusKind::Problem;
+            }
+        }
+    }
+
+    fn prepare_edit(&mut self) -> Result<EditRequest, String> {
+        let pane = self.focus;
+
+        let Some(entry) = self.panes[pane].selected().cloned() else {
+            return Err("nothing selected".into());
+        };
+        if entry.is_dir_like() {
+            return Err(format!("{} is a directory", entry.name));
+        }
+
+        let max = self.config.editor.max_bytes;
+        if max > 0 && entry.size > max {
+            return Err(format!(
+                "{} is {} and the editor limit is {} -- raise [editor] max_bytes",
+                entry.name,
+                crate::ui::format_size(entry.size),
+                crate::ui::format_size(max)
+            ));
+        }
+
+        let program = self.editor_command()?;
+        let remote = self.panes[pane].path().join(&entry.name);
+
+        // A local file is edited where it lies. Copying it to a scratch
+        // directory and back would turn an edit into a replace: inodes,
+        // hard links and anything watching the file would all see something
+        // that did not happen.
+        if !self.panes[pane].vfs.has_session() && self.panes[pane].vfs.scheme() == "local" {
+            return Ok(EditRequest {
+                command: with_path(&program, &remote),
+                local: remote,
+                origin: None,
+                before: (entry.size, entry.mtime),
+            });
+        }
+
+        let (scratch, local) = fetch_for_edit(self.panes[pane].vfs.as_mut(), &remote, &entry.name)?;
+        let before = local_stamp(&local);
+
+        Ok(EditRequest {
+            command: with_path(&program, &local),
+            local,
+            origin: Some(EditOrigin {
+                pane,
+                path: remote,
+                name: entry.name,
+                remote_before: (entry.size, entry.mtime),
+                scratch,
+            }),
+            before,
+        })
+    }
+
+    /// What to run, from `[editor] command` or the environment.
+    fn editor_command(&self) -> Result<Vec<String>, String> {
+        if !self.config.editor.command.is_empty() {
+            return Ok(self.config.editor.command.clone());
+        }
+
+        // `$VISUAL` before `$EDITOR`, which is the older convention and the
+        // right way round: `$EDITOR` may be `ed` on a machine whose
+        // `$VISUAL` is the full-screen one you actually want.
+        for name in ["VISUAL", "EDITOR"] {
+            let Some(value) = std::env::var_os(name) else {
+                continue;
+            };
+            let value = value.to_string_lossy();
+            let words: Vec<String> = value.split_whitespace().map(ToOwned::to_owned).collect();
+            if !words.is_empty() {
+                return Ok(words);
+            }
+        }
+
+        Err("no editor: set $VISUAL, $EDITOR, or [editor] command".into())
+    }
+
+    /// The editor has exited. Put the file back if it changed.
+    ///
+    /// Called by the event loop once the terminal is lazysync's again, so
+    /// anything reported here is on a screen the user can see.
+    pub fn finish_edit(&mut self, request: EditRequest) {
+        let outcome = self.apply_edit(&request);
+
+        // The scratch directory goes whatever happened, including when the
+        // upload was refused -- the copy is lazysync's, and leaving a
+        // server's file in a temp directory because an error path returned
+        // early is exactly the thing `OpenExternal` refuses to do.
+        if let Some(origin) = &request.origin {
+            if let Err(e) = fs::remove_dir_all(&origin.scratch) {
+                tracing::warn!("could not remove {}: {e}", origin.scratch.display());
+            }
+        }
+
+        match outcome {
+            Ok(message) => {
+                self.status = message;
+                self.status_kind = StatusKind::Answer;
+            }
+            Err(why) => {
+                self.status = why;
+                self.status_kind = StatusKind::Problem;
+            }
+        }
+    }
+
+    fn apply_edit(&mut self, request: &EditRequest) -> Result<String, String> {
+        let after = local_stamp(&request.local);
+
+        let Some(origin) = &request.origin else {
+            // A local file was edited in place; there is nothing to send.
+            // The pane still reloads, because the size and mtime on screen
+            // are now stale.
+            let pane = self.focus;
+            self.panes[pane].reload();
+            return Ok(if after == request.before {
+                "unchanged".into()
+            } else {
+                format!("saved {}", request.local.display())
+            });
+        };
+
+        if after == request.before {
+            // Nothing was written, so nothing is uploaded. Re-sending an
+            // identical file would give it a new mtime on the server and
+            // make the next sync think it had changed.
+            return Ok(format!("{} unchanged", origin.name));
+        }
+
+        // The destination is re-checked immediately before it is written,
+        // which is the same discipline the native executor follows: a file
+        // somebody else wrote while you had the editor open must not be
+        // silently replaced by a copy made before theirs.
+        let current = self.panes[origin.pane]
+            .vfs
+            .stat(&origin.path)
+            .map_err(|e| format!("could not re-check {}: {e}", origin.name))?;
+
+        if (current.size, current.mtime) != origin.remote_before {
+            return Err(format!(
+                "{} changed on the server while you were editing; your copy is not uploaded",
+                origin.name
+            ));
+        }
+
+        let mut file = fs::File::open(&request.local)
+            .map_err(|e| format!("could not read the edited copy: {e}"))?;
+        let metadata = WriteMetadata {
+            size: after.0,
+            mtime: None,
+            mode: current.mode,
+        };
+
+        self.panes[origin.pane]
+            .vfs
+            .write_from(&origin.path, &metadata, &mut file)
+            .map_err(|e| format!("could not upload {}: {e}", origin.name))?;
+
+        self.panes[origin.pane].reload();
+        self.panes[origin.pane].select_name(&origin.name);
+
+        Ok(format!("uploaded {}", origin.name))
+    }
+
     /// Hand the selected file to whatever the desktop opens it with.
     ///
     /// **Local files only.** Opening a remote one means downloading it to a
@@ -3679,6 +3911,64 @@ fn nothing_to_do(
         return what;
     }
     format!("{what} -- compared by {} only", method.describe())
+}
+
+/// The editor command with the file appended.
+fn with_path(program: &[String], path: &Path) -> Vec<String> {
+    let mut command = program.to_vec();
+    command.push(path.display().to_string());
+    command
+}
+
+/// Size and mtime of a local file, for telling "the editor wrote" from
+/// "the editor was opened and closed".
+///
+/// Both, because either alone is defeatable: an edit that keeps the length
+/// is common in a config file, and an editor that writes the same bytes back
+/// still moves the mtime. `None` for a file that is not there -- an editor
+/// that deleted it has changed something.
+fn local_stamp(path: &Path) -> (u64, Option<DateTime<Utc>>) {
+    match fs::metadata(path) {
+        Ok(meta) => (meta.len(), meta.modified().ok().map(DateTime::from)),
+        Err(_) => (0, None),
+    }
+}
+
+/// Download `remote` into a fresh scratch directory for editing.
+///
+/// Returns the directory and the file inside it. The directory is the unit
+/// of cleanup: one `remove_dir_all` takes the copy with it, and a name
+/// collision with another lazysync is impossible because `TempDir` makes a
+/// unique one.
+///
+/// The copy keeps the original's *name*, because the editor will show it in
+/// its title bar and syntax-highlight by its extension -- `tmpfile.XXXX`
+/// would lose both.
+fn fetch_for_edit(
+    vfs: &mut dyn Vfs,
+    remote: &Path,
+    name: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let scratch = tempfile::Builder::new()
+        .prefix("lazysync-edit-")
+        .tempdir()
+        .map_err(|e| format!("could not make a scratch directory: {e}"))?
+        // Kept rather than dropped: the editor runs long after this returns,
+        // so the directory outlives the guard and `finish_edit` removes it.
+        .keep();
+
+    let local = scratch.join(name);
+    let mut file = fs::File::create(&local).map_err(|e| {
+        let _ = fs::remove_dir_all(&scratch);
+        format!("could not create the scratch copy: {e}")
+    })?;
+
+    if let Err(e) = vfs.read_into(remote, &mut file) {
+        let _ = fs::remove_dir_all(&scratch);
+        return Err(format!("could not fetch {name}: {e}"));
+    }
+
+    Ok((scratch, local))
 }
 
 /// The credential a silent reconnect would use, or why there isn't one.

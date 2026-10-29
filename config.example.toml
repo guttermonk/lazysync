@@ -77,6 +77,29 @@ keepalive_secs = 60
 # The pane keeps its directory, cursor and marks across a reconnect.
 auto_reconnect = true
 
+# ─── Editor ──────────────────────────────────────────────────────────────────
+
+[editor]
+# What `e` runs, overriding $VISUAL and $EDITOR.
+#
+# A list rather than a string, like `hide_command`: splitting one into a
+# program and its arguments takes a shell, and lazysync has none to offer.
+#
+# Empty means the environment decides -- $VISUAL first, then $EDITOR, each
+# split on whitespace, since that is the convention those variables already
+# follow (`code -w`, `nvim -u NONE`). Set this when your editor's *path*
+# contains a space, or to use a different one here than everywhere else.
+#
+#   command = ["nvim"]
+command = []
+
+# Refuse to open anything larger than this, in bytes. 0 disables.
+#
+# Editing a remote file downloads it first, so without a ceiling `e` on a
+# 4 GB dump is a long silent wait ending in an editor that cannot open it
+# either. The refusal happens before the transfer rather than after.
+max_bytes = 10485760   # 10 MiB
+
 # ─── Synchronized browsing ───────────────────────────────────────────────────
 
 [sync_browse]

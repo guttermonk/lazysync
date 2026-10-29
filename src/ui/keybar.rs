@@ -141,6 +141,7 @@ fn items(app: &App) -> Vec<(Action, &'static str)> {
     // `ss profile` fell off a 200-column bar. A sync tool may not push its
     // sync keys off the footer to advertise `mkdir`.
     let files: Vec<(Action, &'static str)> = [
+        (Action::EditFile, "edit"),
         (Action::Rename, "rename"),
         (Action::NewFile, "new file"),
         (Action::NewDir, "new dir"),

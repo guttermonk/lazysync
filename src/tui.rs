@@ -42,7 +42,7 @@ pub fn run(app: &mut App) -> Result<()> {
     app.progress = Box::new(ScanSpinner::new(app.palette, &app.keymaps));
 
     let mouse = app.config.mouse && enable_mouse();
-    let result = main_loop(&mut terminal, app);
+    let result = main_loop(&mut terminal, app, mouse);
     if mouse {
         disable_mouse();
     }
@@ -336,7 +336,7 @@ fn next_deadline(
     }
 }
 
-fn main_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+fn main_loop(terminal: &mut DefaultTerminal, app: &mut App, mouse: bool) -> Result<()> {
     let mut dispatcher = Dispatcher::new(app.config.chord_timeout());
     let mut clicks = Clicks::default();
 
@@ -403,6 +403,67 @@ fn main_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         // fired: it is cheap, it checks the clock itself, and a wake-up for
         // any other reason is as good a moment as a wake-up for this one.
         app.tick_keepalive();
+
+        // An editor is the one thing that needs the terminal more than
+        // lazysync does.
+        if let Some(request) = app.edit_request.take() {
+            run_editor(terminal, app, request, mouse)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Give the terminal to an editor, wait for it, and take it back.
+///
+/// Everything lazysync did to the terminal has to be undone and redone in
+/// the right order, because the child inherits whatever is left: raw mode
+/// off and the alternate screen left, or vim draws into lazysync's screen
+/// buffer and the shell gets it back full of panes. Mouse reporting too --
+/// an editor that did not ask for it would otherwise receive click escape
+/// sequences as typed text.
+///
+/// The child inherits stdio deliberately, which is the whole difference
+/// between this and `App::open_external`: that one is a GUI handler launched
+/// detached, this one *is* the foreground program until it exits.
+fn run_editor(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    request: crate::app::EditRequest,
+    mouse: bool,
+) -> Result<()> {
+    use std::process::Command;
+
+    let Some((program, args)) = request.command.split_first() else {
+        return Ok(());
+    };
+
+    if mouse {
+        disable_mouse();
+    }
+    ratatui::restore();
+
+    let status = Command::new(program).args(args).status();
+
+    // Back in, before anything is reported: a message about the edit has to
+    // land on a screen that exists. `init` gives a fresh terminal rather
+    // than reusing the old handle, whose idea of the screen is now wrong.
+    *terminal = ratatui::init();
+    if mouse {
+        enable_mouse();
+    }
+    terminal.clear()?;
+
+    match status {
+        // The exit code is deliberately ignored. Editors are not consistent
+        // about it -- `:cq` is a real way to leave vim -- and what decides
+        // whether to upload is whether the *file* changed, which is a
+        // better question than whether the editor was happy.
+        Ok(_) => app.finish_edit(request),
+        Err(e) => {
+            app.status = format!("{program}: {e}");
+            app.status_kind = crate::app::StatusKind::Problem;
+        }
     }
 
     Ok(())

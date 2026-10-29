@@ -126,7 +126,7 @@ generated from, so the footers follow your config rather than this page.
 | Browser | `h` `j` `k` `l` navigate · `tab` other pane · `/` search · `space` mark · `o` sort · `c` connections · `?` help · `q` quit |
 | Toggles | `S` synchronized browsing · `u` union view · `.` hidden files |
 | Sync | `sp` push · `sl` pull · `sm` mirror · `sb` bisync · `ss` profile · `sw` watch · `sL` audit log |
-| Files | `a` new file · `A` new directory · `r` rename · `dd` delete · `p` permissions |
+| Files | `e` edit · `a` new file · `A` new directory · `r` rename · `dd` delete · `p` permissions |
 | On a file | `enter` default sync · `shift+enter` or `gx` open externally |
 
 The connection list always ends with a built-in **Local transfer** entry,
@@ -378,8 +378,8 @@ Only the leader pane propagates, and the wheel never leads.
 
 ### File operations
 
-`a` creates an empty file, `A` a directory, `r` renames, `dd` deletes, `p`
-changes permissions. They act on the **focused pane**, local or remote alike —
+`e` opens a file in your editor, `a` creates an empty file, `A` a directory,
+`r` renames, `dd` deletes, `p` changes permissions. They act on the **focused pane**, local or remote alike —
 the same `Vfs` the sync engine uses.
 
 Four rules worth knowing:
@@ -401,6 +401,36 @@ Four rules worth knowing:
 mode, so the usual edit is one character. It is offered only where the backend
 has permission bits — not on FTP or an rclone remote, which say so rather than
 failing at the server.
+
+### Editing a file
+
+`e` opens the selected file in your editor — `$VISUAL`, then `$EDITOR`, or
+`[editor] command` to override. A **remote** file is fetched first, edited
+locally, and written back.
+
+```toml
+[editor]
+command = []            # empty = $VISUAL, then $EDITOR
+max_bytes = 10485760    # refuse anything larger; 0 disables
+```
+
+- **A local file is edited in place.** Copying it to scratch and back would
+  turn an edit into a replace, and inodes, hard links and anything watching
+  the file would all see something that did not happen.
+- **Nothing is uploaded unless the editor actually wrote.** Re-sending an
+  identical file would give it a new mtime on the server and make the next
+  sync think it had changed. Opening and quitting costs one download.
+- **The server is re-checked immediately before the upload.** If somebody
+  else wrote the file while you had it open, yours is not sent and it says
+  so — the same discipline the native executor applies to every transfer.
+- **The scratch copy is removed however the edit ends**, including when the
+  upload is refused. It lives in a `0700` directory for the duration.
+- The size limit is checked **before** the download, since the point of it is
+  not spending the transfer.
+
+Unlike `shift+enter`, which hands a file to the desktop and forgets it, this
+one owns the terminal until the editor exits — so a terminal editor is the
+normal case rather than the broken one.
 
 ### Connections
 
