@@ -38,7 +38,7 @@ use crate::{
         watch,
     },
     ui::{confirm, form::ConnectionForm, hint, HitMap, Target},
-    vfs::{ftp, hostkey::HostKey, rclone, ssh, LocalFs, Vfs, WriteMetadata},
+    vfs::{ftp, hostkey::HostKey, rclone, ssh, Entry, LocalFs, Vfs, WriteMetadata},
 };
 
 /// What is on top of the browser, if anything.
@@ -197,7 +197,13 @@ pub enum EditPlan {
     /// Run this, then write the result back.
     Edit(EditRequest),
     /// Hand it to the system handler and forget it.
-    Desktop { path: PathBuf, name: String },
+    Desktop {
+        path: PathBuf,
+        name: String,
+        /// Whether `path` is a throwaway copy rather than the real file,
+        /// which changes both what is said and whether it is writable.
+        fetched: bool,
+    },
 }
 
 /// The remote half of an [`EditRequest`].
@@ -413,6 +419,18 @@ pub struct App {
     /// back. Taken by the loop, never left set across a frame.
     pub edit_request: Option<EditRequest>,
 
+    /// Scratch directories holding remote files handed to a desktop
+    /// handler, kept until lazysync exits.
+    ///
+    /// Not the same lifetime as an edit's scratch copy, and deliberately:
+    /// an editor is waited for, so `finish_edit` knows the moment it is
+    /// finished with the file and removes the directory then. A desktop
+    /// handler is not waited for -- `xdg-open` returns having handed off --
+    /// so nothing here ever learns that the viewer has closed. Exit is the
+    /// latest moment that is still lazysync's to act on, and `Drop` is what
+    /// makes it happen on a panic as well as a quit.
+    retained_scratch: Vec<PathBuf>,
+
     /// When the keepalive last ran, or `None` if nothing has a session.
     ///
     /// The schedule is "this long after the last ping", not a fixed wall
@@ -513,6 +531,7 @@ impl App {
             default_sync: None,
             connection: None,
             edit_request: None,
+            retained_scratch: Vec::new(),
             keepalive_at: None,
             hits: HitMap::default(),
             progress: Box::new(progress::Silent),
@@ -3424,9 +3443,13 @@ impl App {
             // `OpenExternal` would have sent it -- detached, no terminal, no
             // round trip, because a file the editor will not be opening is
             // not one lazysync is going to write back either.
-            Ok(EditPlan::Desktop { path, name }) => match launch_opener(&path) {
+            Ok(EditPlan::Desktop {
+                path,
+                name,
+                fetched,
+            }) => match launch_opener(&path) {
                 Ok(program) => {
-                    self.status = format!("{name} is not text; opened with {program}");
+                    self.status = opened_message(&name, program, fetched);
                     self.status_kind = StatusKind::Answer;
                 }
                 Err(why) => {
@@ -3484,6 +3507,7 @@ impl App {
                 return Ok(EditPlan::Desktop {
                     path: remote,
                     name: entry.name,
+                    fetched: false,
                 });
             }
 
@@ -3503,23 +3527,18 @@ impl App {
         // -- the common case -- to save a download on a binary one, which
         // `max_bytes` has already capped. The copy is thrown away either way.
         if text_only && !looks_like_text(&local) {
-            let _ = fs::remove_dir_all(&scratch);
-
-            // No desktop handler for this one. Handing it `xdg-open` means
-            // leaving the scratch copy behind for a viewer that outlives
-            // this call, and a file manager that quietly keeps a server's
-            // files in a temp directory is one you cannot audit. So it says
-            // what it cannot do, and names the key that works on a local
-            // copy once you have pulled one.
-            let pull = self
-                .keys_for(&[Action::OpenExternal])
-                .map(|keys| format!("; pull it and use {keys}"))
-                .unwrap_or_default();
-
-            return Err(format!(
-                "{} is not text, and a remote file has no desktop handler{pull}",
-                entry.name
-            ));
+            // The copy we just fetched is handed over rather than thrown
+            // away and fetched again: it is already here, and this is the
+            // same scratch directory the viewer would need either way. It
+            // moves from the edit path's prompt cleanup to the retained
+            // list, because nothing will tell us when the viewer is done.
+            seal_copy(&local);
+            self.retained_scratch.push(scratch);
+            return Ok(EditPlan::Desktop {
+                path: local,
+                name: entry.name,
+                fetched: true,
+            });
         }
 
         let before = local_stamp(&local);
@@ -3668,28 +3687,30 @@ impl App {
     /// is between it and the user; by the time it exits, lazysync is no
     /// longer the thing they are looking at.
     fn open_external(&mut self) {
-        let pane = self.focused();
+        let pane = self.focus;
 
-        if pane.vfs.scheme() != "local" {
-            self.status = format!(
-                "{} is on a {} connection; only local files can be opened",
-                pane.selected().map_or("this file", |e| e.name.as_str()),
-                pane.vfs.scheme()
-            );
+        let Some(entry) = self.panes[pane].selected().cloned() else {
+            self.status = "nothing selected".into();
+            return;
+        };
+        if entry.is_dir_like() {
+            self.status = format!("{} is a directory", entry.name);
             self.status_kind = StatusKind::Problem;
             return;
         }
 
-        let Some(entry) = pane.selected() else {
-            self.status = "nothing selected".into();
-            return;
+        let (path, fetched) = match self.local_copy_for(pane, &entry) {
+            Ok(result) => result,
+            Err(why) => {
+                self.status = why;
+                self.status_kind = StatusKind::Problem;
+                return;
+            }
         };
-        let path = pane.path().join(&entry.name);
-        let name = entry.name.clone();
 
         match launch_opener(&path) {
             Ok(program) => {
-                self.status = format!("opened {name} with {program}");
+                self.status = opened_message(&entry.name, program, fetched);
                 self.status_kind = StatusKind::Answer;
             }
             Err(why) => {
@@ -3697,6 +3718,52 @@ impl App {
                 self.status_kind = StatusKind::Problem;
             }
         }
+    }
+
+    /// A path on this machine for `entry`, fetching it if it is not here.
+    ///
+    /// A local file is handed over where it lies; nothing is copied, so the
+    /// handler sees the real file and an editor among the handlers edits
+    /// the real thing.
+    ///
+    /// **A remote one is fetched into a scratch directory that lazysync
+    /// keeps until it exits**, which is the whole difficulty. `xdg-open`
+    /// returns as soon as it has handed off, while the viewer it started
+    /// goes on reading -- so deleting the copy when this returns would pull
+    /// the file out from under the program that was just opened. The
+    /// directory is therefore retained in [`Self::retained_scratch`] and
+    /// removed by `Drop`, which is the latest moment that is still
+    /// lazysync's responsibility.
+    ///
+    /// That is a real cost and is the reason this was refused before: a
+    /// file fetched at 10:00 sits in `/tmp` until the program is closed. It
+    /// is bounded -- one directory per open, `0700`, gone on exit -- and
+    /// bounded is the difference between a temp file and a leak.
+    fn local_copy_for(&mut self, pane: usize, entry: &Entry) -> Result<(PathBuf, bool), String> {
+        let remote = self.panes[pane].path().join(&entry.name);
+
+        if !self.panes[pane].vfs.has_session() && self.panes[pane].vfs.scheme() == "local" {
+            return Ok((remote, false));
+        }
+
+        // The same ceiling the editor uses, and for the same reason: this
+        // downloads before anything can happen, and a 4 GB film fetched to
+        // a temp directory with no progress bar is not an accident worth
+        // allowing. Named in the message, because raising it is the fix.
+        let max = self.config.editor.max_bytes;
+        if max > 0 && entry.size > max {
+            return Err(format!(
+                "{} is {} and the fetch limit is {} -- raise [editor] max_bytes",
+                entry.name,
+                crate::ui::format_size(entry.size),
+                crate::ui::format_size(max)
+            ));
+        }
+
+        let (scratch, local) = fetch_for_edit(self.panes[pane].vfs.as_mut(), &remote, &entry.name)?;
+        seal_copy(&local);
+        self.retained_scratch.push(scratch);
+        Ok((local, true))
     }
 
     /// What Enter on a file syncs with.
@@ -4004,6 +4071,76 @@ fn local_stamp(path: &Path) -> (u64, Option<DateTime<Utc>>) {
     match fs::metadata(path) {
         Ok(meta) => (meta.len(), meta.modified().ok().map(DateTime::from)),
         Err(_) => (0, None),
+    }
+}
+
+impl Drop for App {
+    /// Remove the scratch copies handed to desktop handlers.
+    ///
+    /// `Drop` rather than a `cleanup()` the event loop calls, because this
+    /// has to happen on the way out of a panic too -- and because a cleanup
+    /// method is a thing a future caller can forget while the files it
+    /// forgets are somebody's server's.
+    ///
+    /// Best effort, and silent apart from the log: lazysync is exiting, the
+    /// screen may already be gone, and a message nobody can read is not
+    /// worth failing an exit over.
+    fn drop(&mut self) {
+        for dir in &self.retained_scratch {
+            if let Err(e) = fs::remove_dir_all(dir) {
+                tracing::warn!("could not remove {}: {e}", dir.display());
+            }
+        }
+    }
+}
+
+/// Make a fetched copy read-only before handing it to the desktop.
+///
+/// **This is the fix for a hazard the fetch itself created.** A desktop
+/// handler is not waited for, so a remote file given to one is a copy
+/// lazysync deletes on exit -- and several of the handlers people have
+/// configured for text are *editors*: Zed on `text/plain`, marktext on
+/// `text/markdown`. Opening a remote note in one, typing, saving, and
+/// losing the lot when lazysync quits is a worse outcome than the refusal
+/// this replaced.
+///
+/// A read-only copy puts the warning where it will actually be read: in the
+/// program that was about to eat the work, at the moment it tries. A status
+/// line in a TUI behind a GUI window is not where anybody is looking.
+///
+/// It is a strong signal rather than a guarantee -- an editor that offers
+/// to force the write can still do it, though by then it has said the file
+/// is read-only and been told to go ahead. Paired with the status line
+/// below, which is lazysync saying it too.
+///
+/// Deleting the copy later is unaffected: unlinking needs write permission
+/// on the *directory*, which is still ours.
+///
+/// Failure is logged and not reported. The file opens either way, and an
+/// error about permissions on a temporary file is noise next to the thing
+/// the user asked for.
+fn seal_copy(path: &Path) {
+    let sealed = fs::metadata(path).and_then(|meta| {
+        let mut perms = meta.permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(path, perms)
+    });
+
+    if let Err(e) = sealed {
+        tracing::warn!("could not make {} read-only: {e}", path.display());
+    }
+}
+
+/// What to say after handing a file to the desktop.
+///
+/// The fetched case has to say that nothing comes back. "Opened" is true of
+/// both and sufficient for a local file, where the handler has the real
+/// thing and a save is a save.
+fn opened_message(name: &str, program: &'static str, fetched: bool) -> String {
+    if fetched {
+        format!("opened a read-only copy of {name} with {program} -- edits there do not come back")
+    } else {
+        format!("opened {name} with {program}")
     }
 }
 

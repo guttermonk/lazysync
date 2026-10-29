@@ -112,9 +112,15 @@ max_bytes = 10485760   # 10 MiB
 # mangled. Set it false if your editor is one you *want* binaries in -- a hex
 # editor would otherwise be unreachable from the key meant to run it.
 #
-# Local files only. A remote one has no desktop handler to be sent to without
-# leaving a copy in a temp directory for a viewer that outlives lazysync's
-# cleanup, so a remote binary says so instead.
+# A remote file is fetched to a 0700 scratch directory first and handed over
+# from there; the copy is kept until lazysync exits, because xdg-open returns
+# while the viewer goes on reading. max_bytes above caps that fetch.
+#
+# The copy is read-only. A handler is never waited for, so nothing done in it
+# comes back -- and a registered editor (Zed on text/plain, say) would lose
+# your work when lazysync quits. Refusing the write puts the warning in the
+# program you are looking at. Use the edit key for a remote file you mean to
+# change: that one waits and uploads what you saved.
 text_only = true
 
 # ─── Synchronized browsing ───────────────────────────────────────────────────

@@ -1186,3 +1186,271 @@ fn a_remote_file_changed_under_the_editor_is_not_clobbered() {
         );
     });
 }
+
+/// A remote file handed to the desktop is fetched first, and the copy
+/// survives the call -- `xdg-open` returns while the viewer goes on reading.
+///
+/// Driven through `plan_edit`, which decides without acting: the acting
+/// branch ends in `xdg-open`, and a test that ran it would launch whatever
+/// the developer's desktop opens a PNG with.
+#[test]
+fn a_remote_binary_is_fetched_for_the_desktop_handler() {
+    use lazysync::{
+        app::{App, EditPlan},
+        bookmarks::Bookmark,
+        config::Config,
+    };
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    // A PNG signature: NUL at index 3, so it reads as binary.
+    std::fs::write(
+        server.served.join("shot.png"),
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR-and-some-pixels",
+    )
+    .unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let config: Config = toml::from_str("[editor]\ncommand = [\"true\"]\n").unwrap();
+        let mut app = App::new(config, here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        app.focus = 1;
+        app.panes[1].select_name("shot.png");
+
+        let fetched = match app.plan_edit() {
+            Ok(EditPlan::Desktop {
+                path,
+                name,
+                fetched,
+            }) => {
+                assert_eq!(name, "shot.png");
+                assert!(fetched, "a remote file is a copy, and must say so");
+                path
+            }
+            other => panic!("a PNG should go to the desktop: {other:?}"),
+        };
+
+        // Fetched, and still there: the viewer has not been started yet in
+        // this test, but in the real path it would be reading this file
+        // after `xdg-open` had already returned.
+        assert!(fetched.exists(), "the copy must outlive the call");
+        assert_eq!(
+            std::fs::read(&fetched).unwrap(),
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR-and-some-pixels",
+        );
+
+        let scratch = fetched.parent().unwrap().to_path_buf();
+
+        // ...and is cleaned up when lazysync goes away, which is the latest
+        // moment that is still its responsibility.
+        drop(app);
+        assert!(
+            !scratch.exists(),
+            "the scratch directory should not outlive lazysync"
+        );
+    });
+}
+
+/// The same for `OpenExternal` itself, which used to refuse a remote file
+/// outright. Only the fetch is asserted; the handler is not launched.
+#[test]
+fn open_external_now_fetches_a_remote_file_instead_of_refusing() {
+    use lazysync::{app::App, bookmarks::Bookmark, config::Config, keys::Action};
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::write(
+        server.served.join("photo.jpg"),
+        b"\xff\xd8\xff\xe0\x00\x10JFIF",
+    )
+    .unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let mut app = App::new(Config::default(), here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        app.focus = 1;
+        app.panes[1].select_name("photo.jpg");
+
+        app.handle(Action::OpenExternal);
+
+        assert!(
+            !app.status.contains("only local files"),
+            "a remote file is no longer refused: {}",
+            app.status
+        );
+    });
+}
+
+/// The fetch ceiling applies to viewing as well as editing, because both
+/// download before anything can happen.
+#[test]
+fn a_remote_file_over_the_limit_is_not_fetched_for_the_desktop() {
+    use lazysync::{app::App, bookmarks::Bookmark, config::Config, keys::Action};
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::write(server.served.join("big.bin"), vec![0u8; 8192]).unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let config: Config = toml::from_str("[editor]\nmax_bytes = 1024\n").unwrap();
+        let mut app = App::new(config, here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        app.focus = 1;
+        app.panes[1].select_name("big.bin");
+
+        app.handle(Action::OpenExternal);
+
+        assert!(app.status.contains("max_bytes"), "{}", app.status);
+    });
+}
+
+/// The hazard that fetching created, and the fix for it.
+///
+/// Several desktop handlers for text are editors -- Zed on `text/plain`,
+/// marktext on `text/markdown` -- so a remote file handed to one is a copy
+/// somebody may type into and save. lazysync deletes it on exit, so the
+/// work would go with it. The copy is read-only, which puts the warning in
+/// the program that was about to eat it rather than on a status line behind
+/// a GUI window.
+#[test]
+fn a_copy_handed_to_the_desktop_is_read_only() {
+    use lazysync::{
+        app::{App, EditPlan},
+        bookmarks::Bookmark,
+        config::Config,
+    };
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::write(
+        server.served.join("art.png"),
+        b"\x89PNG\r\n\x1a\n\x00pixels",
+    )
+    .unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let config: Config = toml::from_str("[editor]\ncommand = [\"true\"]\n").unwrap();
+        let mut app = App::new(config, here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        app.focus = 1;
+        app.panes[1].select_name("art.png");
+
+        let path = match app.plan_edit() {
+            Ok(EditPlan::Desktop { path, .. }) => path,
+            other => panic!("expected a desktop handover: {other:?}"),
+        };
+
+        assert!(
+            std::fs::metadata(&path).unwrap().permissions().readonly(),
+            "a throwaway copy must refuse the save that would be lost"
+        );
+        assert!(
+            std::fs::write(&path, b"typed into the viewer").is_err(),
+            "and refusing must be real, not advisory"
+        );
+
+        // Read-only does not block cleanup: unlinking needs write on the
+        // directory, which is still lazysync's.
+        let scratch = path.parent().unwrap().to_path_buf();
+        drop(app);
+        assert!(!scratch.exists(), "the sealed copy is still removable");
+    });
+}
+
+/// And the editing copy is **not** sealed, or the feature it exists for
+/// would not work. The two copies have opposite requirements, so this is
+/// the regression guard for confusing them.
+#[test]
+fn the_copy_being_edited_stays_writable() {
+    use lazysync::{
+        app::{App, EditPlan},
+        bookmarks::Bookmark,
+        config::Config,
+    };
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::write(server.served.join("notes.md"), b"before\n").unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let config: Config = toml::from_str("[editor]\ncommand = [\"true\"]\n").unwrap();
+        let mut app = App::new(config, here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        app.focus = 1;
+        app.panes[1].select_name("notes.md");
+
+        let request = match app.plan_edit() {
+            Ok(EditPlan::Edit(request)) => request,
+            other => panic!("text belongs in the editor: {other:?}"),
+        };
+
+        assert!(
+            !std::fs::metadata(&request.local)
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "the editor has to be able to write this one"
+        );
+        std::fs::write(&request.local, b"after\n").expect("an editor would write here");
+    });
+}
+
+/// lazysync says it too, in case the handler is a viewer that never tries
+/// to write and so never produces the permission error.
+#[test]
+fn handing_over_a_copy_says_that_edits_do_not_come_back() {
+    use lazysync::{app::App, bookmarks::Bookmark, config::Config, keys::Action};
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::write(server.served.join("report.pdf"), b"%PDF-1.4\x00\x00").unwrap();
+
+    with_home(&server.home, || {
+        let here = server.work.clone();
+        let mut app = App::new(Config::default(), here.clone(), here).expect("build an app");
+
+        let bookmark = Bookmark::from_target("fixture", &server.target());
+        app.finish_open(&bookmark, None);
+        app.focus = 1;
+        app.panes[1].select_name("report.pdf");
+
+        app.handle(Action::OpenExternal);
+
+        // The handler may or may not exist on this machine, so the launch
+        // is allowed to fail -- but if it worked, it has to have said so.
+        if app.status.starts_with("opened") {
+            assert!(
+                app.status.contains("do not come back"),
+                "a throwaway copy must be named as one: {}",
+                app.status
+            );
+        }
+    });
+}

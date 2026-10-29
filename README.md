@@ -208,10 +208,26 @@ plain Enter; only those speaking the kitty keyboard protocol distinguish them.
 A key that opens a file on some terminals and *syncs* one on the rest is worse
 than no key, so both are bound.
 
-Local files only — opening a remote one means leaving a copy in `/tmp` that
-nothing owns, so it says so instead. The handler is launched detached with no
-terminal, so this is for GUI applications; a terminal-based handler fails
-visibly rather than drawing over the UI.
+A **remote** file is fetched to a `0700` scratch directory first and handed
+over from there. The copy cannot be deleted when the call returns —
+`xdg-open` hands off and exits while the viewer goes on reading — so it is
+kept until lazysync quits. One directory per open, gone on exit.
+`[editor] max_bytes` caps what will be fetched, since the download happens
+before anything appears.
+
+**That copy is read-only, and the distinction matters.** A desktop handler
+is never waited for, so nothing you do in it comes back — and plenty of
+people have an *editor* registered for text (`text/plain` → Zed,
+`text/markdown` → marktext). Typing into one and saving would lose the work
+when lazysync exits. The copy refuses the write instead, which puts the
+warning in the program you are actually looking at.
+
+If you want to change a remote file, that is `e` — it waits for the editor
+and uploads what you saved. `gx` is for looking.
+
+The handler is launched detached with no terminal, so this is for GUI
+applications; a terminal-based handler fails visibly rather than drawing
+over the UI.
 
 ### The confirmation window
 
@@ -423,9 +439,14 @@ wrong about a `.log` full of protobuf and about a shell script with no
 extension at all. Set `text_only = false` if your editor is one you *want*
 binaries in.
 
-That routing is local-only. A **remote** binary says so and stops, because
-sending it to the desktop means leaving the fetched copy behind for a viewer
-that outlives lazysync's cleanup. Pull it first, then `gx`.
+**A remote file is fetched first**, into a `0700` scratch directory lazysync
+removes when it exits — `xdg-open` returns as soon as it has handed off while
+the viewer goes on reading, so the copy cannot be deleted when the call
+returns. One directory per open, gone on quit.
+
+The copy is **read-only**: a handler is never waited for, so nothing done in
+it comes back, and a registered editor would otherwise lose your work
+silently. To change a remote file, use `e` — see above.
 
 - **A local file is edited in place.** Copying it to scratch and back would
   turn an edit into a replace, and inodes, hard links and anything watching
