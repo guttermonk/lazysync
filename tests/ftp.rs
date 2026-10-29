@@ -753,3 +753,40 @@ fn closing_a_live_connection_asks_first() {
         "the connection must actually be closed, since that is what was asked"
     );
 }
+
+/// Opening a remote file in a desktop application would mean downloading it
+/// to a temporary path first, and then owning questions this feature does
+/// not answer: where the copy lives, who deletes it, whether editing it
+/// means anything. It refuses and says so.
+///
+/// Here rather than in `tests/browser.rs` because the refusal needs a pane
+/// that genuinely is not the local filesystem -- and because the *local*
+/// path ends in `xdg-open`, which no test should run.
+#[test]
+fn a_remote_file_is_not_handed_to_the_desktop() {
+    use lazysync::{
+        app::{App, Screen},
+        browser::Pane,
+        config::Config,
+        keys::Action,
+    };
+
+    let server = server!();
+    let config = Config::default();
+
+    let here = server.work.clone();
+    let mut app = App::new(config.clone(), here.clone(), here).expect("build an app");
+    app.panes[1] = Pane::new(Box::new(server.open()), server.remote(""), &config);
+    app.screen = Screen::Browser;
+    app.focus = 1;
+
+    assert_eq!(app.panes[1].vfs.scheme(), "ftp", "the fixture is connected");
+
+    app.handle(Action::OpenExternal);
+
+    assert!(
+        app.status.contains("only local files"),
+        "it should say why rather than doing nothing: {:?}",
+        app.status
+    );
+}

@@ -47,6 +47,15 @@ fn ctrl(ch: char) -> KeyCombo {
     KeyCombo::single(ModifiedKey::ctrl(ch))
 }
 
+/// Shift plus a named key: `shift(Key::Enter)`.
+///
+/// Only for the named keys. Shift plus a *character* is spelled as the
+/// uppercase character -- see [`ModifiedKey::from_event`], which drops a
+/// Shift the letter already carries.
+fn shift(key: Key) -> KeyCombo {
+    KeyCombo::single(ModifiedKey::new(key, super::combo::Mods::shift()))
+}
+
 /// A chord of unmodified characters: `chord("gg")`.
 fn chord(keys: &str) -> KeyCombo {
     KeyCombo::chord(keys.chars().map(|ch| ModifiedKey::plain(Key::Char(ch))))
@@ -89,6 +98,15 @@ fn browser() -> Keymap {
         (Action::GoHome, chord("g~")),
         (Action::GoRoot, chord("g/")),
         (Action::Refresh, ctrl('r')),
+        // Open in the system's handler. `shift+enter` is the asked-for key
+        // and leads, but it cannot be the only one: most terminals send
+        // Shift+Enter as a plain Enter, and only those speaking the kitty
+        // keyboard protocol distinguish the two. A key that works on some
+        // terminals and silently does something else on the rest is worse
+        // than no key, so `gx` -- vim's "open this with the system handler"
+        // -- is bound alongside it and works everywhere.
+        (Action::OpenExternal, shift(Key::Enter)),
+        (Action::OpenExternal, chord("gx")),
         // Panes.
         (Action::NextPane, n(Key::Tab)),
         (Action::PrevPane, n(Key::BackTab)),

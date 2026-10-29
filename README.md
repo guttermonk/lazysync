@@ -189,6 +189,23 @@ synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
 own sync profile, `sw` watches the tree, `sL` shows the audit log. All of it
 remappable — see below.
 
+### Synchronized browsing follows the cursor too
+
+`S` couples the panes. Entering `src/api` on one side takes the other to its
+own `src/api`, and **scrolling one pane scrolls the other with it** — row N
+beside row N, which is what makes two directories side by side a comparison
+rather than two unrelated listings.
+
+It follows by *ordinal position*, not by name. Lining equal names up against
+each other is a different feature and lazysync already has it: `u` merges
+both listings into one set of rows with one cursor, which is the honest way
+to do it because it can show that a name exists on one side only. A shorter
+directory stops at its own last entry rather than scrolling into blank space.
+
+Only the leader propagates, the same rule navigation follows — and the wheel
+never leads, so reading the other pane with the mouse does not drag the one
+you are working in.
+
 ### Which sync key does what
 
 | Key | Mode | Direction | What it deletes |
@@ -279,6 +296,57 @@ The confirmation window says `3 marked items only` so a narrow plan can never
 be mistaken for a complete one.
 
 With nothing marked, a sync covers the whole directory as before.
+
+### Enter on a file
+
+`Enter` on a directory enters it. On a *file* it runs the connection's
+**default sync**, on that file alone — or on the marked files, if any are
+marked, since marking three things and pressing Enter has to mean those
+three.
+
+Set it in the connection editor: the `Enter syncs` row, which offers `off`,
+`push`, `pull`, `mirror-push`, `mirror-pull` and `bisync`.
+
+```toml
+# bookmarks.toml
+default_sync = "push"
+```
+
+**It is `off` until you set it, deliberately.** Enter is the key people press
+without having decided to, and a default that transferred files would make
+the most reflexive keystroke in the program the one that writes to a server.
+"Enter pushes" is a reasonable thing to want for a deploy target and an
+alarming one for a backup you pull from, which is also why it is per
+connection rather than a global.
+
+With no setting of its own, a connection falls back to the mode of its
+`[profiles.<name>]` — a connection that already says "this is a push target"
+has answered the question, and making it answer twice is how the two end up
+disagreeing.
+
+**`bisync` is accepted and then refused for a selection.** A two-way sync
+compares both whole trees against a snapshot of the last run, so it cannot be
+narrowed to one file; the alternative to refusing is pressing Enter on one
+row and syncing both trees, which is not a thing a key should be able to do
+by accident. Use `sb` when you mean the whole tree.
+
+### Opening a file
+
+`shift+enter` hands the selected file to whatever your desktop opens it with
+— `xdg-open`, `open` on macOS, `start` on Windows.
+
+**`gx` does the same thing, and is the one that always works.** Most
+terminals send Shift+Enter as a plain Enter; only those speaking the kitty
+keyboard protocol distinguish the two. Rather than ship a key that works on
+some terminals and silently syncs a file on the rest, both are bound.
+
+Two limits worth knowing. It is **local files only**: opening a remote one
+means downloading it to a temporary path first, and a file manager that
+quietly leaves copies of a server's files in `/tmp` is one you cannot audit
+— so it says so instead. And the handler is launched **detached with no
+terminal**, because lazysync still owns this one; that makes it a feature for
+GUI applications, and a terminal-based handler will fail visibly rather than
+draw over the UI.
 
 ### The confirmation window
 
@@ -488,6 +556,17 @@ password — including the local working directory and a sync profile
 reference. Opening one shows its *name* and, only if it needs one, a password
 prompt; host, port, username and key path appear solely in the add/edit form.
 
+**The password prompt is a window**, centred and bordered, titled `password`
+and naming the connection it is for, with what you type masked by `*` —
+lazygit's credentials prompt, which is where the shape comes from. It used to
+be collected on the status line, in the same row and colour as the mode badge
+and the cursor counter, which made the one moment lazysync stops and waits
+for you look like furniture.
+
+Search and the bookmark filter stay on the status line, because a box in the
+middle of the screen would cover the listing you are searching. A password
+has no such tie to what is behind it and wants the opposite treatment.
+
 Host keys are verified against `~/.ssh/known_hosts` before any credential is
 sent, because `remotefs-ssh`'s libssh2 backend does not check them at all. A
 new host asks once, with a `SHA256:` fingerprint you can compare against
@@ -655,6 +734,26 @@ key another action was using leaves that action stranded, and so does an
 generated from it, and so is every on-screen key hint — so nothing in the UI
 can claim a binding you do not have. If the footer does not offer an action,
 nothing is bound to it.
+
+**The help overlay has three columns**: the keys, the action's name, and
+what it does.
+
+```
+    sm                  SyncMirror         One-way: remote ends up identical to local
+    sb                  SyncBisync         Two-way: each change travels to the other side
+```
+
+The middle one is the exact spelling `[keys.*]` accepts, not a prettified
+version of it, because `?` is the screen you are on when you decide to rebind
+something — `SyncMirror` can be pasted straight into `set = [["SyncMirror",
+"sm"]]`, and `Sync Mirror` would have to be translated first.
+
+**An overlay dims the screen behind it** and keeps clear of the panes' bottom
+border. Both are the same complaint: a help window whose border is the same
+colour as the pane borders it is sitting on reads as one shape with a seam in
+it rather than as a window over a screen. A transparent terminal stays
+transparent — the dimming takes the colour out of the text, it does not paint
+a grey rectangle over your background.
 
 **The yes/no dialog is its own mode.** `[keys.question]` covers the small
 window that asks before closing a connection, deleting a bookmark or deleting

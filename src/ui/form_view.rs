@@ -216,6 +216,8 @@ mod tests {
                 FieldId::RemotePath,
                 FieldId::LocalPath,
                 FieldId::SyncProfile,
+                // Names a sync mode, not a credential.
+                FieldId::DefaultSync,
                 FieldId::SyncBrowse,
                 FieldId::RememberPassword,
             ],

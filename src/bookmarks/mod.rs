@@ -23,7 +23,10 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::connection::{AuthMethod, Protocol, Target};
+use crate::{
+    config::SyncMode,
+    connection::{AuthMethod, Protocol, Target},
+};
 
 /// One saved connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +59,25 @@ pub struct Bookmark {
     /// Name of a `[profiles.<name>]` entry in `config.toml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_profile: Option<String>,
+
+    /// What Enter on a file syncs with.
+    ///
+    /// Enter on a *directory* enters it, as it always has. On a file it used
+    /// to say "opening files is not implemented yet"; with this set it plans
+    /// a sync of that one file instead, or of the marked ones if any are
+    /// marked.
+    ///
+    /// `None` by default, and that matters: Enter is the key people press
+    /// without deciding to, and a default that transferred files would make
+    /// the most reflexive keystroke in the program the one that writes to a
+    /// server. Opt in per connection, which is also why it lives here rather
+    /// than in `config.toml` -- "Enter pushes" is a sane thing to want for a
+    /// deploy target and an alarming one for a backup you pull from.
+    ///
+    /// Falls back to the mode of [`Self::sync_profile`] when that is set;
+    /// see `App::default_sync_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sync: Option<SyncMode>,
 
     /// Turn synchronized browsing on when this bookmark opens.
     #[serde(default)]
@@ -122,6 +144,7 @@ impl Bookmark {
             remote_path: None,
             local_path: None,
             sync_profile: None,
+            default_sync: None,
             sync_browse: false,
             remember_password: false,
             builtin: true,
@@ -141,6 +164,7 @@ impl Bookmark {
             remote_path: None,
             local_path: None,
             sync_profile: None,
+            default_sync: None,
             sync_browse: false,
             remember_password: false,
             builtin: false,

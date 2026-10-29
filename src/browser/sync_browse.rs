@@ -135,6 +135,34 @@ pub fn follow(leader: &mut Pane, follower: &mut Pane, on_missing: OnMissing) -> 
     }
 }
 
+/// Put the follower's cursor and viewport where the leader's are.
+///
+/// [`follow`] keeps the two panes in the same *directory*; this keeps them on
+/// the same *row* of it. Browsing a pair of corresponding trees side by side
+/// is a comparison, and a comparison wants row N next to row N -- scrolling
+/// one pane forty files down while the other sits at the top means reading
+/// two unrelated parts of two directories and calling it synchronized.
+///
+/// **By ordinal position, not by name.** Lining equal names up against each
+/// other is a real thing to want, and lazysync already has it: union view
+/// merges both listings into one set of rows with one cursor, which is the
+/// honest way to do it because it can show that a name exists on one side
+/// only. A second, subtler alignment here would be a feature that looks like
+/// union view and disagrees with it in exactly the asymmetric cases that
+/// matter.
+///
+/// Both are clamped by the follower's own length, so a shorter directory
+/// stops at its last entry rather than scrolling into blank space. A ghosted
+/// follower has no entries at all, which clamps to zero and costs nothing.
+pub fn follow_cursor(leader: &Pane, follower: &mut Pane) {
+    follower.set_cursor(leader.cursor());
+
+    // The renderer would pull a too-large offset back on its own to keep the
+    // selection visible, but only after drawing one frame from it. Clamping
+    // here means the follower never flashes a blank listing.
+    follower.scroll = leader.scroll.min(follower.len().saturating_sub(1));
+}
+
 /// Which pane leads, given the configured policy and which pane has focus.
 pub const fn leader_side(policy: Leader, focused: Side) -> Side {
     match policy {

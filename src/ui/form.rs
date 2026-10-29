@@ -14,8 +14,15 @@ use std::path::PathBuf;
 
 use crate::{
     bookmarks::Bookmark,
+    config::SyncMode,
     connection::{AuthMethod, Protocol, Target},
 };
+
+/// The `Enter syncs` choice that means "do not".
+///
+/// A word rather than an empty option, because a blank row in a column of
+/// filled ones reads as a field somebody forgot rather than as a setting.
+const NO_DEFAULT_SYNC: &str = "off";
 
 /// Which field of the form a row edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +37,7 @@ pub enum FieldId {
     RemotePath,
     LocalPath,
     SyncProfile,
+    DefaultSync,
     SyncBrowse,
     RememberPassword,
 }
@@ -144,6 +152,17 @@ impl ConnectionForm {
             .position(|a| *a == bookmark.auth)
             .unwrap_or(0);
 
+        // `off` leads, and is what an unset connection shows. Enter is the
+        // most reflexive key there is, so the state you get without deciding
+        // anything is the one where it does not transfer files.
+        let default_syncs: Vec<String> = std::iter::once(NO_DEFAULT_SYNC.to_owned())
+            .chain(SyncMode::ALL.iter().map(|m| m.name().to_owned()))
+            .collect();
+        let default_sync_index = bookmark
+            .default_sync
+            .and_then(|mode| default_syncs.iter().position(|name| name == mode.name()))
+            .unwrap_or(0);
+
         let fields = vec![
             Field {
                 id: FieldId::Name,
@@ -238,6 +257,16 @@ impl ConnectionForm {
                 value: Value::Text(bookmark.sync_profile.clone().unwrap_or_default()),
                 placeholder: "none",
                 hint: "A [profiles.<name>] entry in config.toml.",
+            },
+            Field {
+                id: FieldId::DefaultSync,
+                label: "Enter syncs",
+                value: Value::Choice {
+                    options: default_syncs,
+                    selected: default_sync_index,
+                },
+                placeholder: "",
+                hint: "What Enter on a file runs -- on the marked files if any are marked.",
             },
             Field {
                 id: FieldId::SyncBrowse,
@@ -417,6 +446,9 @@ impl ConnectionForm {
         let mut bookmark = Bookmark::from_target(name, &target);
         bookmark.local_path = non_empty(self.text(FieldId::LocalPath)).map(PathBuf::from);
         bookmark.sync_profile = non_empty(self.text(FieldId::SyncProfile));
+        // `from_name` returns `None` for "off", which is the same `None` an
+        // unset connection has -- so the two states cannot drift apart.
+        bookmark.default_sync = SyncMode::from_name(self.text(FieldId::DefaultSync));
         bookmark.sync_browse = self.flag(FieldId::SyncBrowse);
         bookmark.remember_password = self.flag(FieldId::RememberPassword);
 

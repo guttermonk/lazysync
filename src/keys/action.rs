@@ -198,6 +198,17 @@ pub enum Action {
     PrevChoice,
 
     // ── Generic ──────────────────────────────────────────────────────────
+    /// Hand the selected file to the system's default application.
+    ///
+    /// Local files only, and deliberately: opening a remote one means
+    /// downloading it to a temporary path first, and a file manager that
+    /// silently leaves copies of a server's files in `/tmp` is one you
+    /// cannot audit. It says so rather than guessing.
+    ///
+    /// The handler is launched detached with no terminal of its own, so this
+    /// is for GUI applications. A terminal-based handler would otherwise be
+    /// drawing into the same cells lazysync is; see `app::App::open_external`.
+    OpenExternal,
     Submit,
     Cancel,
     Help,
@@ -290,6 +301,7 @@ impl Action {
             Self::NextChoice => "Next value",
             Self::PrevChoice => "Previous value",
 
+            Self::OpenExternal => "Open the file in the system's default application",
             Self::Submit => "Accept",
             Self::Cancel => "Cancel, or close the overlay",
             Self::Help => "Show this help",
@@ -372,6 +384,7 @@ impl Action {
             Self::NextChoice => "next value",
             Self::PrevChoice => "previous value",
 
+            Self::OpenExternal => "open externally",
             Self::Submit => "accept",
             Self::Cancel => "cancel",
             Self::Help => "help",
@@ -440,7 +453,12 @@ impl Action {
             | Self::NextChoice
             | Self::PrevChoice => "Connections",
 
-            Self::Submit | Self::Cancel | Self::Help | Self::Hide | Self::Quit => "General",
+            Self::OpenExternal
+            | Self::Submit
+            | Self::Cancel
+            | Self::Help
+            | Self::Hide
+            | Self::Quit => "General",
         }
     }
 

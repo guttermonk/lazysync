@@ -6,7 +6,10 @@
 //! which [`Mode::takes_text_input`] routes to the overlay as characters --
 //! otherwise typing a password would run commands.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     bookmarks::{secrets, Bookmark, BookmarkStore},
@@ -51,6 +54,26 @@ pub enum Overlay {
     Question(Question),
 }
 
+impl Overlay {
+    /// Whether this overlay covers the middle of the screen.
+    ///
+    /// What it decides is dimming: a window over the panes wants the panes
+    /// muted behind it, or its border and theirs compete in the same colour.
+    /// A prompt that lives on the status line wants the opposite -- a search
+    /// is *read against* the listing it is filtering, and dimming that would
+    /// hide the thing being searched.
+    ///
+    /// Separate from "owns the keyboard", which every overlay does, and from
+    /// "swallows clicks", which every overlay also does.
+    pub const fn is_modal(&self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Help { .. } | Self::Question(_) => true,
+            Self::Prompt(prompt) => prompt.kind.is_secret(),
+        }
+    }
+}
+
 /// A text prompt and what to do with what is typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
@@ -79,7 +102,37 @@ impl PromptKind {
         }
     }
 
+    /// What is being asked for, as the popup's title.
+    ///
+    /// Only the secret kinds are ever drawn as a window, but every kind
+    /// answers rather than the renderer matching on the variant -- so a
+    /// passphrase prompt arriving later gets a title by construction instead
+    /// of by somebody remembering to extend a `match` in `ui`.
+    pub const fn title(&self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::FilterBookmarks => "filter",
+            Self::Password { .. } => "password",
+        }
+    }
+
+    /// Who it is being asked on behalf of, drawn above the input.
+    ///
+    /// `None` for the prompts that have no subject, which is also why the
+    /// popup measures its height rather than assuming the line is there.
+    pub fn subject(&self) -> Option<&str> {
+        match self {
+            Self::Search | Self::FilterBookmarks => None,
+            Self::Password { bookmark } => Some(bookmark),
+        }
+    }
+
     /// Whether what is typed should be hidden.
+    ///
+    /// This is also what decides between the two prompt renderings: a secret
+    /// gets the window, everything else keeps the status line. The two
+    /// questions have the same answer for the same reason -- a prompt worth
+    /// masking is one that has stopped the application to ask.
     pub const fn is_secret(&self) -> bool {
         matches!(self, Self::Password { .. })
     }
@@ -261,6 +314,11 @@ pub struct App {
     /// documentation for the headless path.
     pub active_profile: Option<String>,
 
+    /// The open connection's `default_sync`, which is what Enter on a file
+    /// runs. `None` leaves Enter doing nothing to files, which is the
+    /// default; see [`crate::bookmarks::Bookmark::default_sync`].
+    pub default_sync: Option<SyncMode>,
+
     /// Where everything was on the last frame, so a click can be matched to
     /// what the user was pointing at. Written by `ui::draw`, read by the
     /// event loop, and rebuilt from nothing every frame.
@@ -351,6 +409,7 @@ impl App {
             last_report: None,
             transfer: None,
             active_profile: None,
+            default_sync: None,
             hits: HitMap::default(),
             progress: Box::new(progress::Silent),
             pending_keys: Vec::new(),
@@ -642,6 +701,10 @@ impl App {
                     self.union_cursor = row.min(self.row_count().saturating_sub(1));
                 } else {
                     self.panes[pane].set_cursor(row);
+                    // Focus moved to this pane just above, so clicking the
+                    // other side makes it the leader and the mirror follows
+                    // the click -- which is what the keyboard does too.
+                    self.after_cursor_moved(pane);
                 }
 
                 double.then_some(Action::EnterDir)
@@ -717,6 +780,10 @@ impl App {
                     self.move_cursor(delta);
                 } else {
                     self.panes[pane].move_cursor(delta);
+                    // Only mirrors if the wheel was over the leader; see
+                    // `after_cursor_moved`. Scrolling the other pane with the
+                    // pointer is a look, not a move.
+                    self.after_cursor_moved(pane);
                 }
             }
 
@@ -1067,6 +1134,7 @@ impl App {
         }
 
         self.active_profile = bookmark.sync_profile.clone();
+        self.default_sync = bookmark.default_sync;
         self.sync_browse = bookmark.sync_browse || self.config.sync_browse.enabled;
         if self.sync_browse {
             sync_browse::anchor_both(&mut self.panes);
@@ -1115,6 +1183,7 @@ impl App {
         self.sync_browse = false;
         self.desynced = false;
         self.active_profile = None;
+        self.default_sync = None;
 
         self.screen = Screen::Bookmarks;
         self.status.clear();
@@ -1137,6 +1206,7 @@ impl App {
         self.panes[1] = Pane::new(Box::new(LocalFs::new()), right, &self.config);
 
         self.active_profile = bookmark.sync_profile.clone();
+        self.default_sync = bookmark.default_sync;
         // Not `|| config.sync_browse.enabled`, unlike a real connection. Two
         // panes that both start at home are already in step, so coupling them
         // means every move happens twice and the second pane becomes a mirror
@@ -1303,6 +1373,7 @@ impl App {
             Action::SyncBisync => self.begin_sync(SyncMode::Bisync),
             Action::ToggleWatch => self.toggle_watch(),
             Action::ShowLog => self.open_log(),
+            Action::OpenExternal => self.open_external(),
 
             // Leaving the browser with a connection open ends that session:
             // the connection list cannot navigate back to a live browser, so
@@ -1456,6 +1527,17 @@ impl App {
     /// confirmation window is the only route to applying it -- which is why
     /// there is no "sync now" that skips this.
     pub fn begin_sync(&mut self, mode: SyncMode) {
+        self.begin_sync_scoped(mode, None);
+    }
+
+    /// [`Self::begin_sync`], with the option of naming the scope outright.
+    ///
+    /// `None` means "whatever the source pane has marked", which is what
+    /// every sync key does. `Some` is for Enter on a file, which scopes to
+    /// one row that may not be marked at all -- and which must not be
+    /// widened to the marks, or pressing Enter on an unmarked file after
+    /// marking others would sync the others.
+    pub fn begin_sync_scoped(&mut self, mode: SyncMode, scope: Option<HashSet<String>>) {
         if !mode.is_implemented() {
             self.status = format!(
                 "{} arrives in a later phase -- see docs/PLAN.md",
@@ -1465,6 +1547,17 @@ impl App {
         }
 
         if matches!(mode, SyncMode::Bisync) {
+            // Refused rather than widened. `sync::bisync` takes no scope, so
+            // honouring one here is impossible and ignoring one would turn
+            // "sync this file" into "sync both trees" -- the worst available
+            // reading of a key the user pressed on one row. `sync_selected`
+            // checks first and says it better; this is the backstop that
+            // keeps a future caller from reintroducing the bug.
+            if scope.is_some() {
+                self.status = "a two-way sync cannot be narrowed to a selection".into();
+                self.status_kind = StatusKind::Problem;
+                return;
+            }
             self.begin_bisync();
             return;
         }
@@ -1511,10 +1604,10 @@ impl App {
         //
         // Cloned because the panes are borrowed mutably just below, and a
         // handful of file names is not worth restructuring the borrow for.
-        let scope: Option<diff::Scope> = {
+        let scope: Option<diff::Scope> = scope.or_else(|| {
             let marks = self.panes[source_index].marks();
             (!marks.is_empty()).then(|| marks.clone())
-        };
+        });
         let scoped_names: Vec<String> = {
             let mut names: Vec<String> = scope.iter().flatten().cloned().collect();
             names.sort();
@@ -2585,6 +2678,7 @@ impl App {
                 .min(count - 1);
         } else {
             self.focused_mut().move_cursor(delta);
+            self.after_cursor_moved(self.focus);
         }
     }
 
@@ -2593,8 +2687,45 @@ impl App {
             self.union_cursor = index.min(self.row_count().saturating_sub(1));
         } else if index == 0 {
             self.focused_mut().cursor_to_top();
+            self.after_cursor_moved(self.focus);
         } else {
             self.focused_mut().cursor_to_bottom();
+            self.after_cursor_moved(self.focus);
+        }
+    }
+
+    /// Keep the other pane on the same row after the leader's cursor moved.
+    ///
+    /// The within-a-directory counterpart of [`Self::after_leader_moved`],
+    /// and it answers the same two questions the same way: only the leader
+    /// propagates, and who leads is the configured policy applied to which
+    /// pane has *focus*.
+    ///
+    /// Focus rather than `moved` specifically for the wheel, which scrolls
+    /// whatever is under the pointer without taking focus. Reading the other
+    /// pane with the mouse is a deliberate look at the other side, and it
+    /// must not drag the pane you are working in along behind it.
+    ///
+    /// Union view is excluded because it has no second cursor to move: both
+    /// panes already render one merged list from `union_cursor`.
+    fn after_cursor_moved(&mut self, moved: usize) {
+        if !self.sync_browse || self.union_view {
+            return;
+        }
+
+        let leader =
+            sync_browse::leader_side(self.config.sync_browse.leader, Side::from_index(self.focus))
+                .index();
+
+        if moved != leader {
+            return;
+        }
+
+        let (first, second) = self.panes.split_at_mut(1);
+        if leader == 0 {
+            sync_browse::follow_cursor(&first[0], &mut second[0]);
+        } else {
+            sync_browse::follow_cursor(&second[0], &mut first[0]);
         }
     }
 
@@ -2609,15 +2740,126 @@ impl App {
         }
 
         if self.focused_mut().enter_selected().is_none() {
-            // A file, not a directory. Opening files arrives with the editor
-            // integration; saying so beats doing nothing silently.
+            // A file, not a directory. Enter on one syncs it, if the
+            // connection says what with.
             if self.focused().selected().is_some() {
-                self.status = "opening files is not implemented yet".into();
+                self.sync_selected();
             }
             return;
         }
 
         self.after_leader_moved();
+    }
+
+    /// What Enter on a file does: sync it with the connection's default mode.
+    ///
+    /// **Marked files win over the row under the cursor.** Marking three
+    /// things and pressing Enter has to mean those three, or marks would be
+    /// a selection that the most obvious key ignores. With nothing marked,
+    /// the scope is the single row you are on.
+    ///
+    /// The scope is a top-level name within the directory on screen, which
+    /// is the same shape `sp` already narrows by -- so this adds a key, not
+    /// a second way for a plan to be narrowed.
+    fn sync_selected(&mut self) {
+        let Some(mode) = self.default_sync_mode() else {
+            self.status = "this connection has no default sync; set `Enter syncs` in its \
+                           editor"
+                .into();
+            self.status_kind = StatusKind::Problem;
+            return;
+        };
+
+        // A two-way sync cannot be narrowed, and the dangerous reading of
+        // that is to run it unnarrowed: press Enter on one file, sync the
+        // entire tree both ways. Refused instead, and the message names the
+        // key that does mean "the whole tree".
+        if !mode.can_be_scoped() {
+            let whole_tree = self
+                .keys_for(&[Action::SyncBisync])
+                .map(|keys| format!("; {keys} syncs the whole tree"))
+                .unwrap_or_default();
+            self.status = format!("a two-way sync cannot be narrowed to a selection{whole_tree}");
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        let marks = self.focused().marks().clone();
+        let scope = if marks.is_empty() {
+            let Some(entry) = self.focused().selected() else {
+                return;
+            };
+            HashSet::from([entry.name.clone()])
+        } else {
+            marks
+        };
+
+        self.begin_sync_scoped(mode, Some(scope));
+    }
+
+    /// Hand the selected file to whatever the desktop opens it with.
+    ///
+    /// **Local files only.** Opening a remote one means downloading it to a
+    /// temporary path first, and then answering questions this function has
+    /// no good answer to: where the copy lives, who deletes it, whether an
+    /// edit to it means anything. A file manager that silently leaves copies
+    /// of a server's files in `/tmp` is one you cannot audit, so this says
+    /// what it cannot do instead.
+    ///
+    /// **Launched detached, with no terminal.** lazysync still owns this
+    /// one: it is in raw mode on the alternate screen, and a child writing
+    /// to the same cells would draw over a UI that does not know to repaint.
+    /// So stdio is null and the child is not waited for -- which makes this
+    /// a GUI-handler feature, and makes a terminal-based handler fail
+    /// visibly rather than corrupt the display.
+    ///
+    /// Only the spawn is reported. Whether the handler then liked the file
+    /// is between it and the user; by the time it exits, lazysync is no
+    /// longer the thing they are looking at.
+    fn open_external(&mut self) {
+        let pane = self.focused();
+
+        if pane.vfs.scheme() != "local" {
+            self.status = format!(
+                "{} is on a {} connection; only local files can be opened",
+                pane.selected().map_or("this file", |e| e.name.as_str()),
+                pane.vfs.scheme()
+            );
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        let Some(entry) = pane.selected() else {
+            self.status = "nothing selected".into();
+            return;
+        };
+        let path = pane.path().join(&entry.name);
+        let name = entry.name.clone();
+
+        match launch_opener(&path) {
+            Ok(program) => {
+                self.status = format!("opened {name} with {program}");
+                self.status_kind = StatusKind::Answer;
+            }
+            Err(why) => {
+                self.status = why;
+                self.status_kind = StatusKind::Problem;
+            }
+        }
+    }
+
+    /// What Enter on a file syncs with.
+    ///
+    /// The connection's own setting first, then the mode of its sync profile
+    /// if it has one. The fallback is there because a connection that
+    /// already says "this is a push target" in `[profiles.deploy]` has
+    /// answered this question, and making it answer twice is how the two end
+    /// up disagreeing.
+    pub fn default_sync_mode(&self) -> Option<SyncMode> {
+        self.default_sync.or_else(|| {
+            let name = self.active_profile.as_ref()?;
+            Some(self.config.profiles.get(name)?.mode)
+        })
     }
 
     /// Enter a row in union view.
@@ -2805,6 +3047,9 @@ impl App {
             self.status = format!("no match for {query:?}");
         } else {
             self.status.clear();
+            // A match is a cursor move like any other, so the other pane
+            // keeps up with it rather than only with the arrow keys.
+            self.after_cursor_moved(self.focus);
         }
     }
 
@@ -2888,6 +3133,51 @@ fn nothing_to_do(
         return what;
     }
     format!("{what} -- compared by {} only", method.describe())
+}
+
+/// Start the desktop's handler for `path`, and return the program used.
+///
+/// One opener per platform, named rather than probed: `xdg-open` is the
+/// freedesktop entry point, `open` is macOS's, and Windows has no program at
+/// all -- `start` is a `cmd` builtin, which is why that arm goes through
+/// `cmd /C` and the others do not.
+///
+/// stdio is null in all three directions. stdout and stderr because a child
+/// writing to this terminal writes on top of a TUI that will not know to
+/// repaint; stdin because an inherited one puts the child in competition
+/// with the event loop for keystrokes.
+///
+/// Spawned and not waited for. `xdg-open` returns once it has handed off,
+/// but the handler it started outlives it, and blocking the UI until
+/// somebody closes an image viewer is not what the key means.
+fn launch_opener(path: &Path) -> Result<&'static str, String> {
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    let (program, args): (&str, Vec<&std::ffi::OsStr>) = ("open", vec![path.as_os_str()]);
+    #[cfg(target_os = "windows")]
+    let (program, args): (&str, Vec<&std::ffi::OsStr>) = (
+        "cmd",
+        vec![
+            "/C".as_ref(),
+            "start".as_ref(),
+            // `start` reads a bare first argument as the new window's title,
+            // so it is given an empty one and the path comes second.
+            "".as_ref(),
+            path.as_os_str(),
+        ],
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let (program, args): (&str, Vec<&std::ffi::OsStr>) = ("xdg-open", vec![path.as_os_str()]);
+
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| program)
+        .map_err(|e| format!("{program}: {e}"))
 }
 
 /// Which side a pane index refers to, for titles.

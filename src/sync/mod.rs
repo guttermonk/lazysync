@@ -104,11 +104,78 @@ impl SyncMode {
     pub const fn is_implemented(self) -> bool {
         true
     }
+
+    /// Every mode, in the order the connection editor offers them.
+    pub const ALL: [Self; 5] = [
+        Self::Push,
+        Self::Pull,
+        Self::MirrorPush,
+        Self::MirrorPull,
+        Self::Bisync,
+    ];
+
+    /// The spelling `config.toml` and `bookmarks.toml` accept.
+    ///
+    /// Distinct from [`Self::label`], which is prose for a status line.
+    /// Serde writes these via `rename_all = "kebab-case"`, so the two have to
+    /// agree -- a test asserts they round-trip rather than trusting that they
+    /// were kept in step by hand.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::Pull => "pull",
+            Self::MirrorPush => "mirror-push",
+            Self::MirrorPull => "mirror-pull",
+            Self::Bisync => "bisync",
+        }
+    }
+
+    /// Parse a [`Self::name`], for the connection editor's choice field.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.name() == name)
+    }
+
+    /// Whether a plan in this mode can be narrowed to particular files.
+    ///
+    /// A two-way sync cannot. Its whole method is to compare both trees
+    /// against a snapshot of the last run, and a snapshot written from a
+    /// partial comparison would claim agreement about files nobody looked
+    /// at -- so `sync::bisync` takes no scope at all. Callers that have a
+    /// scope therefore have to ask before assuming one will be honoured,
+    /// because the failure mode otherwise is silently syncing a whole tree
+    /// when the user selected one file.
+    pub const fn can_be_scoped(self) -> bool {
+        !matches!(self, Self::Bisync)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config spelling and serde's must agree, or a mode the connection
+    /// editor offers is one `bookmarks.toml` cannot read back.
+    #[test]
+    fn every_mode_round_trips_through_its_config_name() {
+        for mode in SyncMode::ALL {
+            let written = toml::Value::try_from(mode).unwrap();
+            assert_eq!(
+                written.as_str(),
+                Some(mode.name()),
+                "{mode:?} serialises as something other than its name"
+            );
+            assert_eq!(SyncMode::from_name(mode.name()), Some(mode));
+        }
+    }
+
+    /// Scoping a two-way sync is the one case that must be refused rather
+    /// than quietly widened to the whole tree.
+    #[test]
+    fn only_a_two_way_sync_refuses_to_be_narrowed() {
+        for mode in SyncMode::ALL {
+            assert_eq!(mode.can_be_scoped(), mode != SyncMode::Bisync, "{mode:?}");
+        }
+    }
 
     #[test]
     fn push_goes_local_to_remote_and_pull_the_other_way() {

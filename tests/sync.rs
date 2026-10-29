@@ -1779,3 +1779,175 @@ fn a_kept_conflict_copy_is_still_synced() {
         plan.rows.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
 }
+
+// ── Enter as the default sync ────────────────────────────────────────────
+
+/// Put the browser cursor on a named entry in the focused pane.
+fn select_file(h: &mut Harness, name: &str) {
+    let index = h
+        .app
+        .focused()
+        .entries()
+        .iter()
+        .position(|e| e.name == name)
+        .unwrap_or_else(|| panic!("no {name} in the pane"));
+
+    h.app.handle(lazysync::keys::Action::MoveTop);
+    for _ in 0..index {
+        h.press("j");
+    }
+}
+
+fn enter(h: &mut Harness) {
+    h.key(ModifiedKey::plain(Key::Enter));
+}
+
+/// The request: Enter on a file runs the connection's default sync, on that
+/// file. Enter on a *directory* still enters it.
+#[test]
+fn enter_on_a_file_plans_the_default_sync_for_that_file_alone() {
+    let mut h = Harness::new(Config::default());
+    fixture(&h);
+    h.refresh();
+    h.app.default_sync = Some(lazysync::config::SyncMode::Push);
+
+    select_file(&mut h, "index.html");
+    enter(&mut h);
+
+    assert_eq!(h.app.screen, Screen::Confirm, "a plan should be open");
+    let plan = h.app.plan.as_ref().expect("a plan");
+    let paths: Vec<String> = plan
+        .rows
+        .iter()
+        .map(|r| r.path.display().to_string())
+        .collect();
+
+    assert_eq!(
+        paths,
+        vec!["index.html".to_string()],
+        "only the selected file should be planned"
+    );
+}
+
+/// And marks win over the cursor, or marking would be a selection that the
+/// most obvious key ignores.
+#[test]
+fn enter_syncs_the_marked_files_when_there_are_any() {
+    let mut h = Harness::new(Config::default());
+    fixture(&h);
+    h.refresh();
+    h.app.default_sync = Some(lazysync::config::SyncMode::Push);
+
+    select_file(&mut h, "index.html");
+    h.space();
+    select_file(&mut h, "config.toml");
+    h.space();
+
+    // The cursor is on `config.toml`, but both are marked.
+    select_file(&mut h, "README.md");
+    enter(&mut h);
+
+    let plan = h.app.plan.as_ref().expect("a plan");
+    let mut paths: Vec<String> = plan
+        .rows
+        .iter()
+        .map(|r| r.path.display().to_string())
+        .collect();
+    paths.sort();
+
+    assert_eq!(paths, vec!["config.toml".to_string(), "index.html".into()]);
+    assert!(
+        !paths.contains(&"README.md".to_string()),
+        "the unmarked row under the cursor should not have been added"
+    );
+}
+
+/// Entering a directory still enters it. The feature adds a meaning for
+/// files, it does not take one away from directories.
+#[test]
+fn enter_on_a_directory_still_navigates() {
+    let mut h = Harness::new(Config::default());
+    fixture(&h);
+    h.refresh();
+    h.app.default_sync = Some(lazysync::config::SyncMode::Push);
+
+    select_file(&mut h, "src");
+    enter(&mut h);
+
+    assert_eq!(h.app.screen, Screen::Browser, "no plan should have opened");
+    assert!(h.app.focused().path().ends_with("left/src"));
+}
+
+/// With nothing configured, Enter on a file says what to set rather than
+/// doing something nobody asked for.
+#[test]
+fn enter_without_a_default_sync_explains_itself() {
+    let mut h = Harness::new(Config::default());
+    fixture(&h);
+    h.refresh();
+
+    select_file(&mut h, "index.html");
+    enter(&mut h);
+
+    assert_eq!(h.app.screen, Screen::Browser);
+    assert!(
+        h.app.status.contains("Enter syncs"),
+        "the message should name the setting: {:?}",
+        h.app.status
+    );
+}
+
+/// The dangerous case. A two-way sync cannot be narrowed, and the wrong
+/// answer is to run it unnarrowed -- press Enter on one file, sync both
+/// trees. It is refused.
+#[test]
+fn enter_refuses_a_two_way_default_rather_than_syncing_everything() {
+    let mut h = Harness::new(Config::default());
+    fixture(&h);
+    h.refresh();
+    h.app.default_sync = Some(lazysync::config::SyncMode::Bisync);
+
+    select_file(&mut h, "index.html");
+    enter(&mut h);
+
+    assert_eq!(
+        h.app.screen,
+        Screen::Browser,
+        "no plan at all, rather than a whole-tree one"
+    );
+    assert!(
+        h.app.status.contains("cannot be narrowed"),
+        "{:?}",
+        h.app.status
+    );
+}
+
+/// A connection that already declares its mode in `[profiles.<name>]` has
+/// answered this question, so Enter uses that rather than asking twice.
+#[test]
+fn the_default_sync_falls_back_to_the_profiles_mode() {
+    let config: Config = toml::from_str(
+        r#"
+[profiles.deploy]
+mode = "pull"
+"#,
+    )
+    .unwrap();
+
+    let mut h = Harness::new(config);
+    fixture(&h);
+    h.refresh();
+    h.app.active_profile = Some("deploy".into());
+
+    assert_eq!(
+        h.app.default_sync_mode(),
+        Some(lazysync::config::SyncMode::Pull)
+    );
+
+    // And the connection's own setting wins over the profile's.
+    h.app.default_sync = Some(lazysync::config::SyncMode::Push);
+    assert_eq!(
+        h.app.default_sync_mode(),
+        Some(lazysync::config::SyncMode::Push)
+    );
+}

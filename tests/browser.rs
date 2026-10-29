@@ -524,3 +524,158 @@ fn config_keybindings_override_the_defaults() {
         "rebinding g must displace the default gg, or it could only fire after a timeout"
     );
 }
+
+// ── Synchronized scrolling ───────────────────────────────────────────────
+
+/// A tree pair with enough entries on each side to scroll, and deliberately
+/// different lengths: twelve files on the left, four on the right.
+fn tall_trees() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("left")).unwrap();
+    fs::create_dir_all(dir.path().join("right")).unwrap();
+
+    for index in 0..12 {
+        fs::write(dir.path().join(format!("left/file-{index:02}.txt")), b"x").unwrap();
+    }
+    for index in 0..4 {
+        fs::write(dir.path().join(format!("right/file-{index:02}.txt")), b"x").unwrap();
+    }
+    dir
+}
+
+/// The request: synchronized browsing followed the directory but not the
+/// cursor, so scrolling one pane left the other sitting at the top.
+#[test]
+fn the_follower_tracks_the_leaders_cursor_within_a_directory() {
+    let dir = tall_trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.press("S");
+    assert_eq!(h.app.panes[1].cursor(), 0);
+
+    h.press("jjj");
+
+    assert_eq!(h.app.panes[0].cursor(), 3);
+    assert_eq!(
+        h.app.panes[1].cursor(),
+        3,
+        "the follower should be on the same row, not still at the top"
+    );
+}
+
+/// And the viewport with it, which is the half the report was about: the
+/// same rows should be on screen in both panes.
+#[test]
+fn the_follower_tracks_the_leaders_scroll_offset() {
+    let dir = tall_trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.press("S");
+    h.app.panes[0].scroll = 6;
+    h.press("j");
+
+    assert_eq!(
+        h.app.panes[1].scroll,
+        h.app.panes[0].scroll.min(h.app.panes[1].len() - 1),
+        "the follower's viewport should track the leader's"
+    );
+}
+
+/// A shorter directory stops at its own last entry rather than being
+/// scrolled into blank space below it.
+#[test]
+fn a_shorter_follower_clamps_to_its_own_last_entry() {
+    let dir = tall_trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.press("S");
+    h.app.handle(lazysync::keys::Action::MoveBottom);
+
+    assert_eq!(h.app.panes[0].cursor(), 11, "twelve files on the left");
+    assert_eq!(
+        h.app.panes[1].cursor(),
+        3,
+        "four on the right, so it stops on the last one"
+    );
+}
+
+/// The same rule navigation already follows: only the leader propagates.
+/// With `leader = "local"`, scrolling the remote pane is a deliberate look
+/// at the other side and must not drag the local one.
+#[test]
+fn only_the_leaders_cursor_propagates() {
+    let dir = tall_trees();
+    let mut config = Config::default();
+    config.sync_browse.leader = lazysync::config::Leader::Local;
+
+    let mut h = Harness::new(&dir, config);
+    h.press("S");
+    h.tab();
+    h.press("jj");
+
+    assert_eq!(h.app.panes[1].cursor(), 2, "the remote pane moved");
+    assert_eq!(
+        h.app.panes[0].cursor(),
+        0,
+        "the local pane leads, so it must not have been dragged"
+    );
+}
+
+/// Switched off, the panes are independent again -- including their cursors.
+#[test]
+fn without_synchronized_browsing_the_cursors_are_independent() {
+    let dir = tall_trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.press("jjj");
+
+    assert_eq!(h.app.panes[0].cursor(), 3);
+    assert_eq!(h.app.panes[1].cursor(), 0, "nothing should have followed");
+}
+
+// ── Opening a file externally ────────────────────────────────────────────
+
+/// Both keys reach the same action. `shift+enter` is the asked-for one;
+/// `gx` exists because most terminals cannot send it.
+#[test]
+fn shift_enter_and_gx_both_open_externally() {
+    use lazysync::keys::{Action, Keymaps, Mode, Mods};
+
+    let maps = Keymaps::default();
+    let combos = maps.get(Mode::Browser).combos_for(Action::OpenExternal);
+    let spellings: Vec<String> = combos.iter().map(ToString::to_string).collect();
+
+    assert!(
+        spellings.iter().any(|s| s.contains("enter")),
+        "shift+enter should be bound: {spellings:?}"
+    );
+    assert!(
+        spellings.iter().any(|s| s == "gx"),
+        "a key that works on every terminal is required too: {spellings:?}"
+    );
+
+    // And shift+enter must not have displaced plain Enter, which still
+    // enters a directory.
+    let mut dispatcher = Dispatcher::new(Duration::from_millis(500));
+    assert_eq!(
+        dispatcher.key(Mode::Browser, &maps, ModifiedKey::plain(Key::Enter)),
+        Dispatch::Act(Action::EnterDir)
+    );
+
+    let mut dispatcher = Dispatcher::new(Duration::from_millis(500));
+    assert_eq!(
+        dispatcher.key(
+            Mode::Browser,
+            &maps,
+            ModifiedKey::new(Key::Enter, Mods::shift())
+        ),
+        Dispatch::Act(Action::OpenExternal)
+    );
+}
+
+// No test drives `OpenExternal` to completion on a local file, and that is
+// deliberate: the last thing it does is hand the path to `xdg-open`, so a
+// test of the happy path would launch whatever the developer's desktop
+// opens a `.md` with, on every `cargo test`. The guard before the spawn is
+// covered by the remote case in `tests/sftp.rs`, where there is a real
+// backend to be refused.

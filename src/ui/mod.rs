@@ -15,6 +15,7 @@ mod keybar;
 pub mod log;
 mod panes;
 mod progress;
+mod prompt;
 mod question;
 mod status;
 
@@ -28,7 +29,10 @@ use ratatui::{
 
 pub use hit::{HitMap, Target};
 
-use crate::app::{App, Overlay, Screen};
+use crate::{
+    app::{App, Overlay, Screen},
+    config::Palette,
+};
 
 /// Draw a frame.
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
@@ -89,40 +93,78 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     status::draw(frame, app, status_line);
 
+    // Every overlay lays a shield over the whole frame before drawing itself.
+    // A dialog is modal to the keyboard already -- its mode owns every key --
+    // and a mouse that could still reach the pane behind it would be the one
+    // input that ignored that.
+    if !matches!(app.overlay, Overlay::None) {
+        hits.push(frame.area(), Target::Blocked);
+    }
+
+    // One that covers the middle of the screen also mutes what it covers.
+    if app.overlay.is_modal() {
+        dim_behind(frame, app.palette);
+    }
+
     match &app.overlay {
         Overlay::None => {}
-        Overlay::Help { scroll } => {
-            // Every overlay lays a shield over the whole frame before drawing
-            // itself. A dialog is modal to the keyboard already -- its mode
-            // owns every key -- and a mouse that could still reach the pane
-            // behind it would be the one input that ignored that.
-            hits.push(frame.area(), Target::Blocked);
-            help::draw(frame, app, *scroll, &mut hits);
-        }
-        Overlay::Prompt(prompt) => {
-            hits.push(frame.area(), Target::Blocked);
-
-            // A password is never echoed. Dots rather than nothing, so you can
-            // see that your keystrokes are arriving.
-            let shown = if prompt.kind.is_secret() {
-                "\u{2022}".repeat(prompt.input.chars().count())
+        Overlay::Help { scroll } => help::draw(frame, app, *scroll, &mut hits),
+        Overlay::Prompt(p) => {
+            // A secret gets a window; everything else keeps the status line.
+            // See `prompt` for why the two are drawn differently, and
+            // `draw_prompt_line` for why search in particular stays put.
+            if p.kind.is_secret() {
+                prompt::draw(frame, app, p);
             } else {
-                prompt.input.clone()
-            };
-            let text = format!("{}{shown}", prompt.kind.label());
-            draw_prompt_line(frame, app, status_line, &text);
+                let text = format!("{}{}", p.kind.label(), p.input);
+                draw_prompt_line(frame, app, status_line, &text);
+            }
         }
-        Overlay::Question(q) => {
-            hits.push(frame.area(), Target::Blocked);
-            question::draw(frame, app, q, &mut hits);
-        }
+        Overlay::Question(q) => question::draw(frame, app, q, &mut hits),
     }
 
     app.hits = hits;
 }
 
-/// The prompt replaces the status line rather than floating over the panes,
-/// so typing a search does not hide the thing you are searching.
+/// Take the colour out of everything already drawn, so that what goes on top
+/// of it reads as being on top of it.
+///
+/// Reported from a zellij popup: the help overlay's border and the panes'
+/// borders are the same colour, and where they meet the two read as one
+/// shape rather than as a window over a screen. Moving the overlay off the
+/// panes' border row fixes the collision; this fixes the cause, which is that
+/// a full-strength background competes with the thing in front of it.
+///
+/// A terminal has no alpha channel to dim with, so this walks the cells
+/// already in the frame buffer and restyles them. It therefore has to run
+/// *after* everything behind the overlay is drawn and *before* the overlay
+/// itself, which is the one place in [`draw`] that is true.
+///
+/// `palette.bg` rather than a concrete colour: on the default `terminal`
+/// preset that is [`ratatui::style::Color::Reset`], so a transparent terminal
+/// stays transparent behind the overlay instead of being painted over with a
+/// grey rectangle. `Style::reset()` is what clears the modifiers -- bold and
+/// reverse are how the cursor row and the focused border shout, and a
+/// background still shouting is the whole complaint.
+fn dim_behind(frame: &mut Frame<'_>, palette: Palette) {
+    let area = frame.area();
+    let buffer = frame.buffer_mut();
+
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buffer[(x, y)].set_style(Style::reset().fg(palette.dim).bg(palette.bg));
+        }
+    }
+}
+
+/// Search and the bookmark filter replace the status line rather than
+/// floating over the panes, so typing a search does not hide the thing you
+/// are searching.
+///
+/// A password used to be collected here too, and should not have been: this
+/// treatment is right for a prompt you read *against* what is behind it, and
+/// wrong for one that has stopped the application to ask. That one is
+/// [`prompt::draw`].
 fn draw_prompt_line(frame: &mut Frame<'_>, app: &App, area: Rect, text: &str) {
     frame.render_widget(Clear, area);
     frame.render_widget(
