@@ -1157,3 +1157,116 @@ fn the_configured_editor_wins_over_the_environment() {
     assert_eq!(request.command[1], "--wait");
     assert_eq!(request.command.len(), 3, "the path is appended last");
 }
+
+/// A binary file goes to the desktop handler rather than into the editor.
+///
+/// Asserted through `prepare_edit`'s *decision* rather than by pressing the
+/// key: the acting branch ends in `xdg-open`, so a test that drove it would
+/// launch whatever the developer's desktop opens a PNG with.
+#[test]
+fn a_binary_file_is_routed_away_from_the_editor() {
+    use lazysync::app::EditPlan;
+
+    let dir = trees();
+    // A PNG header: the eight-byte signature starts with a NUL at index 3.
+    fs::write(
+        dir.path().join("left/shot.png"),
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+    )
+    .unwrap();
+
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["true"]
+            "#,
+        )
+        .unwrap()
+    });
+    h.app.focused_mut().reload();
+
+    h.select("shot.png");
+    match h.app.plan_edit() {
+        Ok(EditPlan::Desktop { name, .. }) => assert_eq!(name, "shot.png"),
+        other => panic!("a PNG should not go to the editor: {other:?}"),
+    }
+}
+
+/// And a text file still does not.
+#[test]
+fn a_text_file_still_goes_to_the_editor() {
+    use lazysync::app::EditPlan;
+
+    let dir = trees();
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["true"]
+            "#,
+        )
+        .unwrap()
+    });
+
+    h.select("README.md");
+    match h.app.plan_edit() {
+        Ok(EditPlan::Edit(request)) => {
+            assert_eq!(request.local, dir.path().join("left/README.md"));
+        }
+        other => panic!("text belongs in the editor: {other:?}"),
+    }
+}
+
+/// An empty file is text. There is no NUL in nothing, and the file you just
+/// made with `a` should open rather than be handed to an image viewer.
+#[test]
+fn an_empty_file_counts_as_text() {
+    use lazysync::app::EditPlan;
+
+    let dir = trees();
+    fs::write(dir.path().join("left/fresh.txt"), b"").unwrap();
+
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["true"]
+            "#,
+        )
+        .unwrap()
+    });
+    h.app.focused_mut().reload();
+
+    h.select("fresh.txt");
+    assert!(matches!(h.app.plan_edit(), Ok(EditPlan::Edit(_))));
+}
+
+/// `text_only = false` is the escape hatch for an editor you *want*
+/// binaries in -- a hex editor, which this would otherwise make unreachable
+/// from the key that is meant to run it.
+#[test]
+fn text_only_false_sends_everything_to_the_editor() {
+    use lazysync::app::EditPlan;
+
+    let dir = trees();
+    fs::write(dir.path().join("left/shot.png"), b"\x89PNG\r\n\x1a\n\x00").unwrap();
+
+    let mut h = Harness::new(&dir, {
+        toml::from_str(
+            r#"
+            [editor]
+            command = ["hexedit"]
+            text_only = false
+            "#,
+        )
+        .unwrap()
+    });
+    h.app.focused_mut().reload();
+
+    h.select("shot.png");
+    match h.app.plan_edit() {
+        Ok(EditPlan::Edit(request)) => assert_eq!(request.command[0], "hexedit"),
+        other => panic!("the opt-out should reach the editor: {other:?}"),
+    }
+}

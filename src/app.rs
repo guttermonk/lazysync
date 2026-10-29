@@ -185,6 +185,21 @@ pub struct EditRequest {
     pub before: (u64, Option<DateTime<Utc>>),
 }
 
+/// What pressing the edit key turned out to mean.
+///
+/// Two outcomes rather than one because `[editor] text_only` routes by what
+/// the file *is*: text goes to the editor, anything else to whatever the
+/// desktop opens it with. The decision is made in one place and returned,
+/// rather than each branch acting, so that nothing has happened yet when
+/// the caller is still deciding what to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditPlan {
+    /// Run this, then write the result back.
+    Edit(EditRequest),
+    /// Hand it to the system handler and forget it.
+    Desktop { path: PathBuf, name: String },
+}
+
 /// The remote half of an [`EditRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditOrigin {
@@ -3401,10 +3416,24 @@ impl App {
     /// looking at their shell wondering what happened.
     fn begin_edit(&mut self) {
         match self.prepare_edit() {
-            Ok(request) => {
+            Ok(EditPlan::Edit(request)) => {
                 self.status = format!("editing {}...", request.local.display());
                 self.edit_request = Some(request);
             }
+            // Not text, and `[editor] text_only` is on. It goes where
+            // `OpenExternal` would have sent it -- detached, no terminal, no
+            // round trip, because a file the editor will not be opening is
+            // not one lazysync is going to write back either.
+            Ok(EditPlan::Desktop { path, name }) => match launch_opener(&path) {
+                Ok(program) => {
+                    self.status = format!("{name} is not text; opened with {program}");
+                    self.status_kind = StatusKind::Answer;
+                }
+                Err(why) => {
+                    self.status = why;
+                    self.status_kind = StatusKind::Problem;
+                }
+            },
             Err(why) => {
                 self.status = why;
                 self.status_kind = StatusKind::Problem;
@@ -3412,7 +3441,17 @@ impl App {
         }
     }
 
-    fn prepare_edit(&mut self) -> Result<EditRequest, String> {
+    /// What the edit key would do, without doing any of it.
+    ///
+    /// Public so that the routing can be tested by its *decision*: the
+    /// `Desktop` branch ends in `xdg-open`, and a test that drove it to
+    /// completion would launch whatever the developer's desktop opens a PNG
+    /// with, on every `cargo test`.
+    pub fn plan_edit(&mut self) -> Result<EditPlan, String> {
+        self.prepare_edit()
+    }
+
+    fn prepare_edit(&mut self) -> Result<EditPlan, String> {
         let pane = self.focus;
 
         let Some(entry) = self.panes[pane].selected().cloned() else {
@@ -3434,24 +3473,58 @@ impl App {
 
         let program = self.editor_command()?;
         let remote = self.panes[pane].path().join(&entry.name);
+        let text_only = self.config.editor.text_only;
 
         // A local file is edited where it lies. Copying it to a scratch
         // directory and back would turn an edit into a replace: inodes,
         // hard links and anything watching the file would all see something
         // that did not happen.
         if !self.panes[pane].vfs.has_session() && self.panes[pane].vfs.scheme() == "local" {
-            return Ok(EditRequest {
+            if text_only && !looks_like_text(&remote) {
+                return Ok(EditPlan::Desktop {
+                    path: remote,
+                    name: entry.name,
+                });
+            }
+
+            return Ok(EditPlan::Edit(EditRequest {
                 command: with_path(&program, &remote),
                 local: remote,
                 origin: None,
                 before: (entry.size, entry.mtime),
-            });
+            }));
         }
 
         let (scratch, local) = fetch_for_edit(self.panes[pane].vfs.as_mut(), &remote, &entry.name)?;
+
+        // Sniffed after the fetch rather than before. Reading the first few
+        // kilobytes over the wire first would be the tidier-sounding order
+        // and is a worse trade: it is an extra round trip on every text file
+        // -- the common case -- to save a download on a binary one, which
+        // `max_bytes` has already capped. The copy is thrown away either way.
+        if text_only && !looks_like_text(&local) {
+            let _ = fs::remove_dir_all(&scratch);
+
+            // No desktop handler for this one. Handing it `xdg-open` means
+            // leaving the scratch copy behind for a viewer that outlives
+            // this call, and a file manager that quietly keeps a server's
+            // files in a temp directory is one you cannot audit. So it says
+            // what it cannot do, and names the key that works on a local
+            // copy once you have pulled one.
+            let pull = self
+                .keys_for(&[Action::OpenExternal])
+                .map(|keys| format!("; pull it and use {keys}"))
+                .unwrap_or_default();
+
+            return Err(format!(
+                "{} is not text, and a remote file has no desktop handler{pull}",
+                entry.name
+            ));
+        }
+
         let before = local_stamp(&local);
 
-        Ok(EditRequest {
+        Ok(EditPlan::Edit(EditRequest {
             command: with_path(&program, &local),
             local,
             origin: Some(EditOrigin {
@@ -3462,7 +3535,7 @@ impl App {
                 scratch,
             }),
             before,
-        })
+        }))
     }
 
     /// What to run, from `[editor] command` or the environment.
@@ -3931,6 +4004,40 @@ fn local_stamp(path: &Path) -> (u64, Option<DateTime<Utc>>) {
     match fs::metadata(path) {
         Ok(meta) => (meta.len(), meta.modified().ok().map(DateTime::from)),
         Err(_) => (0, None),
+    }
+}
+
+/// Whether `path` looks like text, by the rule `git` uses.
+///
+/// A NUL byte anywhere in the first 8000 bytes means binary. It is a
+/// heuristic and is named as one, but it is the same heuristic `git diff`
+/// decides to print `Binary files differ` with, so a file lazysync calls
+/// binary is one most of the toolchain already agrees about.
+///
+/// Deliberately not an extension list: that is a thing to keep up to date
+/// for ever, it is wrong about a `.log` full of protobuf, and it is wrong
+/// again about a shell script with no extension at all.
+///
+/// Two edges worth knowing. An **empty file is text** -- there is no NUL in
+/// nothing, and the file you just made with `a` should open in the editor.
+/// **UTF-16 reads as binary**, because it is full of NULs; so does a file
+/// whose first 8000 bytes are clean but which turns binary later. Both are
+/// the cost of looking at a prefix, which is what makes this cheap enough
+/// to do on every keypress.
+///
+/// Unreadable counts as text, so the editor is what reports the problem.
+/// Refusing here would mean two different messages for one broken file.
+fn looks_like_text(path: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = fs::File::open(path) else {
+        return true;
+    };
+
+    let mut head = [0u8; 8000];
+    match file.read(&mut head) {
+        Ok(read) => !head[..read].contains(&0),
+        Err(_) => true,
     }
 }
 

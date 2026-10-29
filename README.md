@@ -412,7 +412,20 @@ locally, and written back.
 [editor]
 command = []            # empty = $VISUAL, then $EDITOR
 max_bytes = 10485760    # refuse anything larger; 0 disables
+text_only = true        # a binary goes to the desktop handler instead
 ```
+
+**A file that is not text is handed to the desktop**, not to your editor —
+so `e` on a JPEG opens your image viewer rather than a screenful of binary
+you might save back mangled. "Not text" means a NUL byte in the first 8000
+bytes, which is the rule `git` uses; not an extension list, which would be
+wrong about a `.log` full of protobuf and about a shell script with no
+extension at all. Set `text_only = false` if your editor is one you *want*
+binaries in.
+
+That routing is local-only. A **remote** binary says so and stops, because
+sending it to the desktop means leaving the fetched copy behind for a viewer
+that outlives lazysync's cleanup. Pull it first, then `gx`.
 
 - **A local file is edited in place.** Copying it to scratch and back would
   turn an edit into a replace, and inodes, hard links and anything watching

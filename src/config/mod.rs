@@ -304,6 +304,22 @@ pub struct Editor {
     /// cannot open it either -- so the refusal happens before the transfer
     /// rather than after.
     pub max_bytes: u64,
+
+    /// Send a file that is not text to the desktop handler instead.
+    ///
+    /// On by default, because the failure it prevents is loud and the one it
+    /// causes is not: a JPEG opened in a text editor is a screenful of
+    /// binary and a real chance of saving it back mangled, where a JPEG sent
+    /// to the image viewer is what anybody meant.
+    ///
+    /// Turn it **off** if your editor is one you want binaries in -- a hex
+    /// editor is the obvious case, and this would otherwise make it
+    /// unreachable from the key that is supposed to run it.
+    ///
+    /// Only reachable for a *local* file. A remote one has no desktop
+    /// handler to go to without leaving a copy somewhere nothing owns; see
+    /// `App::prepare_edit`.
+    pub text_only: bool,
 }
 
 impl Default for Editor {
@@ -313,6 +329,7 @@ impl Default for Editor {
             // Ten megabytes: far past any source file, far short of the
             // archives and dumps that share a directory with them.
             max_bytes: 10 * 1024 * 1024,
+            text_only: true,
         }
     }
 }

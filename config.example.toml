@@ -100,6 +100,23 @@ command = []
 # either. The refusal happens before the transfer rather than after.
 max_bytes = 10485760   # 10 MiB
 
+# Send a file that is not text to the desktop handler instead of the editor.
+#
+# "Not text" is a NUL byte in the first 8000 bytes, which is the rule `git`
+# uses to decide a file is binary -- not an extension list, which would be a
+# thing to maintain for ever and would still be wrong about a .log full of
+# protobuf and a shell script with no extension at all.
+#
+# On by default because the failure it prevents is loud: a JPEG opened in a
+# text editor is a screenful of binary and a real chance of saving it back
+# mangled. Set it false if your editor is one you *want* binaries in -- a hex
+# editor would otherwise be unreachable from the key meant to run it.
+#
+# Local files only. A remote one has no desktop handler to be sent to without
+# leaving a copy in a temp directory for a viewer that outlives lazysync's
+# cleanup, so a remote binary says so instead.
+text_only = true
+
 # ─── Synchronized browsing ───────────────────────────────────────────────────
 
 [sync_browse]
