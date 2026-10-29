@@ -827,6 +827,7 @@ fn a_bisync_over_sftp_moves_both_ways_and_then_settles() {
                 snapshot,
                 &config,
                 &Default::default(),
+                &mut lazysync::sync::progress::Silent,
             )
         };
 

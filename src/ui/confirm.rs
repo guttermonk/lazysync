@@ -122,6 +122,7 @@ pub fn draw(
     cursor: usize,
     folded: &[Section],
     area: Rect,
+    hits: &mut super::HitMap,
 ) {
     let palette = &app.palette;
     let policy = DeletePolicy::from_config(&app.config.safety);
@@ -147,6 +148,14 @@ pub fn draw(
     let inner = block.inner(body);
     frame.render_widget(block, body);
 
+    // How to open a folded section, named from the live keymap. This said
+    // `zo` as a literal, which is wrong for anybody who rebound it -- the one
+    // mistake `super::hint` exists to prevent, sitting on a heading that is
+    // otherwise the only thing telling you the section can be opened at all.
+    let unfold = hint::key_for(app.keymaps.get(Mode::Confirm), KeyAction::UnfoldSection)
+        .map(|key| format!("{key} to open"))
+        .unwrap_or_default();
+
     let list = entries(plan, folded);
     let rows: Vec<TableRow<'_>> = list
         .iter()
@@ -155,7 +164,7 @@ pub fn draw(
                 section,
                 count,
                 folded,
-            } => heading_row(*section, *count, *folded, palette),
+            } => heading_row(*section, *count, *folded, &unfold, palette),
             Entry::Row { row, .. } => plan_row(row, palette, inner.width),
         })
         .collect();
@@ -178,6 +187,10 @@ pub fn draw(
     let mut state =
         TableState::default().with_selected(Some(cursor.min(list.len().saturating_sub(1))));
     frame.render_stateful_widget(table, inner, &mut state);
+
+    // Headings and rows alike: both are entries of the same flattened list,
+    // which is what the cursor moves over and what a click selects.
+    hits.rows(inner, state.offset(), list.len(), super::Target::PlanEntry);
 
     draw_footer(frame, app, plan, palette, footer);
 }
@@ -263,6 +276,7 @@ fn heading_row<'a>(
     section: Section,
     count: usize,
     folded: bool,
+    unfold: &str,
     palette: &Palette,
 ) -> TableRow<'a> {
     let color = match section {
@@ -286,7 +300,11 @@ fn heading_row<'a>(
         Cell::from(""),
         Cell::from(""),
         Cell::from(Line::from(Span::styled(
-            if folded { "zo to open" } else { "" },
+            if folded {
+                unfold.to_string()
+            } else {
+                String::new()
+            },
             Style::default().fg(palette.dim),
         ))),
     ])

@@ -73,6 +73,28 @@ impl Keymap {
         }
     }
 
+    /// Every binding that continues `prefix`, in binding order.
+    ///
+    /// What a chord in progress could still become: after `s`, this is
+    /// `sp push`, `sl pull`, and the rest. The resolver already knows a
+    /// longer combo exists -- that is what [`Resolution::Pending`] means --
+    /// and this is the same question asked for the user's benefit rather
+    /// than the dispatcher's.
+    ///
+    /// An empty prefix returns nothing. Every binding in the mode continues
+    /// "no keys pressed", and listing all of them is what `?` is for.
+    pub fn completions(&self, prefix: &[ModifiedKey]) -> Vec<(Action, &KeyCombo)> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+
+        self.0
+            .iter()
+            .filter(|(_, combo)| combo.len() > prefix.len() && combo.starts_with(prefix))
+            .map(|(action, combo)| (*action, combo))
+            .collect()
+    }
+
     /// Every combo bound to `action`, for the help overlay.
     pub fn combos_for(&self, action: Action) -> Vec<&KeyCombo> {
         self.0
@@ -315,6 +337,65 @@ mod tests {
                 .map(|(action, keys)| (*action, combo(keys)))
                 .collect(),
         )
+    }
+
+    /// What the which-key bar asks: having pressed `s`, what comes next?
+    #[test]
+    fn completions_list_what_a_chord_could_still_become() {
+        let keymap = map(&[
+            (Action::SyncPush, &['s', 'p']),
+            (Action::SyncPull, &['s', 'l']),
+            (Action::MoveDown, &['j']),
+        ]);
+
+        let offered: Vec<Action> = keymap
+            .completions(&[key('s')])
+            .into_iter()
+            .map(|(action, _)| action)
+            .collect();
+
+        assert_eq!(
+            offered,
+            vec![Action::SyncPush, Action::SyncPull],
+            "binding order, and nothing that does not continue `s`"
+        );
+    }
+
+    /// Every binding continues "nothing pressed yet". Listing them all is
+    /// what the help overlay is for, so an empty prefix offers nothing.
+    #[test]
+    fn an_empty_prefix_offers_nothing() {
+        let keymap = map(&[(Action::SyncPush, &['s', 'p'])]);
+        assert!(keymap.completions(&[]).is_empty());
+    }
+
+    /// A combo is its own prefix, and a binding is not a completion of
+    /// itself -- otherwise `gg` would offer `gg`.
+    #[test]
+    fn a_complete_binding_is_not_a_completion_of_itself() {
+        let keymap = map(&[(Action::MoveTop, &['g', 'g'])]);
+        assert!(keymap.completions(&[key('g'), key('g')]).is_empty());
+        assert_eq!(keymap.completions(&[key('g')]).len(), 1);
+    }
+
+    /// The real keymap, which is what the bar renders: `s` is the prefix the
+    /// sync chords hide behind, and it is the one nobody guesses.
+    #[test]
+    fn the_default_browser_map_offers_the_sync_chords_under_s() {
+        let keymap = crate::keys::defaults::for_mode(Mode::Browser);
+
+        let offered: Vec<Action> = keymap
+            .completions(&[key('s')])
+            .into_iter()
+            .map(|(action, _)| action)
+            .collect();
+
+        for expected in [Action::SyncPush, Action::SyncPull, Action::SyncMirror] {
+            assert!(
+                offered.contains(&expected),
+                "{expected} missing: {offered:?}"
+            );
+        }
     }
 
     #[test]

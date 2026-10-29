@@ -17,6 +17,7 @@ use crate::{
     app::{App, Screen, StatusKind},
     browser::sync_browse,
     config::Palette,
+    keys::KeyCombo,
 };
 
 /// How a message is drawn, given what kind it is.
@@ -44,6 +45,51 @@ fn message_style(kind: StatusKind, palette: &Palette) -> Style {
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    draw_line(frame, app, area);
+
+    // Last, over whatever the line ended with: a chord in progress is the
+    // most perishable thing on screen and the one the user is waiting on.
+    draw_pending(frame, app, area);
+}
+
+/// The chord in progress, in the bottom-right corner the way vim's `showcmd`
+/// sits there.
+///
+/// This is the whole answer to "did that keypress land". The first key of a
+/// chord is bound to nothing on its own, so without this, pressing `s` and
+/// then thinking for a moment is indistinguishable from pressing a key the
+/// terminal swallowed -- and the next thing you find out is whether you
+/// guessed the second key right.
+fn draw_pending(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if app.pending_keys.is_empty() {
+        return;
+    }
+
+    // Spelled by `KeyCombo`, so the echo of what you pressed matches the way
+    // every hint and `lazysync keys` writes the same chord.
+    let text = format!(" {} ", KeyCombo::chord(app.pending_keys.iter().copied()));
+    let width = text.chars().count() as u16;
+    if width > area.width {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(app.palette.accent)
+                .bg(app.palette.status_bg)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        Rect {
+            x: area.x + area.width - width,
+            width,
+            ..area
+        },
+    );
+}
+
+fn draw_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let palette = &app.palette;
     let mut spans = Vec::new();
 
@@ -139,9 +185,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     if !app.status.is_empty() {
+        // Styled by kind, like the other branch. It was plain `palette.fg`
+        // here, which is the browser -- the one screen where the reported bug
+        // actually happens. `sp` on two identical trees answers "nothing to
+        // push", and an answer rendered in the same colour as the badges and
+        // counters either side of it reads as part of the furniture rather
+        // than as a reply to the key just pressed.
         spans.push(Span::styled(
             format!(" {} ", app.status),
-            Style::default().fg(palette.fg),
+            message_style(app.status_kind, palette),
         ));
     }
 
@@ -150,4 +202,95 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .style(Style::default().fg(palette.status_fg).bg(palette.status_bg)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use crate::{
+        app::{App, StatusKind},
+        config::Config,
+        keys::{Key, ModifiedKey},
+    };
+
+    fn app() -> App {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_path_buf();
+        App::new(Config::default(), here.clone(), here).unwrap()
+    }
+
+    /// The status line as drawn, plus the style of the cell at `column`.
+    fn line(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        terminal
+            .draw(|frame| super::draw(frame, app, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect()
+    }
+
+    /// The whole point: `s` on its own is bound to nothing, so without the
+    /// echo, pressing it produced no evidence anywhere on screen.
+    #[test]
+    fn a_chord_in_progress_is_echoed() {
+        let mut app = app();
+        app.pending_keys = vec![ModifiedKey::plain(Key::Char('s'))];
+
+        let drawn = line(&mut app);
+        assert!(drawn.trim_end().ends_with('s'), "{drawn:?}");
+    }
+
+    #[test]
+    fn a_two_key_chord_is_echoed_as_the_sequence_it_is() {
+        let mut app = app();
+        app.pending_keys = vec![
+            ModifiedKey::plain(Key::Char('g')),
+            ModifiedKey::plain(Key::Char('g')),
+        ];
+
+        assert!(line(&mut app).contains("gg"));
+    }
+
+    #[test]
+    fn nothing_pending_means_nothing_in_the_corner() {
+        let mut app = app();
+        app.status.clear();
+
+        let drawn = line(&mut app);
+        assert!(
+            drawn.trim_end().chars().last().unwrap_or(' ').is_numeric(),
+            "the line should end in the cursor counter: {drawn:?}"
+        );
+    }
+
+    /// The bug `message_style` was written for, in the screen it was reported
+    /// on: the browser branch rendered every message in `palette.fg`, so an
+    /// answer to a keypress looked like one more badge on a line of badges.
+    #[test]
+    fn a_browser_message_is_styled_by_its_kind() {
+        let mut app = app();
+        app.status = "nothing to push".into();
+        app.status_kind = StatusKind::Answer;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        terminal
+            .draw(|frame| super::draw(frame, &app, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let column = (0..buffer.area.width)
+            .find(|x| buffer[(*x, 0)].symbol() == "n")
+            .expect("the message is on the line");
+        let cell = &buffer[(column, 0)];
+
+        assert_eq!(
+            cell.fg, app.palette.accent,
+            "an answer has to read as a reply, not as furniture"
+        );
+        assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+    }
 }

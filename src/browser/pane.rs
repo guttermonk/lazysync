@@ -260,6 +260,14 @@ impl Pane {
         self.cursor = self.cursor.saturating_add_signed(delta).min(last);
     }
 
+    /// Put the cursor on a particular entry, clamped to what is there.
+    ///
+    /// The absolute form of [`Self::move_cursor`], for a click: the mouse
+    /// names the row it landed on rather than a distance from the last one.
+    pub fn set_cursor(&mut self, index: usize) {
+        self.cursor = index.min(self.view.len().saturating_sub(1));
+    }
+
     pub fn cursor_to_top(&mut self) {
         self.cursor = 0;
     }

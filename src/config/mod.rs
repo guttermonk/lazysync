@@ -40,8 +40,21 @@ pub struct Config {
     /// Compute recursive directory sizes. Off by default because it costs one
     /// listing per subdirectory, which over SFTP is slow enough to feel.
     pub dir_sizes: bool,
-    /// How long a chord waits for its next key, in milliseconds.
+    /// How long a chord waits before falling back to its shorter binding,
+    /// in milliseconds.
+    ///
+    /// Only consulted where there *is* a shorter binding -- `d` bound
+    /// alongside `dd`. A chord with nothing to fall back on waits as long as
+    /// you do; see `event::Dispatcher::poll_timeout`.
     pub chord_timeout_ms: u64,
+
+    /// Report mouse clicks and the wheel to lazysync.
+    ///
+    /// On by default, and worth knowing what it costs: while lazysync is
+    /// running, the terminal hands it the mouse, so dragging to select text
+    /// selects nothing. Most terminals keep their own selection on
+    /// shift+drag; turning this off gets it back unconditionally.
+    pub mouse: bool,
 
     pub sync_browse: SyncBrowse,
     pub zide: Zide,
@@ -67,6 +80,7 @@ impl Default for Config {
             dirs_first: true,
             dir_sizes: false,
             chord_timeout_ms: 500,
+            mouse: true,
             sync_browse: SyncBrowse::default(),
             zide: Zide::default(),
             compare: Compare::default(),
@@ -269,6 +283,24 @@ pub enum OnMissing {
 pub struct Zide {
     pub auto_open_bookmark: bool,
     pub r#match: ZideMatch,
+
+    /// What to run for [`crate::keys::Action::Hide`]: the command that puts
+    /// the popup away and leaves lazysync running behind it.
+    ///
+    /// A list rather than a string, because a string would need a shell to
+    /// split it and lazysync does not have one to offer. `["zellij",
+    /// "action", "hide-floating-panes"]` is the zellij pairing; a different
+    /// multiplexer gets its own line, and nothing is detected or guessed.
+    ///
+    /// Empty by default, which is the honest default: the only program that
+    /// can hide this window is the one that opened it, and lazysync does not
+    /// know what that was. Pressing `Hide` with this empty says so rather
+    /// than doing nothing.
+    ///
+    /// It is waited for, and its output is captured rather than printed --
+    /// anything written to the terminal would land on top of the TUI. So it
+    /// has to be a command that returns promptly; `zellij action` does.
+    pub hide_command: Vec<String>,
 }
 
 impl Default for Zide {
@@ -276,6 +308,7 @@ impl Default for Zide {
         Self {
             auto_open_bookmark: true,
             r#match: ZideMatch::Ancestor,
+            hide_command: Vec::new(),
         }
     }
 }
@@ -531,6 +564,7 @@ mod tests {
             defaults.sync_browse.on_missing
         );
         assert_eq!(parsed.zide.r#match, defaults.zide.r#match);
+        assert_eq!(parsed.zide.hide_command, defaults.zide.hide_command);
         assert_eq!(parsed.compare.method, defaults.compare.method);
         assert_eq!(
             parsed.compare.mtime_tolerance_secs,
@@ -544,6 +578,36 @@ mod tests {
             parsed.transfer.partial_suffix,
             defaults.transfer.partial_suffix
         );
+    }
+
+    /// Empty is the default and it means "nothing can hide this window",
+    /// which the `Hide` action reports rather than acting on. A default that
+    /// guessed at zellij would run a command nobody asked for on every
+    /// machine where the guess was wrong.
+    #[test]
+    fn there_is_no_default_hide_command() {
+        assert!(Config::default().zide.hide_command.is_empty());
+    }
+
+    /// A list of words, because the alternative is lazysync splitting a
+    /// string the way a shell would and getting quoting wrong for free.
+    #[test]
+    fn a_hide_command_is_a_program_and_its_arguments() {
+        let parsed: Config = toml::from_str(
+            r#"
+[zide]
+hide_command = ["zellij", "action", "hide-floating-panes"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.zide.hide_command,
+            ["zellij", "action", "hide-floating-panes"]
+        );
+        // The rest of the section keeps its defaults rather than being
+        // zeroed by the one field that was named.
+        assert!(parsed.zide.auto_open_bookmark);
     }
 
     /// `lazysync config` exists so you can paste its output into

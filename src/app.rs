@@ -17,18 +17,20 @@ use crate::{
     },
     config::{Config, Executor, Palette, PaneSide, SyncMode, Watch},
     connection::{Protocol, Secret},
-    keys::{Action, Keymaps, Mode},
+    integrations::zide,
+    keys::{Action, Keymaps, Mode, ModifiedKey},
     sync::{
         audit, bisync, delegate, diff,
         executor::{Outcome, Report},
         filters::Filters,
         plan::{Action as PlanAction, Plan, Resolution, Section, Side as PlanSide},
+        progress,
         safety::{self, DeletePolicy},
         state::{Record, Snapshot},
         transfer::{Settings as TransferSettings, State as TransferState, Transfer},
         watch,
     },
-    ui::{confirm, form::ConnectionForm},
+    ui::{confirm, form::ConnectionForm, hint, HitMap, Target},
     vfs::{ftp, hostkey::HostKey, rclone, ssh, LocalFs, Vfs},
 };
 
@@ -93,6 +95,43 @@ pub struct Question {
     pub text: String,
     pub on_yes: Pending,
     pub on_no: Pending,
+    /// Which button is selected. Always starts on [`Answer::No`].
+    pub answer: Answer,
+}
+
+impl Question {
+    /// Ask, selecting "no".
+    ///
+    /// The selection is not a parameter. Every question lazysync asks guards
+    /// something that cannot be undone from the dialog -- closing a
+    /// connection, deleting a bookmark, applying a plan -- so the answer the
+    /// window opens on is the one that does the least, and a caller cannot
+    /// decide otherwise.
+    pub fn new(text: impl Into<String>, on_yes: Pending, on_no: Pending) -> Self {
+        Self {
+            text: text.into(),
+            on_yes,
+            on_no,
+            answer: Answer::No,
+        }
+    }
+}
+
+/// Which button of a [`Question`] is selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Yes,
+    No,
+}
+
+impl Answer {
+    /// The other one. Two buttons, so "next" and "previous" are the same move.
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Yes => Self::No,
+            Self::No => Self::Yes,
+        }
+    }
 }
 
 /// Work deferred until the user answers.
@@ -222,6 +261,29 @@ pub struct App {
     /// documentation for the headless path.
     pub active_profile: Option<String>,
 
+    /// Where everything was on the last frame, so a click can be matched to
+    /// what the user was pointing at. Written by `ui::draw`, read by the
+    /// event loop, and rebuilt from nothing every frame.
+    pub hits: HitMap,
+
+    /// Where a tree walk reports to while it is running.
+    ///
+    /// [`progress::Silent`] unless something installs a real one: the event
+    /// loop does, with a sink that animates a spinner and watches for the
+    /// cancel key. Keeping it here rather than passing it down through
+    /// `handle` means `App` never learns what a terminal is, and every
+    /// headless path keeps the default that reports nothing.
+    pub progress: Box<dyn progress::Progress>,
+
+    /// The chord in progress: the keys pressed that have not yet resolved.
+    ///
+    /// Mirrored here from `event::Dispatcher` after every press, because
+    /// widgets draw from `App` and never from the dispatcher. Without it the
+    /// first key of a chord produced no evidence on screen at all -- `s` is
+    /// bound to nothing on its own, so pressing it looked exactly like a key
+    /// that had not arrived.
+    pub pending_keys: Vec<ModifiedKey>,
+
     /// Which bookmark a password prompt or host key dialog belongs to.
     connecting: Option<Bookmark>,
     /// A host key awaiting approval, kept so that accepting it can record the
@@ -289,6 +351,9 @@ impl App {
             last_report: None,
             transfer: None,
             active_profile: None,
+            hits: HitMap::default(),
+            progress: Box::new(progress::Silent),
+            pending_keys: Vec::new(),
             connecting: None,
             host_key: None,
             palette,
@@ -318,9 +383,12 @@ impl App {
         match &self.overlay {
             Overlay::Help { .. } => return Mode::Help,
             Overlay::Prompt(_) => return Mode::Prompt,
-            // A yes/no question reuses the confirm keymap, so `y`/`n` mean the
-            // same thing here as they will in the sync confirmation window.
-            Overlay::Question(_) => return Mode::Confirm,
+            // The dialog has its own keymap rather than the confirmation
+            // window's. Sharing one meant a layout that moved `n` onto a
+            // motion -- which is what Colemak does -- silently took the
+            // answer "no" with it, leaving a dialog whose own footer named a
+            // key that did nothing.
+            Overlay::Question(_) => return Mode::Question,
             Overlay::None => {}
         }
 
@@ -367,12 +435,76 @@ impl App {
 
     // ── Dispatch ─────────────────────────────────────────────────────────
 
+    /// Say that a blocking action has started, if this is one of them.
+    ///
+    /// Returns whether anything was announced, which is the event loop's cue
+    /// to draw a frame *before* dispatching.
+    ///
+    /// The need is structural: planning a sync walks both trees inside a
+    /// single call -- one round trip per directory over SFTP -- and the loop
+    /// cannot draw while that runs. `begin_sync` has always set "planning
+    /// push...", and nobody has ever seen it: the next frame is drawn after
+    /// the work it describes has finished, which is exactly when it stops
+    /// being news. Meanwhile the terminal sits there not redrawing and not
+    /// answering keys, which reads as a crash rather than as work.
+    ///
+    /// This is a stopgap and should be read as one. The real fix is a planner
+    /// that yields the way [`Self::step_transfer`] does, at which point there
+    /// is a spinner, a running count, and an Esc that works. Until then, this
+    /// is the difference between a slow program and a frozen one.
+    pub fn announce_work(&mut self, action: Action) -> bool {
+        let Some(message) = self.working_on(action) else {
+            return false;
+        };
+
+        self.status = message;
+        self.status_kind = StatusKind::Answer;
+        true
+    }
+
+    /// What to say before `action` blocks, or `None` if it does not.
+    fn working_on(&self, action: Action) -> Option<String> {
+        match (self.mode(), action) {
+            (
+                Mode::Browser,
+                Action::SyncPush
+                | Action::SyncPull
+                | Action::SyncMirror
+                | Action::SyncProfile
+                | Action::SyncBisync,
+            ) => Some(format!("planning {}...", action.label())),
+
+            // Both open the selected connection -- see `handle_bookmarks`.
+            // Named, because "opening..." on a list of connections leaves the
+            // one question worth answering unanswered.
+            (Mode::Bookmarks, Action::OpenItem | Action::EnterDir) => {
+                Some(format!("opening {}...", self.selected_bookmark()?.name))
+            }
+
+            // Two listings, which on a remote with a large directory is its
+            // own noticeable pause.
+            (Mode::Browser, Action::Refresh) => Some("reloading...".into()),
+
+            _ => None,
+        }
+    }
+
     /// Apply an action in the current mode.
     pub fn handle(&mut self, action: Action) {
         // Every action starts from "ambient". A handler that wants its
         // message to stand out says so while setting it; one that does not
         // cannot inherit the last action's emphasis.
         self.status_kind = StatusKind::Note;
+
+        // Hiding is about the window rather than about what is in it, so it
+        // is answered here instead of nine times over. Bound in one mode or
+        // in all of them, it means the same thing and does the same thing --
+        // which is also why it is safe above the dispatch: no screen has a
+        // competing reading of "put this away".
+        if action == Action::Hide {
+            self.hide_window();
+            return;
+        }
 
         match self.mode() {
             Mode::Bookmarks => self.handle_bookmarks(action),
@@ -381,8 +513,32 @@ impl App {
             Mode::Help => self.handle_help(action),
             Mode::Prompt => self.handle_prompt(action),
             Mode::Confirm => self.handle_confirm(action),
+            Mode::Question => self.handle_question(action),
             Mode::Queue => self.handle_queue(action),
             Mode::Log => self.handle_log(action),
+        }
+    }
+
+    /// Ask whatever is hosting the popup to stop showing it.
+    ///
+    /// Nothing here closes or forgets anything, and that is the feature: a
+    /// hidden lazysync is a running one, so the connection, the marks, the
+    /// cursor and a transfer in flight are all where you left them when the
+    /// pane comes back. Quitting is the other key.
+    ///
+    /// A failure is reported as a `Problem` and left on the status line
+    /// rather than announced, because of *when* it will be read. If the
+    /// command worked, nobody is looking at this screen; if it did not, the
+    /// line is still there whenever the user next glances at a window that
+    /// did not go away, and by then the keystroke is the only thing it can
+    /// be explaining.
+    fn hide_window(&mut self) {
+        match zide::hide(&self.config.zide.hide_command) {
+            Ok(()) => self.status.clear(),
+            Err(why) => {
+                self.status = why;
+                self.status_kind = StatusKind::Problem;
+            }
         }
     }
 
@@ -437,6 +593,159 @@ impl App {
 
         if let Some(form) = &mut self.form {
             form.backspace();
+        }
+    }
+
+    // ── Mouse ────────────────────────────────────────────────────────────
+
+    /// A click on something the last frame drew.
+    ///
+    /// One click selects; a second one on the same thing acts. The split is
+    /// what every file manager does, and here it earns its keep twice over:
+    /// the confirmation window is a screen where a stray click that acted
+    /// could exclude a row from a sync without anybody noticing, and the
+    /// browser is one where it could walk into a remote directory and spend
+    /// a listing on it.
+    ///
+    /// The selection is applied here; the *action* a double click asks for is
+    /// returned rather than run, so that it goes through the event loop's
+    /// dispatch like a keypress does. That is not ceremony: opening a
+    /// connection blocks for seconds, and the loop is where the frame saying
+    /// so gets drawn.
+    ///
+    /// What is returned is deliberately an *existing* action rather than new
+    /// behaviour, so the mouse can never do something the keyboard cannot.
+    #[must_use = "a double click asks for an action; dropping it makes it a single click"]
+    pub fn handle_click(&mut self, target: Target, double: bool) -> Option<Action> {
+        self.status_kind = StatusKind::Note;
+
+        match target {
+            // The help overlay has nothing to select, and a shield exists
+            // precisely so that the click stops here.
+            Target::Blocked | Target::Help => None,
+
+            Target::Pane { pane, row } => {
+                if self.screen != Screen::Browser {
+                    return None;
+                }
+
+                // Clicking into a pane focuses it, which is the half of this
+                // that matters most: it is `tab` without aiming for the key.
+                if self.focus != pane {
+                    self.focus = pane;
+                    self.status.clear();
+                }
+
+                let row = row?;
+
+                if self.union_view {
+                    self.union_cursor = row.min(self.row_count().saturating_sub(1));
+                } else {
+                    self.panes[pane].set_cursor(row);
+                }
+
+                double.then_some(Action::EnterDir)
+            }
+
+            Target::Bookmark(index) => {
+                self.bookmark_cursor = index;
+                self.clamp_bookmark_cursor();
+                double.then_some(Action::OpenItem)
+            }
+
+            Target::Field(index) => {
+                let form = self.form.as_mut()?;
+                let field = form.fields.get(index)?;
+                // A dimmed field is not reachable by keyboard either -- the
+                // auth method it belongs to is not the one selected -- so a
+                // click must not be the one way to land on it.
+                if !form.is_relevant(field.id) {
+                    return None;
+                }
+                form.cursor = index;
+
+                // Cycling a choice is what "opening" a form row means. On a
+                // text field this is a no-op, which is right: double-clicking
+                // a name should not rewrite it.
+                double.then_some(Action::NextChoice)
+            }
+
+            Target::PlanEntry(index) => {
+                self.plan_cursor = index;
+                // `ToggleRow` already means "fold" on a heading and "include
+                // or exclude" on a row, so the mouse inherits both without a
+                // second rule about which is which.
+                double.then_some(Action::ToggleRow)
+            }
+
+            Target::LogEntry(index) => {
+                self.log_cursor = index.min(self.audit_entries.len().saturating_sub(1));
+                None
+            }
+
+            Target::Answer(answer) => {
+                let Overlay::Question(question) = &mut self.overlay else {
+                    return None;
+                };
+                question.answer = answer;
+                // Two clicks to confirm, same as everywhere else. On this
+                // dialog in particular -- it only ever guards something that
+                // cannot be taken back -- that is a feature.
+                double.then_some(Action::Submit)
+            }
+        }
+    }
+
+    /// The wheel, over whatever is under the pointer.
+    ///
+    /// It never changes focus: looking at the other pane should not take you
+    /// out of the one you are working in, and a wheel is easy to nudge.
+    pub fn handle_scroll(&mut self, target: Target, down: bool) {
+        /// Lines per notch. Three is the usual compromise: one feels broken,
+        /// a page loses your place.
+        const LINES: isize = 3;
+
+        let delta = if down { LINES } else { -LINES };
+
+        match target {
+            Target::Blocked | Target::Answer(_) => {}
+
+            Target::Pane { pane, .. } => {
+                if self.union_view {
+                    // One shared cursor, so which pane it was over makes no
+                    // difference.
+                    self.move_cursor(delta);
+                } else {
+                    self.panes[pane].move_cursor(delta);
+                }
+            }
+
+            Target::Bookmark(_) => self.move_bookmark_cursor(delta),
+
+            Target::Field(_) => {
+                if let Some(form) = &mut self.form {
+                    form.move_cursor(delta);
+                }
+            }
+
+            Target::PlanEntry(_) => {
+                let Some(plan) = &self.plan else { return };
+                let last = confirm::entries(plan, &self.folded).len().saturating_sub(1);
+                self.plan_cursor = self.plan_cursor.saturating_add_signed(delta).min(last);
+            }
+
+            Target::LogEntry(_) => {
+                let last = self.audit_entries.len().saturating_sub(1);
+                self.log_cursor = self.log_cursor.saturating_add_signed(delta).min(last);
+            }
+
+            Target::Help => {
+                if let Overlay::Help { scroll } = &mut self.overlay {
+                    // No upper clamp here: only the renderer knows how long
+                    // the help turned out to be, and it clamps there.
+                    *scroll = scroll.saturating_add_signed(delta);
+                }
+            }
         }
     }
 
@@ -508,11 +817,11 @@ impl App {
                 }
                 Some(bookmark) => {
                     let name = bookmark.name.clone();
-                    self.overlay = Overlay::Question(Question {
-                        text: format!("Delete the connection {name:?}?"),
-                        on_yes: Pending::DeleteBookmark { name },
-                        on_no: Pending::Nothing,
-                    });
+                    self.overlay = Overlay::Question(Question::new(
+                        format!("Delete the connection {name:?}?"),
+                        Pending::DeleteBookmark { name },
+                        Pending::Nothing,
+                    ));
                 }
                 None => self.status = "nothing to delete".into(),
             },
@@ -627,14 +936,14 @@ impl App {
             }) => {
                 self.connecting = Some(bookmark.clone());
                 self.host_key = Some(key);
-                self.overlay = Overlay::Question(Question {
-                    text: format!(
+                self.overlay = Overlay::Question(Question::new(
+                    format!(
                         "{host_port} is not in known_hosts. Fingerprint {fingerprint}. \
                          Check it against the server before trusting it. Trust and continue?"
                     ),
-                    on_yes: Pending::TrustHostKey,
-                    on_no: Pending::Nothing,
-                });
+                    Pending::TrustHostKey,
+                    Pending::Nothing,
+                ));
             }
             Ok(ssh::Precheck::Changed {
                 fingerprint,
@@ -1003,11 +1312,11 @@ impl App {
             // sits next to nothing destructive, so it is easy to hit.
             Action::ShowConnections => match self.open_connection_label() {
                 Some(where_to) => {
-                    self.overlay = Overlay::Question(Question {
-                        text: format!("Close the connection to {where_to}?"),
-                        on_yes: Pending::LeaveConnection,
-                        on_no: Pending::Nothing,
-                    });
+                    self.overlay = Overlay::Question(Question::new(
+                        format!("Close the connection to {where_to}?"),
+                        Pending::LeaveConnection,
+                        Pending::Nothing,
+                    ));
                 }
                 // Two local panes: nothing to close, so nothing to ask.
                 None => self.close_connection(),
@@ -1220,6 +1529,15 @@ impl App {
             (&mut second[0], &mut first[0])
         };
 
+        // Taken out for the duration rather than borrowed from `self`: the
+        // panes are already borrowed mutably just above, and the sink has to
+        // outlive that borrow to report from inside the walk.
+        let mut progress = std::mem::replace(
+            &mut self.progress,
+            Box::new(progress::Silent) as Box<dyn progress::Progress>,
+        );
+        progress.start(&format!("planning {}", mode.label()));
+
         let mut plan = diff::plan_with_filters(
             diff::Endpoint {
                 fs: source.vfs.as_mut(),
@@ -1235,7 +1553,20 @@ impl App {
             &self.config,
             &filters,
             scope.as_ref(),
+            progress.as_mut(),
         );
+
+        progress.finish();
+        self.progress = progress;
+
+        if plan.cancelled {
+            // Nothing was read that can be trusted as a whole, so nothing is
+            // shown. Said out loud, because a sync key that silently returned
+            // you to the browser would read as the key having failed.
+            self.status = format!("{} cancelled -- nothing was scanned", mode.label());
+            self.status_kind = StatusKind::Answer;
+            return;
+        }
 
         safety::check(&mut plan, &self.config.safety);
 
@@ -1290,6 +1621,12 @@ impl App {
 
         self.status = "planning bisync...".into();
 
+        let mut progress = std::mem::replace(
+            &mut self.progress,
+            Box::new(progress::Silent) as Box<dyn progress::Progress>,
+        );
+        progress.start("planning bisync");
+
         let (first, second) = self.panes.split_at_mut(1);
         let mut plan = bisync::plan(
             diff::Endpoint {
@@ -1305,7 +1642,19 @@ impl App {
             &snapshot,
             &self.config,
             &filters,
+            progress.as_mut(),
         );
+
+        progress.finish();
+        self.progress = progress;
+
+        if plan.cancelled {
+            // No snapshot is written either. A snapshot claims the two trees
+            // were examined and agreed; a cancelled scan examined part of one.
+            self.status = "bisync cancelled -- nothing was scanned".into();
+            self.status_kind = StatusKind::Answer;
+            return;
+        }
 
         safety::check(&mut plan, &self.config.safety);
 
@@ -1540,13 +1889,38 @@ impl App {
         Filters::parse(&patterns).map_err(|e| e.to_string())
     }
 
+    /// The browser keys bound to `actions`, as `sp or sl`.
+    ///
+    /// `None` when none of them is bound, so a message naming an alternative
+    /// drops the clause rather than pointing at a key that does nothing.
+    fn keys_for(&self, actions: &[Action]) -> Option<String> {
+        let keys: Vec<String> = actions
+            .iter()
+            .filter_map(|action| hint::key_for(self.keymaps.get(Mode::Browser), *action))
+            .collect();
+
+        match keys.as_slice() {
+            [] => None,
+            [only] => Some(only.clone()),
+            [rest @ .., last] => Some(format!("{} or {last}", rest.join(", "))),
+        }
+    }
+
     /// Plan using the active profile's own mode.
     ///
     /// The point of a profile is not having to remember which direction a
     /// given connection syncs in.
     pub fn begin_profile_sync(&mut self) {
         let Some(name) = self.active_profile.clone() else {
-            self.status = "this connection has no sync profile; use sp, sl or sm".into();
+            // Named from the keymap rather than spelled out: this message
+            // used to say "use sp, sl or sm", which is wrong for anybody who
+            // rebound them -- the same failure `ui::hint` exists to prevent.
+            let mut message =
+                String::from("this connection has no sync profile; set one in its editor");
+            if let Some(keys) = self.keys_for(&[Action::SyncPush, Action::SyncPull]) {
+                message.push_str(&format!(", or sync one way with {keys}"));
+            }
+            self.status = message;
             return;
         };
         let Some(profile) = self.config.profiles.get(&name) else {
@@ -1560,13 +1934,8 @@ impl App {
     }
 
     fn handle_confirm(&mut self, action: Action) {
-        // A yes/no question overlay also uses this keymap; it is handled
-        // separately and takes priority.
-        if matches!(self.overlay, Overlay::Question(_)) {
-            self.handle_question(action);
-            return;
-        }
-
+        // A yes/no question on top of this window is `Mode::Question` and is
+        // dispatched there, so nothing about it is handled here.
         let Some(plan) = &mut self.plan else {
             self.screen = Screen::Browser;
             return;
@@ -1694,14 +2063,14 @@ impl App {
                 _ => "both sides".to_string(),
             };
 
-            self.overlay = Overlay::Question(Question {
-                text: format!(
+            self.overlay = Overlay::Question(Question::new(
+                format!(
                     "Permanently delete {} file(s) on {where_}? This cannot be undone.",
                     totals.deletes,
                 ),
-                on_yes: Pending::ApplyPlan,
-                on_no: Pending::Nothing,
-            });
+                Pending::ApplyPlan,
+                Pending::Nothing,
+            ));
             return;
         }
 
@@ -1806,14 +2175,25 @@ impl App {
             return;
         }
 
+        // No profile and a profile that says `watch = "off"` are different
+        // situations with different fixes, and saying "this profile" when
+        // there is no profile sends somebody looking for a setting they have
+        // not written yet.
+        let Some(name) = self.active_profile.clone() else {
+            self.status = "watching needs a sync profile on this connection; set one in its \
+                           editor, with watch = \"batch\" or \"auto\""
+                .into();
+            return;
+        };
+
         let mode = self.watch_mode();
         if matches!(mode, Watch::Off) {
             // A profile that does not ask to be watched is not watched by a
             // keystroke either: `watch` is where the behaviour is declared,
             // and `auto` in particular applies without confirming.
-            self.status = "this profile has watch = \"off\"; set \"batch\" or \"auto\" to \
-                           use it"
-                .into();
+            self.status = format!(
+                "[profiles.{name}] has watch = \"off\"; set \"batch\" or \"auto\" to use it"
+            );
             return;
         }
 
@@ -1833,6 +2213,23 @@ impl App {
             }
             Err(e) => self.status = e,
         }
+    }
+
+    /// Whether this connection has a sync profile that exists in config.
+    ///
+    /// The two profile-driven commands are the only ones in the browser whose
+    /// availability depends on the *connection* rather than on what is bound,
+    /// so the key bar asks before advertising them -- a hint for a key that
+    /// can only produce an error message is worse than no hint.
+    pub fn profile_available(&self) -> bool {
+        self.active_profile
+            .as_ref()
+            .is_some_and(|name| self.config.profiles.contains_key(name))
+    }
+
+    /// Whether watching would start, or is already running.
+    pub fn watch_available(&self) -> bool {
+        self.watcher.is_some() || !matches!(self.watch_mode(), Watch::Off)
     }
 
     /// What the active profile says about watching.
@@ -2070,13 +2467,29 @@ impl App {
         }
     }
 
+    /// The yes/no dialog.
+    ///
+    /// Three ways to answer, which is deliberate: the selection plus Submit
+    /// for somebody reading the buttons, and a direct key per answer for
+    /// somebody who already knows what they are confirming. What none of them
+    /// is, is a bare Enter meaning yes -- the selection starts on "no", so the
+    /// reflex keystroke declines.
     fn handle_question(&mut self, action: Action) {
-        let Overlay::Question(question) = &self.overlay else {
+        let Overlay::Question(question) = &mut self.overlay else {
             return;
         };
 
         let pending = match action {
-            Action::Apply | Action::Submit => question.on_yes.clone(),
+            // Two buttons, so either direction is the same move.
+            Action::NextChoice | Action::PrevChoice => {
+                question.answer = question.answer.other();
+                return;
+            }
+            Action::Submit => match question.answer {
+                Answer::Yes => question.on_yes.clone(),
+                Answer::No => question.on_no.clone(),
+            },
+            Action::Apply => question.on_yes.clone(),
             Action::Cancel => question.on_no.clone(),
             _ => return,
         };
@@ -2326,17 +2739,17 @@ impl App {
                 self.status = "panes are out of step".into();
             }
             Followed::NeedsPermission(path) => {
-                self.overlay = Overlay::Question(Question {
-                    text: format!("{} does not exist here. Create it?", path.display()),
-                    on_yes: Pending::CreateDir {
+                self.overlay = Overlay::Question(Question::new(
+                    format!("{} does not exist here. Create it?", path.display()),
+                    Pending::CreateDir {
                         pane: follower,
                         path: path.clone(),
                     },
-                    on_no: Pending::GhostAt {
+                    Pending::GhostAt {
                         pane: follower,
                         path,
                     },
-                });
+                ));
             }
         }
     }

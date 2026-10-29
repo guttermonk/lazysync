@@ -36,6 +36,7 @@ use super::{
     diff::{Endpoint, MAX_DEPTH},
     filters::Filters,
     plan::{self, Plan, Row},
+    progress::{Flow, Progress, Step},
     state::{Record, Snapshot},
 };
 use crate::{
@@ -258,6 +259,7 @@ pub fn plan(
     snapshot: &Snapshot,
     config: &Config,
     filters: &Filters,
+    progress: &mut dyn Progress,
 ) -> Plan {
     let Endpoint {
         fs: local,
@@ -294,7 +296,7 @@ pub fn plan(
         to_local: caveat(remote.capabilities(), local.capabilities()),
     };
 
-    walk(
+    let flow = walk(
         &mut Sides {
             local,
             local_root,
@@ -310,8 +312,14 @@ pub fn plan(
         &policy,
         &caveats,
         first_run,
+        progress,
         &mut built,
     );
+
+    // Half a two-way plan is worse than half a one-way one: a row here can
+    // be a deletion justified by an absence, and an absence the walk never
+    // got to is not an absence. Marked, and thrown away by the caller.
+    built.cancelled = flow == Flow::Cancel;
 
     built.sort();
     built
@@ -389,14 +397,15 @@ fn walk(
     policy: &super::safety::DeletePolicy,
     caveats: &Caveats,
     first_run: bool,
+    progress: &mut dyn Progress,
     built: &mut Plan,
-) {
+) -> Flow {
     if depth > MAX_DEPTH {
         built.unreadable.push((
             relative.to_path_buf(),
             format!("stopped at {MAX_DEPTH} levels deep; a symlink loop?"),
         ));
-        return;
+        return Flow::Continue;
     }
 
     // Either side being unreadable stops this subtree. Unlike a one-way sync,
@@ -412,11 +421,15 @@ fn walk(
                 built
                     .unreadable
                     .push((relative.to_path_buf(), format!("{side}: {e}")));
-                return;
+                return Flow::Continue;
             }
         }
     }
     let [local_entries, remote_entries] = listings;
+
+    if progress.step(Step::Directory(relative)) == Flow::Cancel {
+        return Flow::Cancel;
+    }
 
     // The union of both sides' names, in a stable order. A name on one side
     // only is the interesting case in a two-way sync, which is why this is a
@@ -430,6 +443,10 @@ fn walk(
     names.dedup();
 
     for name in names {
+        if progress.step(Step::Entry) == Flow::Cancel {
+            return Flow::Cancel;
+        }
+
         let local = local_entries.iter().find(|e| e.name == name);
         let remote = remote_entries.iter().find(|e| e.name == name);
         let child = relative.join(name);
@@ -488,10 +505,13 @@ fn walk(
             // side that lacks it gets a `CreateDir` row, and the walk below
             // plans its contents.
             (Some(EntryKind::Dir), Some(EntryKind::Dir)) => {
-                recurse(
+                if recurse(
                     sides, &child, depth, comparator, snapshot, config, filters, policy, caveats,
-                    first_run, built,
-                );
+                    first_run, progress, built,
+                ) == Flow::Cancel
+                {
+                    return Flow::Cancel;
+                }
             }
             (Some(EntryKind::Dir), None) => {
                 let entry = local.expect("matched");
@@ -501,10 +521,13 @@ fn walk(
                     comparator.method(),
                     1,
                 ));
-                recurse(
+                if recurse(
                     sides, &child, depth, comparator, snapshot, config, filters, policy, caveats,
-                    first_run, built,
-                );
+                    first_run, progress, built,
+                ) == Flow::Cancel
+                {
+                    return Flow::Cancel;
+                }
             }
             (None, Some(EntryKind::Dir)) => {
                 let entry = remote.expect("matched");
@@ -514,10 +537,13 @@ fn walk(
                     comparator.method(),
                     0,
                 ));
-                recurse(
+                if recurse(
                     sides, &child, depth, comparator, snapshot, config, filters, policy, caveats,
-                    first_run, built,
-                );
+                    first_run, progress, built,
+                ) == Flow::Cancel
+                {
+                    return Flow::Cancel;
+                }
             }
 
             // One side has a directory and the other a file. Replacing either
@@ -558,6 +584,8 @@ fn walk(
             }
         }
     }
+
+    Flow::Continue
 }
 
 // Threading the same arguments one level down; a wrapper purely to keep the
@@ -574,8 +602,9 @@ fn recurse(
     policy: &super::safety::DeletePolicy,
     caveats: &Caveats,
     first_run: bool,
+    progress: &mut dyn Progress,
     built: &mut Plan,
-) {
+) -> Flow {
     walk(
         sides,
         child,
@@ -587,8 +616,9 @@ fn recurse(
         policy,
         caveats,
         first_run,
+        progress,
         built,
-    );
+    )
 }
 
 /// Turn a verdict into a plan row.

@@ -385,6 +385,14 @@ pub struct Plan {
     /// refuses to apply.
     pub refusal: Option<String>,
 
+    /// Set when the user stopped the scan before it finished.
+    ///
+    /// Such a plan covers part of a tree with no way to tell which part, so
+    /// it is thrown away rather than shown. The flag exists so the caller can
+    /// tell "you cancelled" from "there was nothing to do" -- two outcomes
+    /// that otherwise both produce an empty plan and would read identically.
+    pub cancelled: bool,
+
     /// Whether this plan moves files in both directions.
     ///
     /// The window needs it for the header -- `⇄` rather than `→`, since

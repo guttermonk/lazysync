@@ -31,8 +31,25 @@ dirs_first = true
 # which over SFTP is slow enough to be felt. Off means directories show "-".
 dir_sizes = false
 
-# How long a chord like `gg` or `dd` waits for its second key.
+# How long a chord waits before giving up and firing its *shorter* binding
+# instead -- `d` bound alongside `dd`, where lazysync has to decide how long
+# to wait before concluding you meant the short one.
+#
+# It does not put a clock on typing a chord. None of the default chords has a
+# shorter binding to fall back on, so with a stock keymap nothing here ever
+# fires: `s` waits for its second key as long as you take, and the way out of
+# a chord you did not mean to start is your cancel key (esc, or ctrl+c).
 chord_timeout_ms = 500
+
+# Report mouse clicks and the wheel to lazysync. A click selects -- a file, a
+# connection, a form field, a section of a plan, a button -- and a double
+# click opens it: the same action the keyboard has, never a new one.
+#
+# Worth knowing what it costs: while lazysync is running the terminal hands it
+# the mouse, so dragging to select text selects nothing. Most terminals keep
+# their own selection on shift+drag. Set this to false to get it back
+# unconditionally, at which point lazysync is keyboard-only again.
+mouse = true
 
 # ─── Synchronized browsing ───────────────────────────────────────────────────
 
@@ -75,6 +92,34 @@ auto_open_bookmark = true
 #   "exact"    -- only an exact match counts
 #   "off"      -- same as auto_open_bookmark = false
 match = "ancestor"
+
+# What the `Hide` action runs: the command that puts the popup away and leaves
+# lazysync running behind it, connection and all. Quitting is what closes a
+# connection; this is for wanting the terminal back for a minute.
+#
+# Empty by default, because the only program that can hide this window is the
+# one that opened it, and lazysync does not know what that was. Nothing is
+# detected or guessed -- name the command and it is used, leave it empty and
+# the `Hide` key says there is nothing to hide with.
+#
+# A list, not a string: splitting a string into a program and its arguments
+# takes a shell, and lazysync has no shell to offer.
+#
+#   hide_command = ["zellij", "action", "hide-floating-panes"]
+#
+# It is waited for and its output is captured, so it has to return promptly --
+# anything it printed would otherwise land on top of the TUI.
+#
+# `Hide` has no key until you give it one, since this is empty by default and
+# a key bound to a no-op reads as a broken feature rather than an unused one:
+#
+#   [keys.browser]
+#   set = [["Hide", "esc"]]
+#
+# Bringing the pane back is the host's job, not lazysync's. In zellij that is
+# ToggleFloatingPanes, Alt+f by default -- and note that a keybind which *runs*
+# lazysync opens a second one rather than revealing the hidden pane.
+hide_command = []
 
 # ─── Comparison ──────────────────────────────────────────────────────────────
 

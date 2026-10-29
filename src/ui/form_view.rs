@@ -14,7 +14,7 @@ use ratatui::{
 
 use super::{
     form::{ConnectionForm, Value},
-    hint,
+    hint, HitMap, Target,
 };
 use crate::{
     app::App,
@@ -22,7 +22,13 @@ use crate::{
     keys::{Action, Keymap, Mode},
 };
 
-pub fn draw(frame: &mut Frame<'_>, app: &App, form: &ConnectionForm, area: Rect) {
+pub fn draw(
+    frame: &mut Frame<'_>,
+    app: &App,
+    form: &ConnectionForm,
+    area: Rect,
+    hits: &mut HitMap,
+) {
     let palette = &app.palette;
 
     let [body, footer] = Layout::vertical([Constraint::Min(5), Constraint::Length(4)]).areas(area);
@@ -55,6 +61,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, form: &ConnectionForm, area: Rect)
         .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
+
+    // One field per line, in order, from the top of the box: the form does
+    // not scroll, so there is no offset to account for. Whether a click on a
+    // dimmed field does anything is `App`'s decision, not the renderer's.
+    hits.rows(inner, 0, form.fields.len(), Target::Field);
+
     draw_footer(frame, form, palette, app.keymaps.get(Mode::Form), footer);
 }
 

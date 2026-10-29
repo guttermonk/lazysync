@@ -54,11 +54,22 @@ pub fn line(keymap: &Keymap, items: &[(Action, &str)]) -> String {
 /// therefore given most-useful-first by the caller, and the tail is what goes
 /// when the terminal is narrow.
 pub fn fitted(keymap: &Keymap, items: &[(Action, &str)], width: usize) -> String {
+    let resolved: Vec<(String, &str)> = items
+        .iter()
+        .filter_map(|(action, label)| Some((key_for(keymap, *action)?, *label)))
+        .collect();
+
+    fitted_pairs(&resolved, width)
+}
+
+/// [`fitted`] for hints whose key is already known.
+///
+/// The which-key bar works the other way round from every other caller: it
+/// starts from the combos that continue a chord and asks what each one does,
+/// rather than starting from actions and asking what each is bound to.
+pub fn fitted_pairs(items: &[(String, &str)], width: usize) -> String {
     let mut out = String::new();
-    for (action, label) in items {
-        let Some(combo) = key_for(keymap, *action) else {
-            continue;
-        };
+    for (combo, label) in items {
         let piece = if out.is_empty() {
             format!(" {combo} {label}")
         } else {

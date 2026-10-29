@@ -21,6 +21,7 @@ pub fn for_mode(mode: Mode) -> Keymap {
         Mode::Bookmarks => bookmarks(),
         Mode::Browser => browser(),
         Mode::Confirm => confirm(),
+        Mode::Question => question(),
         Mode::Form => form(),
         Mode::Prompt => prompt(),
         Mode::Help => help(),
@@ -183,6 +184,41 @@ fn confirm() -> Keymap {
         (Action::Help, c('?')),
     ]);
     Keymap(bindings)
+}
+
+/// The two-button yes/no dialog.
+///
+/// Its own map rather than the confirmation window's, because the dialog is
+/// the one place where `y` and `n` are *answers* rather than commands, and a
+/// layout that moves `n` onto something else -- Colemak puts a motion there --
+/// must not take the answer with it. The answer keys are therefore bound
+/// here, where nothing else competes for them.
+///
+/// The selection keys matter as much as the letters: the dialog starts on
+/// "no", so Enter alone is always the safe answer, and the arrows move
+/// between the two buttons for anybody whose fingers are not on `y`.
+fn question() -> Keymap {
+    Keymap(vec![
+        // Move between the buttons. `h`/`l` as well as the arrows, because
+        // this is a horizontal choice and those are the horizontal keys.
+        (Action::PrevChoice, n(Key::Left)),
+        (Action::PrevChoice, c('h')),
+        (Action::NextChoice, n(Key::Right)),
+        (Action::NextChoice, c('l')),
+        (Action::NextChoice, n(Key::Tab)),
+        // Enter answers with whatever is selected, which is "no" until you
+        // move. Enter cannot mean "yes" here: the dialog guards closing a
+        // connection and deleting a bookmark, and a stray Enter must not be
+        // what confirms one.
+        (Action::Submit, n(Key::Enter)),
+        (Action::Submit, n(Key::Space)),
+        // The letters answer directly, without moving first.
+        (Action::Apply, c('y')),
+        (Action::Cancel, c('n')),
+        (Action::Cancel, n(Key::Esc)),
+        (Action::Cancel, ctrl('c')),
+        (Action::Cancel, c('q')),
+    ])
 }
 
 fn bookmarks() -> Keymap {

@@ -15,13 +15,13 @@ use ratatui::{
     Frame,
 };
 
-use super::{hint, shorten_path};
+use super::{hint, shorten_path, HitMap, Target};
 use crate::{
     app::App,
     keys::{Action, Mode},
 };
 
-pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
+pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, hits: &mut HitMap) {
     let [body, hints_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(area);
 
@@ -142,6 +142,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ));
     frame.render_stateful_widget(table, inner, &mut state);
 
+    hits.rows(inner, state.offset(), visible.len(), Target::Bookmark);
+
     draw_hints(frame, app, hints_area);
 }
 
@@ -218,7 +220,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
         terminal
-            .draw(|frame| super::draw(frame, &app, frame.area()))
+            .draw(|frame| super::draw(frame, &app, frame.area(), &mut Default::default()))
             .unwrap();
 
         let buffer = terminal.backend().buffer().clone();

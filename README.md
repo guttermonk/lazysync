@@ -189,6 +189,84 @@ synchronized browsing, `u` toggles union view, `/` searches, `space` marks,
 own sync profile, `sw` watches the tree, `sL` shows the audit log. All of it
 remappable — see below.
 
+### Which sync key does what
+
+| Key | Mode | Direction | What it deletes |
+| --- | --- | --- | --- |
+| `sp` | push | local → remote | nothing |
+| `sl` | pull | remote → local | nothing |
+| `sm` | mirror | local → remote | files on the **remote** that are not here, so the remote ends up identical to the local tree |
+| `sb` | two-way | both ways at once | a file deleted on either side, on the other — but only once a snapshot of a previous run exists |
+| `ss` | whatever the connection's profile says | — | — |
+
+The pair worth being careful about is `sm` and `sb`. A **mirror** has a
+source and a destination: the local tree is the truth, and anything the
+remote has that the local tree does not is removed there. Run it the day you
+forgot which pane you were in and it removes the files you meant to fetch.
+
+A **two-way sync** has no source. Each side's changes travel to the other,
+and the stored snapshot is what lets it tell "created over there" from
+"deleted over here" — a distinction neither tree contains on its own. The
+first run has no snapshot, so it only ever copies; deletions start
+propagating from the second. Conflicts (both sides edited) are never resolved
+for you — see [Two-way sync](#two-way-sync).
+
+Neither one is quieter than the other: both open the same plan, and both
+route deletions to `.lazysync-backup/` unless you say otherwise.
+
+**Typing one is visible as you type it.** Press `s` and the key bar turns
+into the list of what it can still become — `sp push · sl pull · sb bisync ·
+sm mirror · esc back` — with the key you have pressed so far echoed in the
+bottom-right corner, the way vim shows a half-typed command. Both come from
+the live keymap, so a rebound chord shows its own keys.
+
+**A chord waits as long as you do.** There is no clock on typing one: read
+the bar, then press the second key. (`chord_timeout_ms` is not that clock —
+it only applies where a chord has a *shorter* binding to fall back on, like
+`d` alongside `dd`, which none of the defaults has.)
+
+**Esc backs out of a chord you did not mean to start.** Not the Esc key
+specifically: whatever your keymap binds to `Cancel`, which is `ctrl+c` if
+you gave Esc up to a multiplexer. A chord in progress is the innermost thing
+on screen, so cancel applies to it first and is spent there — backing out of
+`sp` does not also close the screen you are on.
+
+`ss` and `sw` are the two keys that need a **sync profile** on the connection
+— a `[profiles.<name>]` in `config.toml`, named in the connection's `Sync
+profile` field in the connection editor. Without one, both say so and do
+nothing, and neither is offered in the key bar at the bottom of the browser.
+Every other sync key works against whatever two directories are open.
+
+### While a sync is being planned
+
+Planning walks both trees — one directory listing per directory on each side,
+which over SFTP takes as long as the network does. The status line says so
+while it happens:
+
+```
+ ⠹ planning push...  418 entries in 37 directories  (esc to stop)
+```
+
+**The spinner turns with the work, not with a clock.** Each step is a
+directory listed or an entry compared, so if it stops moving, the thing it
+is waiting on has stopped too — which is more use than an animation that
+keeps going while the connection hangs. The counts are there for the same
+reason: they are evidence, not decoration.
+
+**Your cancel key stops it** — Esc, or whatever else is bound to `Cancel`.
+A stopped scan opens no window: it covered part of a tree with no way to say
+which part, and a plan like that is not one you could review.
+
+**Keys pressed during the scan are dropped, not queued.** They were pressed
+at a screen that could not redraw, and delivering them afterwards moved the
+cursor somewhere nobody had chosen — they used to all arrive at once the
+moment the scan finished.
+
+What this does not do is keep the browser usable: the walk still owns the
+thread, so everything under that status line is frozen rather than merely
+busy. Making the walk yield — the way transfers already do, a chunk per
+frame — is the remaining piece.
+
 ### Marks scope the sync
 
 `space` marks a row. With anything marked in the pane files are being sent
@@ -322,7 +400,15 @@ watch = "batch"         # "off" | "batch" | "auto"
 debounce_ms = 2000
 ```
 
-`sw` starts and stops it. Changes are collected until the tree has been quiet
+`sw` starts and stops it, and it is not specific to git repositories or to
+any other kind of project — it watches whatever local directory the left pane
+is showing. What it does need is a profile with `watch` set to `batch` or
+`auto`: the behaviour is declared there rather than by the keystroke, because
+`auto` syncs without confirming and that is not something a key press should
+be able to turn on by itself. With no profile, or with `watch = "off"`, `sw`
+says which of the two it is and does nothing.
+
+Changes are collected until the tree has been quiet
 for `debounce_ms`, then `batch` opens one plan for review and `auto` applies
 without asking. A watcher that stops for a modal on every save is useless,
 and one that never confirms contradicts the rest of this program — so both
@@ -429,10 +515,44 @@ Bookmarks live separately in `bookmarks.toml`, because lazysync writes to them
 from the UI and round-tripping a hand-commented file through a serializer
 would eat the comments.
 
+### Mouse
+
+On by default. **One click selects, a double click opens** — a file, a saved
+connection, a form field, a line of a plan, a button of the yes/no dialog:
+
+| Where | One click | Double click |
+| --- | --- | --- |
+| A file pane | focus that pane, select the row | enter the directory |
+| The connection list | select | open the connection |
+| The connection form | focus the field | next value of a choice |
+| The confirmation window | select the line | fold a section, include/exclude a row |
+| The audit log | select the run | — |
+| The yes/no dialog | select the button | answer with it |
+
+A double click never does anything the keyboard cannot: it runs the same
+action the binding does, which is why a stray click cannot exclude a row from
+a sync or spend a listing walking into a remote directory. An open overlay
+swallows clicks aimed at the screen behind it, the same way it owns every key.
+
+The wheel scrolls whatever is under the pointer, three lines a notch, and
+never changes focus — looking at the other pane should not take you out of
+the one you are working in.
+
+```toml
+mouse = true
+```
+
+Turning it on has one cost worth knowing: while lazysync is running, the
+terminal hands it the mouse, so dragging to select text selects nothing. Most
+terminals keep their own selection on shift+drag. `mouse = false` gets it back
+unconditionally and makes lazysync keyboard-only again.
+
 ### Keybindings
 
 Keymaps are per UI mode — `d` is delete in the browser and a literal `d` in a
-text field. Within a mode there are four tables, applied in this order:
+text field. The modes are `bookmarks`, `browser`, `confirm`, `question`,
+`form`, `prompt`, `help`, `queue` and `log`; `lazysync keys` prints any of
+them. Within a mode there are four tables, applied in this order:
 
 | Table | Means | Resolves collisions by |
 | --- | --- | --- |
@@ -503,6 +623,10 @@ tmux. If you do that, `ctrl+c` is what still works; lazysync quits on `q` or
 `ZZ`, so nothing here treats `ctrl+c` as "exit". A `base` table replaces that
 second key along with everything else, so keep an escape hatch in yours.
 
+Whatever you leave bound to `Cancel` is also what backs out of a half-typed
+chord, and what the which-key bar names while one is in progress — so a
+keymap that gave Esc away is told to press `ctrl+c`, not Esc.
+
 **Reach for `base` only if you really mean "start from nothing".** It replaces
 the mode's defaults *wholesale*, so any action you leave out ends up with no
 key at all — and the symptom is a key that silently does nothing, which reads
@@ -532,6 +656,15 @@ generated from it, and so is every on-screen key hint — so nothing in the UI
 can claim a binding you do not have. If the footer does not offer an action,
 nothing is bound to it.
 
+**The yes/no dialog is its own mode.** `[keys.question]` covers the small
+window that asks before closing a connection, deleting a bookmark or deleting
+files — and it is separate from `[keys.confirm]`, the plan window, because
+the two disagree about `n`: a motion in a remapped browser-style keymap, and
+the answer "no" in a dialog. It is two buttons rather than two letters: `←`
+and `→` (or `h`/`l`, or Tab) move between them, Enter takes the selected one,
+and `y`/`n` still answer directly. **It opens on "no"**, so the keystroke you
+press without reading declines.
+
 ## zide integration
 
 lazysync is built to be opened as a [zide][zide] floating pane the way
@@ -548,6 +681,33 @@ match = "ancestor"   # "exact" | "ancestor" | "off"
 ```
 
 Turn it off with `match = "off"` or `--no-auto-open`.
+
+### Hiding the popup without dropping the connection
+
+Quitting closes the connection, which makes "I want my terminal back for a
+minute" cost a reconnect. `Hide` is the other door: it asks the host to stop
+showing the pane and keeps running behind it, so the connection, the marks,
+the cursor and a transfer in flight are all still there when it comes back.
+
+```toml
+[zide]
+hide_command = ["zellij", "action", "hide-floating-panes"]
+
+[keys.browser]
+set = [["Hide", "esc"]]
+```
+
+Both halves are needed, and neither has a default. lazysync cannot know what
+is hosting it, so nothing is detected or guessed — and because the command is
+empty out of the box, `Hide` starts with no key rather than a key that does
+nothing. The command is a list rather than a string because splitting one
+takes a shell; it is waited for with its output captured, so it has to return
+promptly, as `zellij action` does.
+
+**Bringing the pane back is the host's job.** In zellij that is
+`ToggleFloatingPanes` — `Alt+f` by default. A keybind that *runs* lazysync is
+not the way back: it starts a second lazysync, and a second connection, beside
+the hidden one.
 
 ## Development
 

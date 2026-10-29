@@ -23,6 +23,15 @@ pub enum Mode {
     Browser,
     /// The sync confirmation window.
     Confirm,
+    /// The yes/no dialog.
+    ///
+    /// Its own mode rather than a borrowed `Confirm` one, because the two
+    /// windows disagree about what a key means: `n` in the confirmation
+    /// window is a motion in anybody's config that rebinds the layout, while
+    /// in a two-button dialog it is the answer "no". Sharing the map made the
+    /// dialog's own footer wrong for exactly the users who had rebound
+    /// something -- see `ui::question`.
+    Question,
     /// A multi-field form: connection details, bookmark editor.
     Form,
     /// A single-line prompt: search, rename, password.
@@ -37,10 +46,11 @@ pub enum Mode {
 
 impl Mode {
     /// Every mode, in the order `lazysync keys` prints them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Bookmarks,
         Self::Browser,
         Self::Confirm,
+        Self::Question,
         Self::Form,
         Self::Prompt,
         Self::Help,
@@ -54,6 +64,7 @@ impl Mode {
             Self::Bookmarks => "bookmarks",
             Self::Browser => "browser",
             Self::Confirm => "confirm",
+            Self::Question => "question",
             Self::Form => "form",
             Self::Prompt => "prompt",
             Self::Help => "help",
@@ -190,6 +201,20 @@ pub enum Action {
     Submit,
     Cancel,
     Help,
+    /// Put the window away without closing anything.
+    ///
+    /// lazysync has no window of its own to hide -- it is a terminal program,
+    /// and the only thing that can hide it is whatever opened it. So this
+    /// runs `[zide] hide_command` and keeps running: the connection, the
+    /// marks, the cursor and a transfer in flight are all still there when
+    /// the popup comes back, which is the difference between this and
+    /// [`Self::Quit`].
+    ///
+    /// Unbound by default, and deliberately. The command it needs is empty by
+    /// default, because lazysync cannot know what is hosting it, and a key
+    /// that is bound to a no-op is worse than one that is not bound at all --
+    /// the first reads as a broken feature, the second sends you to `?`.
+    Hide,
     Quit,
 }
 
@@ -248,13 +273,13 @@ impl Action {
             Self::ResolveKeepBoth => "Conflict: keep both, one suffixed",
             Self::ResolveSkip => "Conflict: leave both alone this run",
 
-            Self::SyncPush => "Plan a push to the other pane",
-            Self::SyncPull => "Plan a pull from the other pane",
-            Self::SyncMirror => "Plan a mirror, deletions included",
-            Self::SyncProfile => "Plan using this connection's sync profile",
-            Self::SyncBisync => "Plan a two-way sync",
+            Self::SyncPush => "One-way local to remote; deletes nothing",
+            Self::SyncPull => "One-way remote to local; deletes nothing",
+            Self::SyncMirror => "One-way: remote ends up identical to local",
+            Self::SyncProfile => "Sync as this connection's profile says",
+            Self::SyncBisync => "Two-way: each change travels to the other side",
             Self::TogglePause => "Pause or resume the transfer",
-            Self::ToggleWatch => "Watch this tree and sync changes",
+            Self::ToggleWatch => "Watch and sync on change (needs a profile)",
             Self::ShowLog => "Show the audit log",
             Self::ShowConnections => "Back to the connection list",
 
@@ -268,7 +293,90 @@ impl Action {
             Self::Submit => "Accept",
             Self::Cancel => "Cancel, or close the overlay",
             Self::Help => "Show this help",
+            Self::Hide => "Hide the window; the connection stays open",
             Self::Quit => "Quit lazysync",
+        }
+    }
+
+    /// Two or three words, for a key hint.
+    ///
+    /// [`Self::describe`] is a sentence for the help overlay; this is the
+    /// label that fits on a bar next to a key. They are kept apart rather
+    /// than one truncating the other, because "One-way local to remote;
+    /// delet" is not a shorter hint, it is a worse one.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MoveDown => "down",
+            Self::MoveUp => "up",
+            Self::MoveTop => "to top",
+            Self::MoveBottom => "to bottom",
+            Self::HalfPageDown => "half page down",
+            Self::HalfPageUp => "half page up",
+            Self::PageDown => "page down",
+            Self::PageUp => "page up",
+
+            Self::EnterDir => "enter",
+            Self::ParentDir => "parent",
+            Self::GoHome => "home",
+            Self::GoRoot => "root",
+            Self::Refresh => "reload",
+
+            Self::NextPane => "other pane",
+            Self::PrevPane => "previous pane",
+            Self::SyncOtherPaneHere => "bring other pane here",
+
+            Self::ToggleHidden => "dotfiles",
+            Self::ToggleSyncBrowse => "sync-browse",
+            Self::ToggleUnionView => "union view",
+            Self::ToggleDirSizes => "dir sizes",
+            Self::CycleSort => "sort",
+            Self::ReverseSort => "reverse sort",
+
+            Self::ToggleMark => "mark",
+            Self::MarkAll => "mark all",
+            Self::ClearMarks => "clear marks",
+            Self::InvertMarks => "invert marks",
+
+            Self::Search => "find",
+            Self::SearchNext => "next match",
+            Self::SearchPrev => "previous match",
+
+            Self::Apply => "apply",
+            Self::ToggleRow => "include",
+            Self::InvertRows => "invert",
+            Self::AllRows => "all",
+            Self::OnlyRow => "only this",
+            Self::Checksum => "checksum",
+            Self::DiffRow => "diff",
+            Self::FoldSection => "fold",
+            Self::UnfoldSection => "unfold",
+            Self::ResolveKeepLocal => "keep local",
+            Self::ResolveKeepRemote => "keep remote",
+            Self::ResolveKeepBoth => "keep both",
+            Self::ResolveSkip => "skip",
+
+            Self::SyncPush => "push",
+            Self::SyncPull => "pull",
+            Self::SyncMirror => "mirror",
+            Self::SyncProfile => "profile",
+            Self::SyncBisync => "bisync",
+            Self::TogglePause => "pause",
+            Self::ToggleWatch => "watch",
+            Self::ShowLog => "log",
+            Self::ShowConnections => "connections",
+
+            Self::OpenItem => "open",
+            Self::NewItem => "new",
+            Self::EditItem => "edit",
+            Self::DeleteItem => "delete",
+            Self::NextChoice => "next value",
+            Self::PrevChoice => "previous value",
+
+            Self::Submit => "accept",
+            Self::Cancel => "cancel",
+            Self::Help => "help",
+            Self::Hide => "hide",
+            Self::Quit => "quit",
         }
     }
 
@@ -332,7 +440,7 @@ impl Action {
             | Self::NextChoice
             | Self::PrevChoice => "Connections",
 
-            Self::Submit | Self::Cancel | Self::Help | Self::Quit => "General",
+            Self::Submit | Self::Cancel | Self::Help | Self::Hide | Self::Quit => "General",
         }
     }
 
@@ -349,5 +457,81 @@ impl Action {
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::Keymaps;
+    use std::collections::BTreeMap;
+
+    /// Every action the default keymaps bind, which is every action the
+    /// which-key bar can be asked to name.
+    fn bound_actions() -> Vec<Action> {
+        let maps = Keymaps::resolve(&BTreeMap::new());
+        let mut all: Vec<Action> = Vec::new();
+        for mode in Mode::ALL {
+            for action in maps.get(mode).actions() {
+                if !all.contains(&action) {
+                    all.push(action);
+                }
+            }
+        }
+        assert!(!all.is_empty(), "the defaults bind nothing?");
+        all
+    }
+
+    /// A label has to fit on a bar beside its key. The ceiling is generous --
+    /// this is a guard against someone pasting a sentence in, not a style
+    /// rule -- but a `describe()` string would blow straight through it.
+    #[test]
+    fn every_label_is_short_enough_for_a_hint() {
+        for action in bound_actions() {
+            let label = action.label();
+            assert!(!label.is_empty(), "{action} has no label");
+            assert!(
+                label.chars().count() <= 22,
+                "{action}'s label is a sentence: {label:?}"
+            );
+            assert!(
+                !label.ends_with('.'),
+                "{action}'s label is punctuated like prose: {label:?}"
+            );
+        }
+    }
+
+    /// The two exist for different places, so one must not have been filled
+    /// in by copying the other.
+    #[test]
+    fn a_label_is_not_the_description() {
+        for action in bound_actions() {
+            assert_ne!(
+                action.label(),
+                action.describe(),
+                "{action}'s label is its whole description"
+            );
+        }
+    }
+
+    /// `Hide` ships with no key, so [`bound_actions`] never reaches it and
+    /// the two checks above cannot. It is still namable the moment somebody
+    /// binds it, which is the only state a user ever sees it in.
+    #[test]
+    fn an_action_with_no_default_key_is_still_describable() {
+        assert!(!bound_actions().contains(&Action::Hide));
+
+        assert_eq!(Action::Hide.label(), "hide");
+        assert_ne!(Action::Hide.label(), Action::Hide.describe());
+        assert_eq!(Action::Hide.group(), "General");
+        assert_eq!(Action::Hide.name(), "Hide", "the spelling config accepts");
+    }
+
+    /// The bar reads `sp push`, so the label must not repeat the key or the
+    /// action's own name -- `sp SyncPush` is noise.
+    #[test]
+    fn the_sync_chords_read_as_words() {
+        assert_eq!(Action::SyncPush.label(), "push");
+        assert_eq!(Action::SyncBisync.label(), "bisync");
     }
 }

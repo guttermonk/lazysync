@@ -19,6 +19,7 @@ use super::{
     compare::Comparator,
     filters::Filters,
     plan::{self, Plan, Row},
+    progress::{Flow, Progress, Silent, Step},
 };
 use crate::{
     config::Config,
@@ -67,7 +68,15 @@ pub fn plan(
     direction: Direction,
     config: &Config,
 ) -> Plan {
-    plan_with_filters(source, dest, direction, config, &Filters::default(), None)
+    plan_with_filters(
+        source,
+        dest,
+        direction,
+        config,
+        &Filters::default(),
+        None,
+        &mut Silent,
+    )
 }
 
 /// Top-level names a plan is limited to, from the source pane's marks.
@@ -86,6 +95,7 @@ pub fn plan_with_filters(
     config: &Config,
     filters: &Filters,
     scope: Option<&Scope>,
+    progress: &mut dyn Progress,
 ) -> Plan {
     let Endpoint {
         fs: source,
@@ -122,7 +132,7 @@ pub fn plan_with_filters(
     let mode_caveat = (!dest_caps.mode && source.capabilities().mode)
         .then_some("the destination has no permission bits");
 
-    walk(
+    let flow = walk(
         source,
         source_root,
         dest,
@@ -137,8 +147,15 @@ pub fn plan_with_filters(
         &policy,
         filters,
         scope,
+        progress,
         &mut built,
     );
+
+    // A cancelled walk produces a plan covering whatever it had reached,
+    // which is a plan for part of a tree with no way to tell which part. It
+    // is marked rather than returned as-is, because the one thing that must
+    // not happen is a confirmation window offering to apply it.
+    built.cancelled = flow == Flow::Cancel;
 
     built.sort();
     built
@@ -162,14 +179,15 @@ fn walk(
     policy: &super::safety::DeletePolicy,
     filters: &Filters,
     scope: Option<&Scope>,
+    progress: &mut dyn Progress,
     built: &mut Plan,
-) {
+) -> Flow {
     if depth > MAX_DEPTH {
         built.unreadable.push((
             relative.to_path_buf(),
             format!("stopped at {MAX_DEPTH} levels deep; a symlink loop?"),
         ));
-        return;
+        return Flow::Continue;
     }
 
     let source_dir = source_root.join(relative);
@@ -184,7 +202,7 @@ fn walk(
             built
                 .unreadable
                 .push((relative.to_path_buf(), format!("source: {e}")));
-            return;
+            return Flow::Continue;
         }
     };
 
@@ -210,7 +228,18 @@ fn walk(
         .iter()
         .any(|(path, why)| path == relative && why.starts_with("destination:"));
 
+    // Both listings are done, which on a remote is this directory's whole
+    // cost. Reported before the comparison so the spinner moves at the rate
+    // the network does.
+    if progress.step(Step::Directory(relative)) == Flow::Cancel {
+        return Flow::Cancel;
+    }
+
     for entry in &source_entries {
+        if progress.step(Step::Entry) == Flow::Cancel {
+            return Flow::Cancel;
+        }
+
         if skip_hidden(entry, config) {
             continue;
         }
@@ -270,7 +299,7 @@ fn walk(
 
             // A directory on both sides: nothing to transfer, just recurse.
             (EntryKind::Dir, Some(EntryKind::Dir)) => {
-                walk(
+                if walk(
                     source,
                     source_root,
                     dest,
@@ -285,8 +314,12 @@ fn walk(
                     policy,
                     filters,
                     scope,
+                    progress,
                     built,
-                );
+                ) == Flow::Cancel
+                {
+                    return Flow::Cancel;
+                }
             }
 
             // A directory that does not exist on the destination: create it,
@@ -298,7 +331,7 @@ fn walk(
                     comparator.method(),
                     direction.dest(),
                 ));
-                walk(
+                if walk(
                     source,
                     source_root,
                     dest,
@@ -313,8 +346,12 @@ fn walk(
                     policy,
                     filters,
                     scope,
+                    progress,
                     built,
-                );
+                ) == Flow::Cancel
+                {
+                    return Flow::Cancel;
+                }
             }
 
             // A directory where the destination has a file, or vice versa.
@@ -448,6 +485,8 @@ fn walk(
             ));
         }
     }
+
+    Flow::Continue
 }
 
 /// Whether an entry is excluded because dotfiles are hidden.
@@ -545,6 +584,118 @@ mod tests {
             left,
             right,
         }
+    }
+
+    /// Watches a walk, and can stop it after a given number of entries.
+    struct Watcher {
+        directories: Vec<PathBuf>,
+        entries: usize,
+        stop_after: Option<usize>,
+    }
+
+    impl Watcher {
+        fn new(stop_after: Option<usize>) -> Self {
+            Self {
+                directories: Vec::new(),
+                entries: 0,
+                stop_after,
+            }
+        }
+    }
+
+    impl Progress for Watcher {
+        fn step(&mut self, step: Step<'_>) -> Flow {
+            match step {
+                Step::Directory(path) => self.directories.push(path.to_path_buf()),
+                Step::Entry => self.entries += 1,
+            }
+
+            match self.stop_after {
+                Some(limit) if self.entries > limit => Flow::Cancel,
+                _ => Flow::Continue,
+            }
+        }
+    }
+
+    fn watched(t: &Trees, watcher: &mut dyn Progress) -> Plan {
+        let mut source = LocalFs::new();
+        let mut dest = LocalFs::new();
+        plan_with_filters(
+            Endpoint {
+                fs: &mut source,
+                root: &t.left,
+                label: "local".into(),
+            },
+            Endpoint {
+                fs: &mut dest,
+                root: &t.right,
+                label: "remote".into(),
+            },
+            Direction {
+                source: 0,
+                delete_extraneous: false,
+            },
+            &Config::default(),
+            &Filters::default(),
+            None,
+            watcher,
+        )
+    }
+
+    /// The walk reports every directory it lists, which is what the spinner
+    /// counts and what makes a long scan legible.
+    #[test]
+    fn the_walk_reports_each_directory_it_lists() {
+        let t = trees();
+        write(&t.left.join("top.txt"), "a", 1000);
+        write(&t.left.join("src/api/handler.rs"), "b", 1000);
+
+        let mut watcher = Watcher::new(None);
+        let plan = watched(&t, &mut watcher);
+
+        assert!(!plan.cancelled);
+        assert_eq!(
+            watcher.directories,
+            vec![
+                PathBuf::from(""),
+                PathBuf::from("src"),
+                PathBuf::from("src/api")
+            ],
+            "the root and every directory below it, depth first"
+        );
+        assert!(watcher.entries >= 3, "{} entries", watcher.entries);
+    }
+
+    /// Stopping the walk abandons the plan rather than returning the part of
+    /// it that was built. Half a tree is not a plan, and a window offering to
+    /// apply one would be offering to sync a subset nobody chose.
+    #[test]
+    fn a_cancelled_walk_produces_a_plan_marked_as_such() {
+        let t = trees();
+        for index in 0..20 {
+            write(&t.left.join(format!("file-{index:02}.txt")), "x", 1000);
+        }
+
+        let mut watcher = Watcher::new(Some(3));
+        let plan = watched(&t, &mut watcher);
+
+        assert!(plan.cancelled, "the walk was stopped");
+        assert!(
+            plan.rows.len() < 20,
+            "it should have stopped early, not run to completion"
+        );
+    }
+
+    /// And a walk nobody interrupts is never marked cancelled, so the flag
+    /// cannot quietly suppress a real plan.
+    #[test]
+    fn an_uninterrupted_walk_is_not_cancelled() {
+        let t = trees();
+        write(&t.left.join("one.txt"), "a", 1000);
+
+        let plan = watched(&t, &mut super::Silent);
+        assert!(!plan.cancelled);
+        assert_eq!(plan.rows.len(), 1);
     }
 
     fn run(t: &Trees, delete_extraneous: bool, config: &Config) -> Plan {
@@ -1011,6 +1162,7 @@ mod tests {
             &Config::default(),
             &Filters::default(),
             Some(&scope),
+            &mut Silent,
         )
     }
 
@@ -1138,6 +1290,7 @@ mod tests {
             &Config::default(),
             &filters,
             None,
+            &mut Silent,
         );
 
         let planned: Vec<String> = plan
@@ -1186,6 +1339,7 @@ mod tests {
             &Config::default(),
             &filters,
             None,
+            &mut Silent,
         );
 
         assert_eq!(

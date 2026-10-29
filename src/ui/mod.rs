@@ -10,19 +10,23 @@ pub mod form;
 mod form_view;
 mod help;
 pub mod hint;
+mod hit;
 mod keybar;
 pub mod log;
 mod panes;
 mod progress;
+mod question;
 mod status;
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
+
+pub use hit::{HitMap, Target};
 
 use crate::app::{App, Overlay, Screen};
 
@@ -31,9 +35,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let [body, status_line] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
 
+    // Rebuilt from scratch every frame, so a click is always answered by the
+    // layout the user is looking at rather than by the one before the last
+    // resize.
+    let mut hits = HitMap::default();
+
     match app.screen {
-        Screen::Bookmarks => bookmarks::draw(frame, app, body),
-        Screen::Log => log::draw(frame, app, &app.audit_entries, app.log_cursor, body),
+        Screen::Bookmarks => bookmarks::draw(frame, app, body, &mut hits),
+        Screen::Log => log::draw(
+            frame,
+            app,
+            &app.audit_entries,
+            app.log_cursor,
+            body,
+            &mut hits,
+        ),
         Screen::Browser => {
             // One row off the panes for the key bar. The browser was the only
             // screen that never said what you could press, which is a poor
@@ -43,7 +59,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             let [left, right] =
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .areas(panes_area);
-            panes::draw(frame, app, [left, right]);
+            panes::draw(frame, app, [left, right], &mut hits);
             keybar::draw(frame, app, keys);
         }
         Screen::Form => {
@@ -51,7 +67,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             // renderer needs both it and the palette. A form is a dozen short
             // strings, so the copy costs nothing.
             if let Some(form) = app.form.clone() {
-                form_view::draw(frame, app, &form, body);
+                form_view::draw(frame, app, &form, body, &mut hits);
             }
         }
         Screen::Transfer => {
@@ -66,7 +82,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             if let Some(plan) = app.plan.clone() {
                 let cursor = app.plan_cursor;
                 let folded = app.folded.clone();
-                confirm::draw(frame, app, &plan, cursor, &folded, body);
+                confirm::draw(frame, app, &plan, cursor, &folded, body, &mut hits);
             }
         }
     }
@@ -75,8 +91,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     match &app.overlay {
         Overlay::None => {}
-        Overlay::Help { scroll } => help::draw(frame, app, *scroll),
+        Overlay::Help { scroll } => {
+            // Every overlay lays a shield over the whole frame before drawing
+            // itself. A dialog is modal to the keyboard already -- its mode
+            // owns every key -- and a mouse that could still reach the pane
+            // behind it would be the one input that ignored that.
+            hits.push(frame.area(), Target::Blocked);
+            help::draw(frame, app, *scroll, &mut hits);
+        }
         Overlay::Prompt(prompt) => {
+            hits.push(frame.area(), Target::Blocked);
+
             // A password is never echoed. Dots rather than nothing, so you can
             // see that your keystrokes are arriving.
             let shown = if prompt.kind.is_secret() {
@@ -87,8 +112,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             let text = format!("{}{shown}", prompt.kind.label());
             draw_prompt_line(frame, app, status_line, &text);
         }
-        Overlay::Question(question) => draw_question(frame, app, &question.text),
+        Overlay::Question(q) => {
+            hits.push(frame.area(), Target::Blocked);
+            question::draw(frame, app, q, &mut hits);
+        }
     }
+
+    app.hits = hits;
 }
 
 /// The prompt replaces the status line rather than floating over the panes,
@@ -102,36 +132,6 @@ fn draw_prompt_line(frame: &mut Frame<'_>, app: &App, area: Rect, text: &str) {
             format!("{text}\u{2588}"),
             Style::default().fg(app.palette.fg),
         ))),
-        area,
-    );
-}
-
-fn draw_question(frame: &mut Frame<'_>, app: &App, text: &str) {
-    let area = centered(frame.area(), text.len() as u16 + 6, 5);
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("  {text}  "),
-                Style::default().fg(app.palette.fg),
-            )),
-            Line::from(Span::styled(
-                "  y yes    n no  ",
-                Style::default().fg(app.palette.dim),
-            )),
-        ])
-        .block(
-            Block::bordered()
-                .border_style(Style::default().fg(app.palette.warn))
-                .title_top(Line::from(Span::styled(
-                    " confirm ",
-                    Style::default()
-                        .fg(app.palette.warn)
-                        .add_modifier(Modifier::BOLD),
-                ))),
-        ),
         area,
     );
 }

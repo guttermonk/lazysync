@@ -26,6 +26,7 @@ pub mod executor;
 pub mod external;
 pub mod filters;
 pub mod plan;
+pub mod progress;
 pub mod safety;
 pub mod state;
 pub mod transfer;

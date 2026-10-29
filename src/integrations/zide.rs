@@ -1,4 +1,5 @@
-//! Opening the right bookmark when launched from zide.
+//! Living inside a zide floating pane: opening on the right bookmark, and
+//! getting out of the way again.
 //!
 //! lazysync is meant to be popped up as a zide floating pane the way `lazygit`
 //! is. In that situation it already knows something useful: the directory the
@@ -13,6 +14,12 @@
 //!
 //! Deepest wins when several bookmarks match, so a bookmark for `~/proj/docs`
 //! beats one for `~/proj` when you are inside `docs`.
+//!
+//! [`hide`] is the other end of the same arrangement. A popup you can only
+//! leave by quitting is a popup whose connection you pay to re-establish
+//! every time you want the terminal back, so there is a way to dismiss the
+//! pane and keep the session -- see that function for why it is configured
+//! rather than detected.
 
 use std::path::{Path, PathBuf};
 
@@ -142,6 +149,57 @@ fn normalize(path: &Path) -> PathBuf {
 /// zide would break it for anyone launching lazysync from a wrapper script.
 pub fn launched_from_zide() -> bool {
     std::env::var_os("ZIDE_DIR").is_some() || std::env::var_os("ZELLIJ").is_some()
+}
+
+/// Run the command that puts the popup away, and stay running behind it.
+///
+/// The inversion here is the whole point: every other way out of lazysync
+/// ends the process, and ending the process ends the connection. Hiding is
+/// for the case where you want the terminal back for a minute and the
+/// connection still there when you return -- so this does not touch the
+/// screen, the panes or the transfer queue. It asks the host to stop showing
+/// us, and returns.
+///
+/// Not detected, not guessed: the caller passes what the config says, and an
+/// empty list is reported rather than treated as "try zellij and see". A tool
+/// that quietly probes its surroundings is the one that does something
+/// surprising on the machine where the probe was wrong.
+///
+/// The error string is the status line, so it names the program and repeats
+/// the command's own complaint where there is one -- "zellij: no active
+/// zellij session" is actionable in a way that "exit status: 1" is not.
+pub fn hide(command: &[String]) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let Some((program, args)) = command.split_first() else {
+        return Err("nothing to hide with -- set `hide_command` under [zide]".into());
+    };
+
+    // `output()` pipes both streams, which is not for reading them so much as
+    // for keeping them off the terminal: a child that writes to this terminal
+    // writes on top of the TUI, and ratatui will not know to repaint over it.
+    //
+    // stdin is null for the mirror-image reason. An inherited stdin puts the
+    // child in competition with the event loop for keystrokes, and the key
+    // that gets eaten is whichever one you press while it runs.
+    let output = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{program}: {e}"))?;
+
+    if output.status.success() {
+        tracing::debug!("hidden by {program}");
+        return Ok(());
+    }
+
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    let complaint = complaint.trim();
+    Err(if complaint.is_empty() {
+        format!("{program}: {}", output.status)
+    } else {
+        format!("{program}: {complaint}")
+    })
 }
 
 #[cfg(test)]
@@ -320,5 +378,56 @@ mod tests {
 
         assert_eq!(bookmark.name, "proj");
         assert_eq!(found.relative, Path::new("src"));
+    }
+
+    fn words(command: &[&str]) -> Vec<String> {
+        command.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The default case, and it must not be silent: with nothing configured
+    /// there is no way to tell a key that did nothing from a key that is not
+    /// bound, which is the whole reason `Hide` ships without one.
+    #[test]
+    fn an_unconfigured_hide_says_so_instead_of_doing_nothing() {
+        let message = hide(&[]).unwrap_err();
+        assert!(
+            message.contains("hide_command"),
+            "the message has to name the setting to fix: {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_that_succeeds_hides_without_complaint() {
+        assert_eq!(hide(&words(&["true"])), Ok(()));
+    }
+
+    /// A program that is not installed reports that, rather than being
+    /// mistaken for a program that ran and refused.
+    #[test]
+    fn a_missing_program_is_named() {
+        let message = hide(&words(&["lazysync-no-such-program"])).unwrap_err();
+        assert!(message.contains("lazysync-no-such-program"), "{message:?}");
+    }
+
+    /// `zellij action` outside a session fails with a sentence worth reading,
+    /// and that sentence is more use on the status line than its exit code.
+    #[test]
+    fn the_commands_own_complaint_is_what_gets_reported() {
+        let message = hide(&words(&[
+            "sh",
+            "-c",
+            "echo 'no active session' >&2; exit 1",
+        ]))
+        .unwrap_err();
+        assert!(message.contains("no active session"), "{message:?}");
+    }
+
+    /// Nothing on stderr leaves only the exit status, which is thin but still
+    /// has to say the command failed rather than claiming it worked.
+    #[test]
+    fn a_silent_failure_falls_back_to_the_exit_status() {
+        let message = hide(&words(&["false"])).unwrap_err();
+        assert!(message.starts_with("false:"), "{message:?}");
+        assert!(!message.ends_with(": "), "no empty complaint: {message:?}");
     }
 }

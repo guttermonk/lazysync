@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{format_size, shorten_path};
+use super::{format_size, shorten_path, HitMap, Target};
 use crate::{
     app::App,
     browser::{Pane, PaneState},
@@ -17,22 +17,33 @@ use crate::{
 };
 
 /// Draw both panes.
-pub fn draw(frame: &mut Frame<'_>, app: &mut App, areas: [Rect; 2]) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App, areas: [Rect; 2], hits: &mut HitMap) {
     if app.union_view {
-        draw_union(frame, app, areas);
+        draw_union(frame, app, areas, hits);
         return;
     }
 
     for (index, area) in areas.into_iter().enumerate() {
-        draw_pane(frame, app, index, area);
+        draw_pane(frame, app, index, area, hits);
     }
 }
 
-fn draw_pane(frame: &mut Frame<'_>, app: &mut App, index: usize, area: Rect) {
+fn draw_pane(frame: &mut Frame<'_>, app: &mut App, index: usize, area: Rect, hits: &mut HitMap) {
     let focused = index == app.focus;
     let block = pane_block(app, index, focused, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // The whole box, border included, before any row goes on top of it: a
+    // click on a pane's empty half means "work in this one", whether or not
+    // it landed on a file -- and a ghosted pane has no rows to land on at all.
+    hits.push(
+        area,
+        Target::Pane {
+            pane: index,
+            row: None,
+        },
+    );
 
     // A ghosted or failed pane has no rows to show; say why instead of
     // leaving an empty box that looks like an empty directory. The difference
@@ -55,6 +66,7 @@ fn draw_pane(frame: &mut Frame<'_>, app: &mut App, index: usize, area: Rect) {
         return;
     }
 
+    let count = pane.entries().len();
     let rows: Vec<Row<'_>> = pane
         .entries()
         .iter()
@@ -75,6 +87,11 @@ fn draw_pane(frame: &mut Frame<'_>, app: &mut App, index: usize, area: Rect) {
 
     frame.render_stateful_widget(table, inner, &mut state);
 
+    hits.rows(inner, state.offset(), count, |row| Target::Pane {
+        pane: index,
+        row: Some(row),
+    });
+
     // Carry the widget's scroll decision back, so the next frame starts where
     // this one ended rather than snapping to the top.
     app.panes[index].scroll = state.offset();
@@ -82,7 +99,7 @@ fn draw_pane(frame: &mut Frame<'_>, app: &mut App, index: usize, area: Rect) {
 
 /// Union view: both panes show the same merged rows, each rendering its own
 /// side's attributes and a marker for which sides the row exists on.
-fn draw_union(frame: &mut Frame<'_>, app: &mut App, areas: [Rect; 2]) {
+fn draw_union(frame: &mut Frame<'_>, app: &mut App, areas: [Rect; 2], hits: &mut HitMap) {
     let rows_data = app.union_rows();
     let cursor = app.union_cursor.min(rows_data.len().saturating_sub(1));
 
@@ -91,6 +108,14 @@ fn draw_union(frame: &mut Frame<'_>, app: &mut App, areas: [Rect; 2]) {
         let block = pane_block(app, index, focused, area.width);
         let inner = block.inner(area);
         frame.render_widget(block, area);
+
+        hits.push(
+            area,
+            Target::Pane {
+                pane: index,
+                row: None,
+            },
+        );
 
         let rows: Vec<Row<'_>> = rows_data
             .iter()
@@ -150,6 +175,14 @@ fn draw_union(frame: &mut Frame<'_>, app: &mut App, areas: [Rect; 2]) {
 
         let mut state = TableState::default().with_selected(Some(cursor));
         frame.render_stateful_widget(table, inner, &mut state);
+
+        // Both panes show the same merged list, so a row index means the same
+        // thing in either -- clicking row 9 on the right selects the row the
+        // left-hand pane also has highlighted.
+        hits.rows(inner, state.offset(), rows_data.len(), |row| Target::Pane {
+            pane: index,
+            row: Some(row),
+        });
     }
 }
 
@@ -338,7 +371,7 @@ mod tests {
                     Constraint::Percentage(50),
                 ])
                 .areas(frame.area());
-                super::draw(frame, &mut app, [left, right]);
+                super::draw(frame, &mut app, [left, right], &mut Default::default());
             })
             .unwrap();
 

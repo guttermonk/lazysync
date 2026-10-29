@@ -16,7 +16,7 @@ use ratatui::{
     Frame,
 };
 
-use super::hint;
+use super::{hint, HitMap, Target};
 use crate::{
     app::App,
     config::Palette,
@@ -25,7 +25,14 @@ use crate::{
 };
 
 /// Draw the log over the whole area.
-pub fn draw(frame: &mut Frame<'_>, app: &App, entries: &[Entry], cursor: usize, area: Rect) {
+pub fn draw(
+    frame: &mut Frame<'_>,
+    app: &App,
+    entries: &[Entry],
+    cursor: usize,
+    area: Rect,
+    hits: &mut HitMap,
+) {
     let palette = &app.palette;
 
     let [header, body, detail, footer] = Layout::vertical([
@@ -87,12 +94,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, entries: &[Entry], cursor: usize, 
         .collect();
 
     let block = Block::bordered().border_style(Style::default().fg(palette.border_focused));
+    // Taken before the block is handed to the list, which consumes it.
+    let inner = block.inner(body);
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().fg(palette.cursor_fg).bg(palette.cursor_bg));
 
     let mut state = ListState::default().with_selected(Some(cursor.min(entries.len() - 1)));
     frame.render_stateful_widget(list, body, &mut state);
+
+    hits.rows(inner, state.offset(), entries.len(), Target::LogEntry);
 
     draw_detail(frame, entries.get(cursor), palette, detail);
     draw_footer(frame, palette, app.keymaps.get(Mode::Log), footer);
