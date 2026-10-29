@@ -139,6 +139,32 @@ impl Vfs for RemoteAdapter {
         self.protocol.capabilities()
     }
 
+    fn has_session(&self) -> bool {
+        true
+    }
+
+    fn keepalive(&mut self, path: &Path) -> Result<(), VfsError> {
+        // `stat` rather than a protocol NOOP: `remotefs` exposes no NOOP, and
+        // a stat is one round trip on a path the server already has open --
+        // which is also a better liveness test, since it proves the session
+        // can still *do* something rather than merely that a socket is open.
+        //
+        // A path that has gone missing is not a dead connection: somebody
+        // deleted a directory on the server, which the next reload will show
+        // honestly. Only the connection errors propagate.
+        match self.client.stat(path) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let translated = translate(e, &format!("checking {}", path.display()));
+                if translated.is_not_found() {
+                    Ok(())
+                } else {
+                    Err(translated)
+                }
+            }
+        }
+    }
+
     fn list(&mut self, path: &Path) -> Result<Vec<Entry>, VfsError> {
         let files = self
             .client
@@ -288,6 +314,22 @@ impl Vfs for RemoteAdapter {
         self.client
             .set_metadata(path, &set)
             .map_err(|e| translate(e, &format!("setting metadata on {}", path.display())))
+    }
+
+    fn set_mode(&mut self, path: &Path, mode: u32) -> Result<(), VfsError> {
+        // Gated on `mode`, not `set_mtime`: FTP has no permission bits to
+        // speak of, and saying so beats a protocol error from the server.
+        if !self.capabilities().mode {
+            return Err(VfsError::Unsupported(format!(
+                "{} has no permission bits",
+                self.protocol
+            )));
+        }
+
+        let set = SetMetadata::default().mode(UnixPex::from(mode & 0o7777));
+        self.client
+            .set_metadata(path, &set)
+            .map_err(|e| translate(e, &format!("setting the mode on {}", path.display())))
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<(), VfsError> {

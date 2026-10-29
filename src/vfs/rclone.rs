@@ -376,6 +376,16 @@ impl Vfs for RcloneFs {
         )))
     }
 
+    fn set_mode(&mut self, path: &Path, _mode: u32) -> Result<(), VfsError> {
+        // An rclone remote is whatever backend it fronts, and most of them --
+        // object stores above all -- have no Unix permission bits at all.
+        // There is no `rclone chmod`, so there is nothing to attempt.
+        Err(VfsError::Unsupported(format!(
+            "rclone remotes have no permission bits ({})",
+            self.spec(path)
+        )))
+    }
+
     fn remove_file(&mut self, path: &Path) -> Result<(), VfsError> {
         let spec = self.spec(path);
         self.run(&["deletefile", &spec], &format!("deleting {spec}"))

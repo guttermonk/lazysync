@@ -925,3 +925,99 @@ fn a_bisync_over_sftp_moves_both_ways_and_then_settles() {
         );
     });
 }
+
+// ── Keep-alive and reconnect ─────────────────────────────────────────────
+
+/// The ping is a real round trip on a real session, which is the only way to
+/// know it is one the server actually answers.
+#[test]
+fn a_keepalive_succeeds_on_a_live_session() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    with_home(&server.home, || {
+        let mut fs = ssh::open(&server.target(), None).expect("open");
+        assert!(fs.has_session(), "an SFTP pane holds a session");
+        assert!(
+            fs.keepalive(&server.served).is_ok(),
+            "the fixture should answer a keepalive"
+        );
+    });
+}
+
+/// A directory that has gone is not a dead connection. Conflating the two
+/// would reconnect every time somebody deleted a folder on the server.
+#[test]
+fn a_keepalive_on_a_missing_path_is_not_a_lost_connection() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    with_home(&server.home, || {
+        let mut fs = ssh::open(&server.target(), None).expect("open");
+        assert!(
+            fs.keepalive(&server.served.join("no-such-directory"))
+                .is_ok(),
+            "absent is not disconnected"
+        );
+    });
+}
+
+/// The whole point: the session goes, and lazysync puts it back without
+/// losing where you were.
+///
+/// Key auth deliberately, because that is the case auto-reconnect is *for*:
+/// the credential can be had again without asking, so the reopen can be
+/// silent. A typed password that was never stored cannot be, and the test
+/// below pins that refusal.
+#[test]
+fn a_dropped_session_is_reconnected_and_the_pane_keeps_its_place() {
+    use lazysync::{
+        app::{App, Screen},
+        bookmarks::Bookmark,
+        config::Config,
+    };
+
+    let Some(server) = Server::start() else {
+        return;
+    };
+
+    std::fs::create_dir_all(server.served.join("sub")).unwrap();
+    std::fs::write(server.served.join("sub/one.txt"), b"1").unwrap();
+    std::fs::write(server.served.join("sub/two.txt"), b"2").unwrap();
+
+    with_home(&server.home, || {
+        let config = Config::default();
+        let here = server.work.clone();
+        let mut app = App::new(config, here.clone(), here).expect("build an app");
+
+        let mut bookmark = Bookmark::from_target("fixture", &server.target());
+        bookmark.remote_path = Some(server.served.join("sub"));
+
+        app.finish_open(&bookmark, None);
+        assert_eq!(app.screen, Screen::Browser, "{}", app.status);
+        assert_eq!(app.panes[1].vfs.scheme(), "sftp", "{}", app.status);
+
+        // Stand somewhere specific, with a mark, so a reconnect that rebuilt
+        // the pane rather than swapping its backend would be visible.
+        app.focus = 1;
+        app.panes[1].select_name("two.txt");
+        app.panes[1].toggle_mark();
+        let was = app.panes[1].path().to_path_buf();
+
+        let name = app.reconnect(1).expect("reconnect");
+
+        assert_eq!(name, "fixture");
+        assert_eq!(app.panes[1].vfs.scheme(), "sftp", "a live session again");
+        assert_eq!(app.panes[1].path(), was, "the directory is where it was");
+        assert!(
+            app.panes[1].marks().contains("two.txt"),
+            "a reconnect nobody asked for must not clear the marks"
+        );
+        assert!(
+            app.panes[1].entries().iter().any(|e| e.name == "one.txt"),
+            "and the listing is real"
+        );
+    });
+}

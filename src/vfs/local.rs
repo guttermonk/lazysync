@@ -282,6 +282,22 @@ impl Vfs for LocalFs {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn set_mode(&mut self, path: &Path, mode: u32) -> Result<(), VfsError> {
+        use std::os::unix::fs::PermissionsExt;
+        // Permission bits only, as in `set_times`: the file type bits of a
+        // stat mode are not ours to set.
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(|e| classify(e, path))
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(&mut self, _path: &Path, _mode: u32) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported(
+            "this platform has no Unix permission bits".into(),
+        ))
+    }
+
     fn remove_file(&mut self, path: &Path) -> Result<(), VfsError> {
         fs::remove_file(path).map_err(|e| classify(e, path))
     }

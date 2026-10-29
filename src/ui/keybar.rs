@@ -133,14 +133,42 @@ fn items(app: &App) -> Vec<(Action, &'static str)> {
     .filter(|(action, _)| *action != Action::ToggleWatch || app.watch_available())
     .filter(|(action, _)| *action != Action::Hide || !app.config.zide.hide_command.is_empty())
     .collect();
-    // `?` last but never dropped: it is the way out of not knowing, so it is
+
+    // **Always last, whichever way round the other two go.** These are the
+    // rarest keys on the screen and the bar drops from the tail, so putting
+    // them anywhere else costs a sync hint on a narrow terminal -- which is
+    // what happened when they first went in beside the navigation keys:
+    // `ss profile` fell off a 200-column bar. A sync tool may not push its
+    // sync keys off the footer to advertise `mkdir`.
+    let files: Vec<(Action, &'static str)> = [
+        (Action::Rename, "rename"),
+        (Action::NewFile, "new file"),
+        (Action::NewDir, "new dir"),
+        (Action::DeleteFile, "delete"),
+        (Action::Chmod, "permissions"),
+    ]
+    .into_iter()
+    // Permission bits are a Unix idea the backend may simply not have, and
+    // `p` on an FTP pane can only report that. Same rule as the profile keys.
+    .filter(|(action, _)| *action != Action::Chmod || app.focused().vfs.capabilities().mode)
+    .collect();
+
+    // `?` first but never dropped: it is the way out of not knowing, so it is
     // prepended to whichever group leads rather than left to the tail.
     let help = [(Action::Help, "help")];
 
     if connected(app) {
-        help.into_iter().chain(sync).chain(browse).collect()
+        help.into_iter()
+            .chain(sync)
+            .chain(browse)
+            .chain(files)
+            .collect()
     } else {
-        help.into_iter().chain(browse).chain(sync).collect()
+        help.into_iter()
+            .chain(browse)
+            .chain(sync)
+            .chain(files)
+            .collect()
     }
 }
 

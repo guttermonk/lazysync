@@ -154,6 +154,29 @@ pub trait Vfs: Send {
     /// Short name for the status bar: `local`, `sftp`, `s3`.
     fn scheme(&self) -> &str;
 
+    /// Whether this backend holds a live connection that can time out.
+    ///
+    /// False for the local filesystem, and false for rclone -- which shells
+    /// out per command and has no session to lose. Only a `true` here causes
+    /// the event loop to schedule a keepalive, so a two-local-pane lazysync
+    /// goes on blocking on input and waking for nothing.
+    fn has_session(&self) -> bool {
+        false
+    }
+
+    /// Prove the session is still there, cheaply.
+    ///
+    /// One round trip on `path`, which the caller supplies because the
+    /// backend does not track a working directory. A sessionless backend
+    /// does nothing and says so by succeeding.
+    ///
+    /// [`VfsError::NotConnected`] is the answer that matters: it is what
+    /// tells `App` to reconnect rather than to report a failure.
+    fn keepalive(&mut self, path: &Path) -> Result<(), VfsError> {
+        let _ = path;
+        Ok(())
+    }
+
     /// How this location is displayed: `/home/greg/proj`, or
     /// `sftp://host/srv/www`.
     fn display_path(&self, path: &Path) -> String;
@@ -234,6 +257,18 @@ pub trait Vfs: Send {
     /// [`VfsError::Unsupported`] rather than silently doing nothing, so the
     /// plan can say the timestamp will not be preserved.
     fn set_times(&mut self, path: &Path, metadata: &WriteMetadata) -> Result<(), VfsError>;
+
+    /// Set a file's Unix permission bits, for the `Chmod` action.
+    ///
+    /// Separate from [`Self::set_times`], which applies mode only as part of
+    /// preserving a copied file's metadata and is gated on `set_mtime` --
+    /// a backend that can chmod but not set timestamps would otherwise be
+    /// unable to do the thing it *can* do.
+    ///
+    /// Required rather than defaulted to "unsupported": a backend that gains
+    /// the ability should be a compile error until somebody decides, not a
+    /// feature that silently stays missing.
+    fn set_mode(&mut self, path: &Path, mode: u32) -> Result<(), VfsError>;
 
     /// Delete a file.
     fn remove_file(&mut self, path: &Path) -> Result<(), VfsError>;

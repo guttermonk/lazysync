@@ -679,3 +679,314 @@ fn shift_enter_and_gx_both_open_externally() {
 // opens a `.md` with, on every `cargo test`. The guard before the spawn is
 // covered by the remote case in `tests/sftp.rs`, where there is a real
 // backend to be refused.
+
+// ── File operations ──────────────────────────────────────────────────────
+
+use lazysync::app::{Answer, Pending};
+
+/// Answer the yes/no dialog with "yes".
+fn confirm(h: &mut Harness) {
+    match &h.app.overlay {
+        Overlay::Question(_) => {}
+        other => panic!("expected a confirmation, got {other:?}"),
+    }
+    h.app.handle(lazysync::keys::Action::Apply);
+}
+
+fn names(h: &Harness) -> Vec<String> {
+    h.app
+        .focused()
+        .entries()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect()
+}
+
+/// Type a string into an open prompt, then submit.
+fn type_and_submit(h: &mut Harness, text: &str) {
+    for ch in text.chars() {
+        h.app.handle_text(ch);
+    }
+    h.app.handle(lazysync::keys::Action::Submit);
+}
+
+/// Clear whatever a prompt opened pre-filled with.
+fn clear_prompt(h: &mut Harness) {
+    for _ in 0..64 {
+        h.app.handle_backspace();
+    }
+}
+
+#[test]
+fn a_creates_an_empty_file() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.press("a");
+    type_and_submit(&mut h, "notes.txt");
+
+    assert!(dir.path().join("left/notes.txt").is_file());
+    assert!(names(&h).contains(&"notes.txt".to_string()));
+    assert_eq!(
+        h.app.focused().selected().unwrap().name,
+        "notes.txt",
+        "the thing you just made should be what is selected"
+    );
+}
+
+#[test]
+fn shift_a_creates_a_directory() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.press("A");
+    type_and_submit(&mut h, "build");
+
+    assert!(dir.path().join("left/build").is_dir());
+    assert_eq!(h.app.focused().selected().unwrap().name, "build");
+}
+
+#[test]
+fn r_renames_the_selected_entry() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.select("README.md");
+    h.press("r");
+
+    // The prompt opens pre-filled with the current name.
+    match &h.app.overlay {
+        Overlay::Prompt(p) => assert_eq!(p.input, "README.md"),
+        other => panic!("expected a prompt, got {other:?}"),
+    }
+
+    clear_prompt(&mut h);
+    type_and_submit(&mut h, "GUIDE.md");
+
+    assert!(!dir.path().join("left/README.md").exists());
+    assert!(dir.path().join("left/GUIDE.md").is_file());
+    assert_eq!(h.app.focused().selected().unwrap().name, "GUIDE.md");
+}
+
+/// POSIX rename replaces silently. A file manager that loses a file because
+/// you typed a name already in use is not one anybody trusts twice.
+#[test]
+fn renaming_onto_an_existing_name_is_refused() {
+    let dir = trees();
+    fs::write(dir.path().join("left/other.md"), b"keep me").unwrap();
+    let mut h = Harness::new(&dir, Config::default());
+    h.app.focused_mut().reload();
+
+    h.select("README.md");
+    h.press("r");
+    clear_prompt(&mut h);
+    type_and_submit(&mut h, "other.md");
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("left/other.md")).unwrap(),
+        "keep me",
+        "the existing file must survive"
+    );
+    assert!(dir.path().join("left/README.md").exists());
+    assert!(h.app.status.contains("already exists"), "{}", h.app.status);
+}
+
+/// The prompt says *name*, so a path is refused rather than quietly creating
+/// something one directory up.
+#[test]
+fn a_name_with_a_separator_is_refused() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.press("a");
+    type_and_submit(&mut h, "../escaped.txt");
+
+    assert!(!dir.path().join("escaped.txt").exists());
+    assert!(h.app.status.contains("no slashes"), "{}", h.app.status);
+}
+
+#[test]
+fn creating_a_name_that_is_taken_is_refused() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.press("a");
+    type_and_submit(&mut h, "README.md");
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("left/README.md")).unwrap(),
+        "hello",
+        "the existing file must not be truncated"
+    );
+    assert!(h.app.status.contains("already exists"), "{}", h.app.status);
+}
+
+/// Delete asks first, and does nothing until it is answered.
+#[test]
+fn dd_asks_before_deleting_and_declining_keeps_the_file() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.select("README.md");
+    h.press("dd");
+
+    match &h.app.overlay {
+        Overlay::Question(q) => {
+            assert!(q.text.contains("README.md"), "{:?}", q.text);
+            assert!(q.text.contains("cannot be undone"), "{:?}", q.text);
+            assert_eq!(q.answer, Answer::No, "the dialog opens on the safe answer");
+            assert!(matches!(q.on_yes, Pending::DeleteEntries { .. }));
+        }
+        other => panic!("expected a confirmation, got {other:?}"),
+    }
+
+    assert!(dir.path().join("left/README.md").exists(), "nothing yet");
+
+    h.app.handle(lazysync::keys::Action::Cancel);
+    assert!(dir.path().join("left/README.md").exists(), "declined");
+}
+
+#[test]
+fn confirming_a_delete_removes_the_file() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.select("README.md");
+    h.press("dd");
+    confirm(&mut h);
+
+    assert!(!dir.path().join("left/README.md").exists());
+    assert!(!names(&h).contains(&"README.md".to_string()));
+}
+
+/// Marks win over the cursor, as they do for Enter.
+#[test]
+fn delete_takes_the_marked_entries_when_there_are_any() {
+    let dir = trees();
+    fs::write(dir.path().join("left/a.txt"), b"a").unwrap();
+    fs::write(dir.path().join("left/b.txt"), b"b").unwrap();
+    let mut h = Harness::new(&dir, Config::default());
+    h.app.focused_mut().reload();
+
+    h.select("a.txt");
+    h.key(ModifiedKey::plain(Key::Space));
+    h.select("b.txt");
+    h.key(ModifiedKey::plain(Key::Space));
+
+    // Cursor is elsewhere; the marks are what should go.
+    h.select("README.md");
+    h.press("dd");
+    confirm(&mut h);
+
+    assert!(!dir.path().join("left/a.txt").exists());
+    assert!(!dir.path().join("left/b.txt").exists());
+    assert!(
+        dir.path().join("left/README.md").exists(),
+        "the unmarked row under the cursor must survive"
+    );
+}
+
+/// Deleting a directory is recursive, and the dialog has to say so — the
+/// keystroke is the same one that removes a single file.
+#[test]
+fn deleting_a_directory_says_it_takes_the_contents() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.select("src");
+    h.press("dd");
+
+    match &h.app.overlay {
+        Overlay::Question(q) => assert!(
+            q.text.contains("everything in it"),
+            "recursion must be named: {:?}",
+            q.text
+        ),
+        other => panic!("expected a confirmation, got {other:?}"),
+    }
+
+    confirm(&mut h);
+    assert!(!dir.path().join("left/src").exists());
+    assert!(!dir.path().join("left/src/api").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn p_changes_the_permission_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.select("README.md");
+    h.press("p");
+
+    // Pre-filled with what it has now, so the usual edit is one digit.
+    match &h.app.overlay {
+        Overlay::Prompt(p) => assert_eq!(p.input.len(), 3, "pre-filled octal: {:?}", p.input),
+        other => panic!("expected a prompt, got {other:?}"),
+    }
+
+    clear_prompt(&mut h);
+    type_and_submit(&mut h, "600");
+
+    let mode = fs::metadata(dir.path().join("left/README.md"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[test]
+fn a_mode_that_is_not_octal_is_refused() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.select("README.md");
+    h.press("p");
+    clear_prompt(&mut h);
+    type_and_submit(&mut h, "rwx");
+
+    assert!(h.app.status.contains("octal"), "{}", h.app.status);
+}
+
+#[test]
+fn a_mode_out_of_range_is_refused() {
+    let dir = trees();
+    let mut h = Harness::new(&dir, Config::default());
+
+    h.select("README.md");
+    h.press("p");
+    clear_prompt(&mut h);
+    type_and_submit(&mut h, "77777");
+
+    assert!(h.app.status.contains("out of range"), "{}", h.app.status);
+}
+
+/// Every file-op key is bound, or the feature is unreachable whatever the
+/// handlers do.
+#[test]
+fn the_file_operations_are_all_bound_in_the_browser() {
+    use lazysync::keys::{Action, Keymaps, Mode};
+
+    let maps = Keymaps::default();
+    let keymap = maps.get(Mode::Browser);
+
+    for (action, expected) in [
+        (Action::NewFile, "a"),
+        (Action::NewDir, "A"),
+        (Action::Rename, "r"),
+        (Action::DeleteFile, "dd"),
+        (Action::Chmod, "p"),
+    ] {
+        let combos: Vec<String> = keymap
+            .combos_for(action)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            combos.contains(&expected.to_string()),
+            "{action} should be on {expected:?}, got {combos:?}"
+        );
+    }
+}

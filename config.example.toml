@@ -51,6 +51,32 @@ chord_timeout_ms = 500
 # unconditionally, at which point lazysync is keyboard-only again.
 mouse = true
 
+# ─── Connections ─────────────────────────────────────────────────────────────
+
+[connection]
+# Seconds between liveness pings on an idle remote pane; 0 turns it off.
+#
+# An SFTP or FTP server closes an idle session on its own schedule, and there
+# is usually a middlebox between you and it with opinions of its own. Without
+# this, lazysync holds a socket that is already gone and finds out at your
+# next keystroke.
+#
+# 60 is comfortably inside the usual 120-300 second idle timeouts, and one
+# `stat` a minute is nothing next to a directory listing. Nothing is sent
+# while both panes are local.
+keepalive_secs = 60
+
+# Re-establish a dropped connection instead of reporting it.
+#
+# Only ever silent where the credential can be had again without asking:
+# agent auth, key auth, or a password the connection opted to keep in the
+# keyring. A password typed once and deliberately not stored cannot be
+# replayed, and a password box appearing from a timer while you were reading
+# something else is worse than a message -- so that case says so instead.
+#
+# The pane keeps its directory, cursor and marks across a reconnect.
+auto_reconnect = true
+
 # ─── Synchronized browsing ───────────────────────────────────────────────────
 
 [sync_browse]

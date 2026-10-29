@@ -268,6 +268,35 @@ impl Pane {
         self.cursor = index.min(self.view.len().saturating_sub(1));
     }
 
+    /// Swap the backend, keeping everything else.
+    ///
+    /// For a reconnect: the session died and a new one has been opened to
+    /// the same place, so the directory, the cursor, the marks and the sync
+    /// anchor are all still what the user left them as. Rebuilding the pane
+    /// would reset every one of those, which is a visible lurch in return
+    /// for nothing -- and a reconnect the user did not ask for has no
+    /// business moving their cursor.
+    ///
+    /// The caller reloads; this does not, because the caller is better
+    /// placed to report what a failed listing means.
+    pub fn replace_vfs(&mut self, vfs: Box<dyn Vfs>) {
+        self.vfs = vfs;
+    }
+
+    /// Put the cursor on the entry called `name`, if it is in the listing.
+    ///
+    /// For the file operations: after creating or renaming something, the
+    /// thing you just made should be what is selected. Sorting means its
+    /// index is not predictable, so it is found by name rather than guessed.
+    /// A name that is not there leaves the cursor alone -- the entry may be
+    /// hidden by the dotfile filter, and jumping somewhere arbitrary would be
+    /// worse than not moving.
+    pub fn select_name(&mut self, name: &str) {
+        if let Some(index) = self.view.iter().position(|entry| entry.name == name) {
+            self.cursor = index;
+        }
+    }
+
     pub fn cursor_to_top(&mut self) {
         self.cursor = 0;
     }

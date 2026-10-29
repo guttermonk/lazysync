@@ -682,6 +682,9 @@ mod tests {
         fn create_dir(&mut self, path: &Path) -> Result<(), crate::vfs::VfsError> {
             self.0.create_dir(path)
         }
+        fn set_mode(&mut self, path: &Path, mode: u32) -> Result<(), crate::vfs::VfsError> {
+            self.0.set_mode(path, mode)
+        }
         fn stat(&mut self, path: &Path) -> Result<crate::vfs::Entry, crate::vfs::VfsError> {
             self.0.stat(path)
         }

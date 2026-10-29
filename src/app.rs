@@ -9,6 +9,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -34,7 +35,7 @@ use crate::{
         watch,
     },
     ui::{confirm, form::ConnectionForm, hint, HitMap, Target},
-    vfs::{ftp, hostkey::HostKey, rclone, ssh, LocalFs, Vfs},
+    vfs::{ftp, hostkey::HostKey, rclone, ssh, LocalFs, Vfs, WriteMetadata},
 };
 
 /// What is on top of the browser, if anything.
@@ -92,6 +93,15 @@ pub enum PromptKind {
     /// Carries the bookmark name so that the prompt can say which connection
     /// it is for -- the whole point of the open screen being just a name.
     Password { bookmark: String },
+
+    /// A name for a file to create in the focused pane.
+    NewFile,
+    /// A name for a directory to create in the focused pane.
+    NewDir,
+    /// A new name for `from`, which the prompt opens pre-filled with.
+    Rename { from: String },
+    /// Octal permission bits for `name`, pre-filled with what it has now.
+    Chmod { name: String },
 }
 
 impl PromptKind {
@@ -99,6 +109,10 @@ impl PromptKind {
         match self {
             Self::Search | Self::FilterBookmarks => "/".into(),
             Self::Password { bookmark } => format!("password for {bookmark}: "),
+            Self::NewFile => "new file: ".into(),
+            Self::NewDir => "new directory: ".into(),
+            Self::Rename { from } => format!("rename {from} to: "),
+            Self::Chmod { name } => format!("mode for {name}: "),
         }
     }
 
@@ -113,6 +127,10 @@ impl PromptKind {
             Self::Search => "search",
             Self::FilterBookmarks => "filter",
             Self::Password { .. } => "password",
+            Self::NewFile => "new file",
+            Self::NewDir => "new directory",
+            Self::Rename { .. } => "rename",
+            Self::Chmod { .. } => "permissions",
         }
     }
 
@@ -122,8 +140,10 @@ impl PromptKind {
     /// popup measures its height rather than assuming the line is there.
     pub fn subject(&self) -> Option<&str> {
         match self {
-            Self::Search | Self::FilterBookmarks => None,
+            Self::Search | Self::FilterBookmarks | Self::NewFile | Self::NewDir => None,
             Self::Password { bookmark } => Some(bookmark),
+            Self::Rename { from } => Some(from),
+            Self::Chmod { name } => Some(name),
         }
     }
 
@@ -202,6 +222,13 @@ pub enum Pending {
     ApplyPlan,
     /// Close the open connection and return to the connection list.
     LeaveConnection,
+    /// Delete these entries from the pane at this index.
+    ///
+    /// The names are captured when the question is asked rather than looked
+    /// up again when it is answered: the answer arrives one keystroke later,
+    /// and resolving "whatever is selected now" at that point would delete
+    /// something other than what the dialog named.
+    DeleteEntries { pane: usize, names: Vec<String> },
     /// Nothing. The answer was "no" and no has no side effect.
     Nothing,
 }
@@ -319,6 +346,20 @@ pub struct App {
     /// default; see [`crate::bookmarks::Bookmark::default_sync`].
     pub default_sync: Option<SyncMode>,
 
+    /// The bookmark the live connection was opened from.
+    ///
+    /// Kept so a dropped session can be re-established from the same
+    /// details. Distinct from `connecting`, which is the *in-flight* attempt
+    /// and is cleared the moment one succeeds or fails.
+    connection: Option<Bookmark>,
+
+    /// When the keepalive last ran, or `None` if nothing has a session.
+    ///
+    /// The schedule is "this long after the last ping", not a fixed wall
+    /// clock: a listing that just happened is itself proof the session is
+    /// alive, so there is no reason to follow it with a stat a second later.
+    keepalive_at: Option<Instant>,
+
     /// Where everything was on the last frame, so a click can be matched to
     /// what the user was pointing at. Written by `ui::draw`, read by the
     /// event loop, and rebuilt from nothing every frame.
@@ -410,6 +451,8 @@ impl App {
             transfer: None,
             active_profile: None,
             default_sync: None,
+            connection: None,
+            keepalive_at: None,
             hits: HitMap::default(),
             progress: Box::new(progress::Silent),
             pending_keys: Vec::new(),
@@ -619,7 +662,13 @@ impl App {
                     self.bookmark_filter = prompt.input.clone();
                     self.clamp_bookmark_cursor();
                 }
-                PromptKind::Password { .. } => {}
+                // A name, a mode and a password are all typed in full before
+                // they mean anything.
+                PromptKind::Password { .. }
+                | PromptKind::NewFile
+                | PromptKind::NewDir
+                | PromptKind::Rename { .. }
+                | PromptKind::Chmod { .. } => {}
             }
             return;
         }
@@ -645,7 +694,13 @@ impl App {
                     self.bookmark_filter = prompt.input.clone();
                     self.clamp_bookmark_cursor();
                 }
-                PromptKind::Password { .. } => {}
+                // A name, a mode and a password are all typed in full before
+                // they mean anything.
+                PromptKind::Password { .. }
+                | PromptKind::NewFile
+                | PromptKind::NewDir
+                | PromptKind::Rename { .. }
+                | PromptKind::Chmod { .. } => {}
             }
             return;
         }
@@ -1071,7 +1126,13 @@ impl App {
     }
 
     /// Step three: open the session.
-    fn finish_open(&mut self, bookmark: &Bookmark, secret: Option<&Secret>) {
+    ///
+    /// Public because opening a named bookmark with a credential already in
+    /// hand is a real entry point -- `lazysync open <name>` and the zide
+    /// auto-open both arrive here -- and because a reconnect test needs to
+    /// establish a session the same way the UI does rather than a way that
+    /// only tests use.
+    pub fn finish_open(&mut self, bookmark: &Bookmark, secret: Option<&Secret>) {
         self.status = format!("connecting to {}...", bookmark.name);
 
         let target = bookmark.target();
@@ -1144,6 +1205,11 @@ impl App {
 
         self.connecting = None;
         self.host_key = None;
+        // Kept for the keepalive and for reconnecting: the pane holds a live
+        // session, and when that dies this is the only record of what it was
+        // a session *to*.
+        self.connection = Some(bookmark.clone());
+        self.keepalive_at = Some(Instant::now());
         self.screen = Screen::Browser;
         if self.status.starts_with("connecting") {
             self.status = format!("connected to {}", bookmark.name);
@@ -1184,6 +1250,11 @@ impl App {
         self.desynced = false;
         self.active_profile = None;
         self.default_sync = None;
+        // Closing is a decision, so there is nothing left to keep alive and
+        // nothing to reconnect to. Without this, the keepalive would go on
+        // pinging a pane that is now the local filesystem.
+        self.connection = None;
+        self.keepalive_at = None;
 
         self.screen = Screen::Bookmarks;
         self.status.clear();
@@ -1375,6 +1446,12 @@ impl App {
             Action::ShowLog => self.open_log(),
             Action::OpenExternal => self.open_external(),
 
+            Action::NewFile => self.ask_name(PromptKind::NewFile, String::new()),
+            Action::NewDir => self.ask_name(PromptKind::NewDir, String::new()),
+            Action::Rename => self.begin_rename(),
+            Action::Chmod => self.begin_chmod(),
+            Action::DeleteFile => self.begin_delete(),
+
             // Leaving the browser with a connection open ends that session:
             // the connection list cannot navigate back to a live browser, so
             // the only route back is to open a bookmark again, which
@@ -1503,6 +1580,10 @@ impl App {
                         let secret = Secret::new(input);
                         self.finish_open(&bookmark, Some(&secret));
                     }
+                    PromptKind::NewFile => self.create_file(input.trim()),
+                    PromptKind::NewDir => self.create_directory(input.trim()),
+                    PromptKind::Rename { from } => self.rename_entry(&from, input.trim()),
+                    PromptKind::Chmod { name } => self.chmod_entry(&name, &input),
                 }
             }
             Action::Cancel => {
@@ -2650,6 +2731,8 @@ impl App {
 
             Pending::LeaveConnection => self.close_connection(),
 
+            Pending::DeleteEntries { pane, names } => self.delete_entries(pane, &names),
+
             Pending::Nothing => {
                 self.connecting = None;
                 self.host_key = None;
@@ -2795,6 +2878,469 @@ impl App {
         };
 
         self.begin_sync_scoped(mode, Some(scope));
+    }
+
+    // ── Keeping a session alive ──────────────────────────────────────────
+
+    /// How long until the next keepalive ping, for the event loop's wait.
+    ///
+    /// `None` when there is nothing to keep alive -- no session-backed pane,
+    /// or `keepalive_secs = 0`. That is what stops a two-local-pane lazysync
+    /// waking up once a minute for no reason.
+    ///
+    /// It is deliberately *not* suppressed during a transfer: a sync is a
+    /// stream of real operations, so the session cannot be idle, and the
+    /// elapsed check below makes the ping a no-op anyway.
+    pub fn keepalive_deadline(&self) -> Option<Duration> {
+        let every = self.config.connection.keepalive()?;
+        let last = self.keepalive_at?;
+        if !self.panes.iter().any(|pane| pane.vfs.has_session()) {
+            return None;
+        }
+        Some(every.saturating_sub(last.elapsed()))
+    }
+
+    /// Ping the session if it is time, and reconnect if the ping says it is
+    /// gone.
+    ///
+    /// Called from the event loop on every pass, like `poll_watcher`, rather
+    /// than only when the deadline fires -- so a wake-up for some other
+    /// reason also satisfies the schedule and the two clocks cannot drift
+    /// into pinging twice in a row.
+    pub fn tick_keepalive(&mut self) {
+        let Some(every) = self.config.connection.keepalive() else {
+            return;
+        };
+        let Some(last) = self.keepalive_at else {
+            return;
+        };
+        if last.elapsed() < every {
+            return;
+        }
+
+        self.keepalive_at = Some(Instant::now());
+
+        let Some(index) = self.panes.iter().position(|pane| pane.vfs.has_session()) else {
+            return;
+        };
+
+        let path = self.panes[index].path().to_path_buf();
+        match self.panes[index].vfs.keepalive(&path) {
+            Ok(()) => tracing::trace!("keepalive ok on pane {index}"),
+            Err(e) => {
+                tracing::info!("keepalive failed on pane {index}: {e}");
+                self.handle_lost_connection(index, &e.to_string());
+            }
+        }
+    }
+
+    /// The session is gone: put it back, or say so.
+    fn handle_lost_connection(&mut self, pane: usize, why: &str) {
+        if !self.config.connection.auto_reconnect {
+            self.status = format!("the connection dropped ({why})");
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        match self.reconnect(pane) {
+            Ok(name) => {
+                self.status = format!("reconnected to {name}");
+                self.status_kind = StatusKind::Answer;
+            }
+            Err(e) => {
+                self.status = e;
+                self.status_kind = StatusKind::Problem;
+            }
+        }
+    }
+
+    /// Re-open the dropped connection into `pane`, keeping where you were.
+    ///
+    /// **The credential has to be obtainable without asking.** Agent and key
+    /// auth need none; a password needs the keyring, which only has it if
+    /// the connection opted into `remember_password`. A password typed once
+    /// and deliberately not stored cannot be replayed, and silently
+    /// prompting for it from a timer would be a password box appearing while
+    /// you were reading something else -- so that case reports instead.
+    ///
+    /// The directory, cursor and marks are preserved: a reconnect the user
+    /// did not ask for must not also move them. If the directory has gone
+    /// from the server since, the pane reloads onto whatever is there and
+    /// says so through the ordinary failed-pane path.
+    pub fn reconnect(&mut self, pane: usize) -> Result<String, String> {
+        let Some(bookmark) = self.connection.clone() else {
+            return Err("the connection dropped, and there is nothing to reopen it from".into());
+        };
+
+        let secret = reconnect_secret(&bookmark)?;
+
+        let target = bookmark.target();
+        let opened: Result<Box<dyn Vfs>, _> = if target.protocol.is_ssh() {
+            ssh::open(&target, secret.as_ref()).map(|fs| Box::new(fs) as Box<dyn Vfs>)
+        } else if matches!(target.protocol, Protocol::Rclone) {
+            rclone::RcloneFs::open(&target.host).map(|fs| Box::new(fs) as Box<dyn Vfs>)
+        } else {
+            ftp::open(&target, secret.as_ref()).map(|fs| Box::new(fs) as Box<dyn Vfs>)
+        };
+
+        let fs = opened.map_err(|e| format!("could not reopen {}: {e}", bookmark.name))?;
+
+        // Swap the backend underneath the pane rather than rebuilding it, so
+        // the path, the cursor and the marks survive -- `Pane::new` would
+        // start at the top of a freshly listed directory, which is the one
+        // thing a reconnect nobody asked for must not do.
+        self.panes[pane].replace_vfs(fs);
+        self.panes[pane].reload();
+        self.keepalive_at = Some(Instant::now());
+
+        Ok(bookmark.name)
+    }
+
+    // ── File operations ──────────────────────────────────────────────────
+
+    /// Open a text prompt, pre-filled with `input`.
+    fn ask_name(&mut self, kind: PromptKind, input: String) {
+        self.overlay = Overlay::Prompt(Prompt { kind, input });
+    }
+
+    fn begin_rename(&mut self) {
+        let Some(entry) = self.focused().selected() else {
+            self.status = "nothing selected".into();
+            return;
+        };
+        // Pre-filled with the current name, because a rename is usually an
+        // edit of one rather than a different name typed from scratch.
+        let from = entry.name.clone();
+        self.ask_name(PromptKind::Rename { from: from.clone() }, from);
+    }
+
+    fn begin_chmod(&mut self) {
+        let pane = self.focused();
+
+        if !pane.vfs.capabilities().mode {
+            self.status = format!("{} has no permission bits", pane.vfs.scheme());
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        let Some(entry) = pane.selected() else {
+            self.status = "nothing selected".into();
+            return;
+        };
+
+        // Pre-filled with what the entry has now, so the common edit is one
+        // digit rather than remembering the whole thing. Blank when the
+        // listing did not carry a mode, which is honest: an empty field
+        // cannot be mistaken for a claim about the current permissions.
+        let current = entry
+            .mode
+            .map(|mode| format!("{:03o}", mode & 0o7777))
+            .unwrap_or_default();
+
+        self.ask_name(
+            PromptKind::Chmod {
+                name: entry.name.clone(),
+            },
+            current,
+        );
+    }
+
+    /// Ask before deleting, naming exactly what will go.
+    ///
+    /// Marks win over the cursor, as they do for Enter: marking three things
+    /// and pressing delete has to mean those three.
+    ///
+    /// **This is not the sync's deletion path.** A planned deletion moves to
+    /// `.lazysync-backup/`, because a plan can remove files the user never
+    /// looked at individually. This one is the file under the cursor, named
+    /// in a dialog, so it is a real delete -- and the dialog says `cannot be
+    /// undone` rather than implying a safety net that is not there.
+    fn begin_delete(&mut self) {
+        let pane = self.focus;
+        let marks = self.panes[pane].marks().clone();
+
+        let names: Vec<String> = if marks.is_empty() {
+            match self.panes[pane].selected() {
+                Some(entry) => vec![entry.name.clone()],
+                None => {
+                    self.status = "nothing selected".into();
+                    return;
+                }
+            }
+        } else {
+            // Sorted, so the dialog reads the same way twice and a single
+            // name is quotable rather than arbitrary.
+            let mut names: Vec<String> = marks.into_iter().collect();
+            names.sort();
+            names
+        };
+
+        // Recursion is the part worth saying out loud: "delete docs/" and
+        // "delete docs/ and the 400 files under it" are the same keystroke
+        // and very different acts.
+        let recursive = names.iter().any(|name| {
+            self.panes[pane]
+                .entries()
+                .iter()
+                .any(|e| &e.name == name && e.is_dir_like())
+        });
+
+        let what = match names.as_slice() {
+            [only] if recursive => format!("{only:?} and everything in it"),
+            [only] => format!("{only:?}"),
+            many if recursive => format!(
+                "{} items, including directories and their contents",
+                many.len()
+            ),
+            many => format!("{} items", many.len()),
+        };
+
+        self.overlay = Overlay::Question(Question::new(
+            format!("Permanently delete {what}? This cannot be undone."),
+            Pending::DeleteEntries { pane, names },
+            Pending::Nothing,
+        ));
+    }
+
+    /// Carry out a confirmed delete.
+    ///
+    /// Every name is attempted even if an earlier one failed: stopping at the
+    /// first error would leave the user guessing which of the five files they
+    /// marked are still there, and the listing is reloaded either way.
+    fn delete_entries(&mut self, pane: usize, names: &[String]) {
+        let root = self.panes[pane].path().to_path_buf();
+        let mut deleted = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+
+        for name in names {
+            let path = root.join(name);
+            let is_dir = self.panes[pane].vfs.is_dir(&path);
+
+            let result = if is_dir {
+                self.panes[pane].vfs.remove_dir_all(&path)
+            } else {
+                self.panes[pane].vfs.remove_file(&path)
+            };
+
+            match result {
+                Ok(()) => deleted += 1,
+                Err(e) => failed.push(format!("{name}: {e}")),
+            }
+        }
+
+        self.panes[pane].clear_marks();
+        self.panes[pane].reload();
+        self.after_pane_changed(pane);
+
+        if failed.is_empty() {
+            self.status = match names {
+                [only] => format!("deleted {only}"),
+                _ => format!("deleted {deleted} items"),
+            };
+            self.status_kind = StatusKind::Answer;
+        } else {
+            // The count first, so a partial success is not read as a total
+            // failure -- four of five gone is a different situation.
+            self.status = format!("deleted {deleted}, failed: {}", failed.join("; "));
+            self.status_kind = StatusKind::Problem;
+        }
+    }
+
+    /// Reload the other pane too, when the two are coupled.
+    ///
+    /// Creating a directory under synchronized browsing does not create it on
+    /// the other side -- that is a sync, and syncs are planned and confirmed.
+    /// But the follower may be *ghosting* on the path that just appeared, and
+    /// a ghost that has become real should stop pretending.
+    fn after_pane_changed(&mut self, pane: usize) {
+        if !self.sync_browse {
+            return;
+        }
+        let other = 1 - pane;
+        if self.panes[other].is_ghost() {
+            self.follow_after_change();
+        }
+    }
+
+    fn follow_after_change(&mut self) {
+        let leader =
+            sync_browse::leader_side(self.config.sync_browse.leader, Side::from_index(self.focus))
+                .index();
+        let outcome = self.follow(leader);
+        tracing::debug!("follower pane {}: {outcome:?}", 1 - leader);
+    }
+
+    /// Validate a name typed into a new-file, new-directory or rename prompt.
+    ///
+    /// A name, not a path. `../etc/passwd` typed into "new file" is either a
+    /// mistake or an attempt, and either way the prompt said *name* -- so a
+    /// separator is refused rather than quietly creating something one
+    /// directory up. Creating nested paths is what `A` twice is for.
+    fn check_name(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("a name is required".into());
+        }
+        if name == "." || name == ".." {
+            return Err(format!("{name:?} is not a name"));
+        }
+        if name.contains('/') || name.contains('\\') {
+            return Err("a name, not a path: no slashes".into());
+        }
+        Ok(())
+    }
+
+    /// Create an empty file in the focused pane.
+    ///
+    /// Via `write_from` with an empty reader rather than a dedicated trait
+    /// method: every backend already has to implement it, and "create" and
+    /// "write nothing" are the same operation everywhere.
+    fn create_file(&mut self, name: &str) {
+        if let Err(why) = Self::check_name(name) {
+            self.status = why;
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        let pane = self.focus;
+        let path = self.panes[pane].path().join(name);
+
+        if self.panes[pane].entries().iter().any(|e| e.name == name) {
+            self.status = format!("{name} already exists");
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        let metadata = WriteMetadata {
+            size: 0,
+            mtime: None,
+            mode: None,
+        };
+        let mut empty: &[u8] = &[];
+
+        match self.panes[pane]
+            .vfs
+            .write_from(&path, &metadata, &mut empty)
+        {
+            Ok(_) => {
+                self.panes[pane].reload();
+                self.panes[pane].select_name(name);
+                self.after_pane_changed(pane);
+                self.status = format!("created {name}");
+                self.status_kind = StatusKind::Answer;
+            }
+            Err(e) => {
+                self.status = format!("could not create {name}: {e}");
+                self.status_kind = StatusKind::Problem;
+            }
+        }
+    }
+
+    fn create_directory(&mut self, name: &str) {
+        if let Err(why) = Self::check_name(name) {
+            self.status = why;
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        let pane = self.focus;
+        let path = self.panes[pane].path().join(name);
+
+        if self.panes[pane].entries().iter().any(|e| e.name == name) {
+            self.status = format!("{name} already exists");
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        match self.panes[pane].vfs.create_dir(&path) {
+            Ok(()) => {
+                self.panes[pane].reload();
+                self.panes[pane].select_name(name);
+                self.after_pane_changed(pane);
+                self.status = format!("created {name}/");
+                self.status_kind = StatusKind::Answer;
+            }
+            Err(e) => {
+                self.status = format!("could not create {name}: {e}");
+                self.status_kind = StatusKind::Problem;
+            }
+        }
+    }
+
+    /// Rename `from` to `to` in the focused pane.
+    ///
+    /// The target is checked first. POSIX `rename(2)` replaces silently, and
+    /// a file manager that loses a file because you typed a name that was
+    /// already taken is not one anybody trusts twice -- so an existing target
+    /// is refused here rather than left to the backend, whose behaviour
+    /// varies (SFTP's rename refuses, the local one does not).
+    fn rename_entry(&mut self, from: &str, to: &str) {
+        if let Err(why) = Self::check_name(to) {
+            self.status = why;
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+        if from == to {
+            self.status.clear();
+            return;
+        }
+
+        let pane = self.focus;
+        if self.panes[pane].entries().iter().any(|e| e.name == to) {
+            self.status = format!("{to} already exists");
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        let root = self.panes[pane].path().to_path_buf();
+        match self.panes[pane]
+            .vfs
+            .rename(&root.join(from), &root.join(to))
+        {
+            Ok(()) => {
+                self.panes[pane].reload();
+                self.panes[pane].select_name(to);
+                self.after_pane_changed(pane);
+                self.status = format!("renamed to {to}");
+                self.status_kind = StatusKind::Answer;
+            }
+            Err(e) => {
+                self.status = format!("could not rename {from}: {e}");
+                self.status_kind = StatusKind::Problem;
+            }
+        }
+    }
+
+    /// Apply an octal mode typed at the chmod prompt.
+    fn chmod_entry(&mut self, name: &str, input: &str) {
+        let text = input.trim();
+        let Ok(mode) = u32::from_str_radix(text, 8) else {
+            self.status = format!("{text:?} is not an octal mode, e.g. 644 or 2755");
+            self.status_kind = StatusKind::Problem;
+            return;
+        };
+        // Four digits is the whole permission word including setuid/sticky.
+        // Anything longer is a typo rather than a mode nobody has.
+        if text.len() > 4 || mode > 0o7777 {
+            self.status = format!("{text} is out of range; three or four octal digits");
+            self.status_kind = StatusKind::Problem;
+            return;
+        }
+
+        let pane = self.focus;
+        let path = self.panes[pane].path().join(name);
+
+        match self.panes[pane].vfs.set_mode(&path, mode) {
+            Ok(()) => {
+                self.panes[pane].reload();
+                self.panes[pane].select_name(name);
+                self.status = format!("{name} is now {mode:03o}");
+                self.status_kind = StatusKind::Answer;
+            }
+            Err(e) => {
+                self.status = format!("could not change {name}: {e}");
+                self.status_kind = StatusKind::Problem;
+            }
+        }
     }
 
     /// Hand the selected file to whatever the desktop opens it with.
@@ -3135,6 +3681,29 @@ fn nothing_to_do(
     format!("{what} -- compared by {} only", method.describe())
 }
 
+/// The credential a silent reconnect would use, or why there isn't one.
+///
+/// This is the whole of what decides whether auto-reconnect can happen
+/// without the user, so it is a function rather than four lines inside
+/// [`App::reconnect`]: the answer depends on a keyring lookup and an auth
+/// method, and both halves are worth pinning.
+///
+/// `Ok(None)` is the common case and not a failure -- agent and key auth
+/// need no secret at all, which is exactly why they are the auth methods a
+/// reconnect can be silent for.
+fn reconnect_secret(bookmark: &Bookmark) -> Result<Option<Secret>, String> {
+    if !bookmark.auth.needs_secret_upfront() {
+        return Ok(None);
+    }
+
+    secrets::get(&bookmark.name).map(Some).ok_or_else(|| {
+        format!(
+            "{} dropped; its password is not in the keyring, so reopen it yourself",
+            bookmark.name
+        )
+    })
+}
+
 /// Start the desktop's handler for `path`, and return the program used.
 ///
 /// One opener per platform, named rather than probed: `xdg-open` is the
@@ -3198,6 +3767,47 @@ mod tests {
         let mut config = Config::default();
         config.compare.method = method;
         config
+    }
+
+    mod reconnecting {
+        use super::*;
+        use crate::connection::{AuthMethod, Protocol, Target};
+
+        fn bookmark(auth: AuthMethod) -> Bookmark {
+            let mut target = Target::new(Protocol::Sftp, "example.invalid");
+            target.auth = auth;
+            // A name nothing has ever stored a secret under, so the keyring
+            // lookup below is a read that cannot find anything -- and this
+            // test never writes to the developer's real keyring.
+            Bookmark::from_target("lazysync-test-never-stored", &target)
+        }
+
+        /// The case auto-reconnect exists for: no secret is needed, so the
+        /// reopen can happen without the user knowing it did.
+        #[test]
+        fn agent_and_key_auth_need_nothing_and_can_reconnect_silently() {
+            for auth in [AuthMethod::Agent, AuthMethod::Key] {
+                let secret = reconnect_secret(&bookmark(auth))
+                    .unwrap_or_else(|e| panic!("{auth:?} should not need a secret: {e}"));
+                assert!(secret.is_none(), "{auth:?} asked for one");
+            }
+        }
+
+        /// And the case it must refuse. A password typed once and
+        /// deliberately not stored cannot be replayed, and a password box
+        /// appearing from a timer while you were reading something else is
+        /// worse than a message saying so.
+        #[test]
+        fn a_password_that_was_never_stored_is_refused_with_a_reason() {
+            let error = reconnect_secret(&bookmark(AuthMethod::Password))
+                .expect_err("there is no secret to be had");
+
+            assert!(error.contains("keyring"), "{error:?}");
+            assert!(
+                error.contains("lazysync-test-never-stored"),
+                "the message should name the connection: {error:?}"
+            );
+        }
     }
 
     /// One marked file names itself. This is the common case -- you mark the

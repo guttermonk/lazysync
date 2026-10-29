@@ -184,6 +184,23 @@ pub enum Action {
     /// that returned to the list, so the only way back was to quit.
     ShowConnections,
 
+    // ── File operations ──────────────────────────────────────────────────
+    //
+    // Distinct from the `*Item` actions below, which act on a *connection* in
+    // the bookmark list. Sharing names would mean one binding meaning "delete
+    // this saved host" in one mode and "delete this file" in another, which
+    // is the sort of thing a `base` keymap gets wrong once and loudly.
+    /// Create an empty file in the focused pane.
+    NewFile,
+    /// Create a directory in the focused pane.
+    NewDir,
+    /// Rename the selected entry.
+    Rename,
+    /// Delete the marked entries, or the selected one.
+    DeleteFile,
+    /// Change the Unix permission bits of the selected entry.
+    Chmod,
+
     // ── Bookmarks and forms ──────────────────────────────────────────────
     /// Open the selected bookmark.
     OpenItem,
@@ -294,6 +311,12 @@ impl Action {
             Self::ShowLog => "Show the audit log",
             Self::ShowConnections => "Back to the connection list",
 
+            Self::NewFile => "Create an empty file",
+            Self::NewDir => "Create a directory",
+            Self::Rename => "Rename the selected entry",
+            Self::DeleteFile => "Delete the marked entries, or the selected one",
+            Self::Chmod => "Change permissions on the selected entry",
+
             Self::OpenItem => "Open the selected connection",
             Self::NewItem => "Add a new connection",
             Self::EditItem => "Edit this connection",
@@ -377,6 +400,12 @@ impl Action {
             Self::ShowLog => "log",
             Self::ShowConnections => "connections",
 
+            Self::NewFile => "new file",
+            Self::NewDir => "new dir",
+            Self::Rename => "rename",
+            Self::DeleteFile => "delete",
+            Self::Chmod => "permissions",
+
             Self::OpenItem => "open",
             Self::NewItem => "new",
             Self::EditItem => "edit",
@@ -444,6 +473,8 @@ impl Action {
             | Self::TogglePause
             | Self::ToggleWatch
             | Self::ShowLog => "Sync",
+
+            Self::NewFile | Self::NewDir | Self::Rename | Self::DeleteFile | Self::Chmod => "Files",
 
             Self::ShowConnections
             | Self::OpenItem

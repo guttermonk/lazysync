@@ -297,20 +297,35 @@ struct Deadline {
     chords: bool,
 }
 
-/// The sooner of the two deadlines that can be pending.
+/// The soonest of the deadlines that can be pending.
 ///
 /// Knowing *whose* it is matters. The loop used to take the minimum and then,
 /// on waking, abandon whatever chord was in progress -- so with watch mode on,
 /// a batch of file changes going quiet would eat a half-typed `sp`. A clock
 /// may only expire the thing it belongs to.
-fn next_deadline(chord: Option<Duration>, watch: Option<Duration>) -> Option<Deadline> {
-    match (chord, watch) {
-        (Some(chord), Some(watch)) if chord <= watch => Some(Deadline {
+///
+/// Only the chord's identity needs carrying, because it is the only one that
+/// *consumes* state when it fires. The watcher and the keepalive are both
+/// checked on every pass of the loop regardless of what woke it, so waking
+/// early for the other one costs nothing and waking late is the thing these
+/// deadlines exist to prevent.
+fn next_deadline(
+    chord: Option<Duration>,
+    watch: Option<Duration>,
+    keepalive: Option<Duration>,
+) -> Option<Deadline> {
+    let other = match (watch, keepalive) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+
+    match (chord, other) {
+        (Some(chord), Some(other)) if chord <= other => Some(Deadline {
             remaining: chord,
             chords: true,
         }),
-        (_, Some(watch)) => Some(Deadline {
-            remaining: watch,
+        (_, Some(other)) => Some(Deadline {
+            remaining: other,
             chords: false,
         }),
         (Some(chord), None) => Some(Deadline {
@@ -354,7 +369,11 @@ fn main_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         // deadline. Polling on a fixed interval instead would mean waking
         // several times a second for ever, which is exactly what the blocking
         // read was chosen to avoid.
-        match next_deadline(dispatcher.poll_timeout(), app.watch_deadline()) {
+        match next_deadline(
+            dispatcher.poll_timeout(),
+            app.watch_deadline(),
+            app.keepalive_deadline(),
+        ) {
             None => handle(terminal, app, &mut dispatcher, &mut clicks, event::read()?)?,
             Some(Deadline { remaining, chords }) => {
                 if event::poll(remaining)? {
@@ -379,6 +398,11 @@ fn main_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if app.watcher.is_some() {
             app.step_watch();
         }
+
+        // Last, and on every pass rather than only when its own deadline
+        // fired: it is cheap, it checks the clock itself, and a wake-up for
+        // any other reason is as good a moment as a wake-up for this one.
+        app.tick_keepalive();
     }
 
     Ok(())
@@ -656,7 +680,7 @@ mod tests {
         let chord = Duration::from_millis(500);
         let watch = Duration::from_millis(100);
 
-        let deadline = next_deadline(Some(chord), Some(watch)).expect("a deadline");
+        let deadline = next_deadline(Some(chord), Some(watch), None).expect("a deadline");
         assert_eq!(deadline.remaining, watch, "the sooner one still wins");
         assert!(
             !deadline.chords,
@@ -664,22 +688,58 @@ mod tests {
         );
     }
 
+    /// The keepalive is a third clock, and it must not expire a chord either.
+    #[test]
+    fn a_keepalive_deadline_does_not_expire_a_chord() {
+        let chord = Duration::from_secs(1);
+        let keepalive = Duration::from_millis(50);
+
+        let deadline = next_deadline(Some(chord), None, Some(keepalive)).expect("a deadline");
+        assert_eq!(deadline.remaining, keepalive);
+        assert!(
+            !deadline.chords,
+            "waking to ping the server must not throw away a half-typed chord"
+        );
+    }
+
+    /// Whichever of the two non-chord clocks is sooner, the loop wakes for it
+    /// -- both are re-checked on every pass, so waking early is free.
+    #[test]
+    fn the_sooner_of_the_watcher_and_the_keepalive_wins() {
+        let soon = Duration::from_millis(10);
+        let later = Duration::from_secs(60);
+
+        let watch_first = next_deadline(None, Some(soon), Some(later)).unwrap();
+        assert_eq!(watch_first.remaining, soon);
+
+        let keepalive_first = next_deadline(None, Some(later), Some(soon)).unwrap();
+        assert_eq!(keepalive_first.remaining, soon);
+
+        let only_keepalive = next_deadline(None, None, Some(soon)).unwrap();
+        assert_eq!(only_keepalive.remaining, soon);
+        assert!(!only_keepalive.chords);
+    }
+
     #[test]
     fn the_sooner_clock_wins_and_owns_the_wakeup() {
         let soon = Duration::from_millis(10);
         let later = Duration::from_millis(900);
 
-        let chord_first = next_deadline(Some(soon), Some(later)).unwrap();
+        let chord_first = next_deadline(Some(soon), Some(later), None).unwrap();
         assert_eq!(chord_first.remaining, soon);
         assert!(chord_first.chords);
 
-        let only_chord = next_deadline(Some(soon), None).unwrap();
+        let only_chord = next_deadline(Some(soon), None, None).unwrap();
         assert!(only_chord.chords);
 
-        let only_watch = next_deadline(None, Some(soon)).unwrap();
+        let only_watch = next_deadline(None, Some(soon), None).unwrap();
         assert!(!only_watch.chords);
 
-        assert_eq!(next_deadline(None, None), None, "nothing to wake up for");
+        assert_eq!(
+            next_deadline(None, None, None),
+            None,
+            "nothing to wake up for"
+        );
     }
 
     /// Three fast presses act once, not twice. Otherwise a hand that bounces

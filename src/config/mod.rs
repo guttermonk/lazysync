@@ -16,6 +16,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -57,6 +58,7 @@ pub struct Config {
     pub mouse: bool,
 
     pub sync_browse: SyncBrowse,
+    pub connection: Connection,
     pub zide: Zide,
     pub compare: Compare,
     pub transfer: Transfer,
@@ -82,6 +84,7 @@ impl Default for Config {
             chord_timeout_ms: 500,
             mouse: true,
             sync_browse: SyncBrowse::default(),
+            connection: Connection::default(),
             zide: Zide::default(),
             compare: Compare::default(),
             transfer: Transfer::default(),
@@ -275,6 +278,54 @@ pub enum OnMissing {
     Create,
     /// Ask each time.
     Ask,
+}
+
+/// `[connection]`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Connection {
+    /// Seconds between liveness pings on an idle remote pane; 0 turns it off.
+    ///
+    /// An SFTP or FTP server closes an idle session on its own schedule --
+    /// `ClientAliveInterval` on OpenSSH, a plain idle timeout on most FTP
+    /// daemons, and commonly a middlebox between the two with opinions of its
+    /// own. lazysync then holds a socket that is already gone, and finds out
+    /// at the next keystroke.
+    ///
+    /// 60 seconds by default: comfortably inside the usual 120-300 second
+    /// idle timeouts, and one `stat` per minute is nothing next to a
+    /// directory listing. The ping only runs while a pane *has* a session and
+    /// the application is otherwise idle.
+    pub keepalive_secs: u64,
+
+    /// Re-establish a dropped connection rather than reporting it.
+    ///
+    /// Only ever silent where the credential can be had again without the
+    /// user: agent or key auth, or a password in the keyring. A connection
+    /// whose password was typed once and deliberately not stored cannot be
+    /// reopened behind your back, and says so instead -- see
+    /// `App::reconnect`.
+    pub auto_reconnect: bool,
+}
+
+impl Default for Connection {
+    fn default() -> Self {
+        Self {
+            keepalive_secs: 60,
+            auto_reconnect: true,
+        }
+    }
+}
+
+impl Connection {
+    /// The ping interval, or `None` when it is switched off.
+    pub const fn keepalive(&self) -> Option<Duration> {
+        if self.keepalive_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.keepalive_secs))
+        }
+    }
 }
 
 /// `[zide]`

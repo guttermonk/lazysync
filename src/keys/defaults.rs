@@ -131,6 +131,18 @@ fn browser() -> Keymap {
         (Action::Search, c('/')),
         (Action::SearchNext, c('n')),
         (Action::SearchPrev, c('N')),
+        // File operations. `n` is search-repeat here, so the "new" keys are
+        // `a`/`A` rather than the bookmark list's `n` -- one letter apart in
+        // meaning and nowhere near each other on the keyboard, which is the
+        // point: `n` in a browser should never create anything.
+        (Action::NewFile, c('a')),
+        (Action::NewDir, c('A')),
+        (Action::Rename, c('r')),
+        (Action::Chmod, c('p')),
+        // A chord for the destructive one, matching `[keys.bookmarks]`: a
+        // single `d` next to `a` is how you delete the file you meant to
+        // create beside it.
+        (Action::DeleteFile, chord("dd")),
         // Sync. All chords under `s`, so the destructive one cannot be
         // reached by a single keystroke -- and `s` alone is the sort key, so
         // the prefix is already in use for something harmless.
