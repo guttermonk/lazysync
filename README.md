@@ -1,5 +1,9 @@
 # lazysync
 
+> **Warning:** This is a beta release. It moves, overwrites and deletes files,
+> and it may still do so when it shouldn't. Don't point it at data you don't
+> have a backup of.
+
 A dual-pane terminal file manager and sync tool. [termscp][termscp]'s feature
 set, vim keys by default with every binding remappable, and a confirmation
 window that shows you both sides of every overwrite — size and timestamp,
