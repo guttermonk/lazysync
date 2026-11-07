@@ -2446,9 +2446,9 @@ dependencies = [
 
 [[package]]
 name = "remotefs-ssh"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88f245ac9b96d3dbac3ba161dacb297240097cf8d2f9e8e8413fe3868986f93d"
+checksum = "53e5d5887f76c62f0c21a1c8a37251d81aea6528afe345965d1be974fc176896"
 dependencies = [
  "chrono",
  "if-addrs",
