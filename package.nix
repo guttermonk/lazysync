@@ -3,6 +3,7 @@
   rustPlatform,
   makeWrapper,
   openssl,
+  aws-lc,
   dbus,
   pkg-config,
   stdenv,
@@ -46,7 +47,25 @@ rustPlatform.buildRustPackage {
   ];
 
   buildInputs =
-    [ openssl ]
+    [
+      openssl
+      # aws-lc reaches us through remotefs-ftp's "rustls-aws-lc-rs" feature in
+      # Cargo.toml -> aws-lc-rs -> aws-lc-sys, which builds C.
+      #
+      # It has to be a buildInput because nixpkgs decides for us. The cargo
+      # setup hook's cargoUseSystemLibs() exports AWS_LC_SYS_USE_SYSTEM=1 for
+      # every buildRustPackage, which tells aws-lc-sys to link a system AWS-LC
+      # rather than vendor its own -- and then its build script panics outright
+      # if it cannot find one. There is no in-crate fallback to vendoring.
+      #
+      # Worth knowing that this is a nixpkgs-side change rather than anything
+      # we did: the hook had no AWS_LC_SYS_USE_SYSTEM line before 2026-11, so
+      # this built fine until the pin crossed it. Without aws-lc here the
+      # failure reads as an openssl problem -- aws-lc-sys probes OPENSSL_DIR,
+      # finds openssl-dev, and rejects it for a missing openssl/base.h, which
+      # is an AWS-LC header and was never going to be there.
+      aws-lc
+    ]
     # keyring stores bookmark passwords in the platform's own credential
     # store, which on Linux means Secret Service over libdbus and on Darwin
     # means the Keychain via the Security framework.
